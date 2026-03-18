@@ -1,0 +1,25 @@
+{
+  "memory": {
+    "xmx": "6G",
+    "xms": "4G",
+    "max_ram_ratio": 0.7
+  },
+  "runtime": {
+    "max_attempts": 8,
+    "start_timeout": 300,
+    "keep_running": false
+  },
+  "ai": {
+    "enabled": false,
+    "provider": "ollama",
+    "model": "qwen3.5:4b",
+    "endpoint": "http://127.0.0.1:11434/api/generate"
+  },
+  "server_port": 25565,
+  "github_api_key": "",
+  "curseforge_api_key": "",
+  "modrinth_api_token": "",
+  "modrinth_user_agent": "brokestar233/mc-auto-server-builder",
+  "extra_jvm_flags": [],
+  "user_blacklist_regex": []
+}
