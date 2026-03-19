@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-
 LoaderType = Literal["forge", "neoforge", "fabric", "quilt", "unknown"]
 InputType = Literal["local_zip", "curseforge", "modrinth", "url"]
 
@@ -48,9 +47,14 @@ class WorkDirs:
 class StartResult:
     success: bool
     done_detected: bool
+    command_probe_detected: bool
+    port_open_detected: bool
+    process_alive: bool
+    success_source: str
     exit_code: int | None
     log_path: Path
     crash_dir: Path
+    readiness_evidence: list[str] = field(default_factory=list)
     stdout_tail: str = ""
     stderr_tail: str = ""
 
@@ -72,3 +76,9 @@ class AIResult:
     confidence: float
     reason: str
     actions: list[AIAction] = field(default_factory=list)
+    thought_chain: list[str] = field(default_factory=list)
+    input_summary: str = ""
+    hit_deleted_mods: list[str] = field(default_factory=list)
+    dependency_chains: list[list[str]] = field(default_factory=list)
+    deletion_rationale: list[str] = field(default_factory=list)
+    conflicts_or_exceptions: list[str] = field(default_factory=list)

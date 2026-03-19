@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import cast
 from zipfile import ZipFile
 
 from .models import LoaderType, ModInfo, PackInput, PackManifest
-
+from .util import is_http_url, normalize_loader_name
 
 CURSEFORGE_DOWNLOAD_RE = re.compile(r"curseforge\.com/.*/download/(\d+)", re.IGNORECASE)
 CURSEFORGE_FILES_RE = re.compile(r"curseforge\.com/.*/files/(\d+)", re.IGNORECASE)
@@ -20,16 +21,13 @@ MODRINTH_PROJECT_RE = re.compile(
     r"modrinth\.com/(?:mod|modpack|resourcepack|shader|plugin|datapack)/([A-Za-z0-9\-_]+)",
     re.IGNORECASE,
 )
-URL_RE = re.compile(r"^https?://", re.IGNORECASE)
-
-
 def parse_pack_input(value: str) -> PackInput:
     value = value.strip()
     p = Path(value)
     if p.exists() and p.suffix.lower() == ".zip":
         return PackInput(input_type="local_zip", source=str(p.resolve()))
 
-    if URL_RE.search(value):
+    if is_http_url(value):
         cf_project = CURSEFORGE_PROJECT_ID_RE.search(value)
         cf_slug = CURSEFORGE_SLUG_RE.search(value)
         if cf_project or cf_slug:
@@ -79,26 +77,13 @@ def parse_manifest_from_zip(zip_path: str | Path) -> PackManifest:
     raise ValueError(f"ZIP 内未找到 manifest.json 或 modrinth.index.json: {zpath}")
 
 
-def _normalize_loader(raw_loader: str) -> LoaderType:
-    text = raw_loader.lower()
-    if "neoforge" in text:
-        return "neoforge"
-    if "forge" in text:
-        return "forge"
-    if "fabric" in text:
-        return "fabric"
-    if "quilt" in text:
-        return "quilt"
-    return "unknown"
-
-
 def _from_curseforge_manifest(data: dict) -> PackManifest:
     minecraft = data.get("minecraft", {})
     version = minecraft.get("version", "unknown")
     loaders = minecraft.get("modLoaders", [])
     loader_id = loaders[0].get("id", "unknown") if loaders else "unknown"
 
-    loader = _normalize_loader(loader_id)
+    loader = cast(LoaderType, normalize_loader_name(loader_id))
     loader_version = None
     if "-" in loader_id:
         loader_version = loader_id.split("-", 1)[1]
@@ -126,7 +111,7 @@ def _from_modrinth_manifest(data: dict) -> PackManifest:
 
     for key in ("neoforge", "forge", "fabric-loader", "quilt-loader"):
         if key in deps:
-            loader = _normalize_loader(key)
+            loader = cast(LoaderType, normalize_loader_name(key))
             loader_version = str(deps.get(key))
             break
 

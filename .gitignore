@@ -1,1 +1,46 @@
+# Python artifacts
+__pycache__/
+*.pyo
+*.pyd
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+workdir_*
+*.egg-info/
+*.whl
+*.tar.gz
+
+# Editor / OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Local secrets and machine-specific config
+.env
+.env.*
+*.local
+config.local.json
+config.*.local.json
+secrets.*
+private.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# Local runtime outputs
+logs/
+tmp/
+*.log

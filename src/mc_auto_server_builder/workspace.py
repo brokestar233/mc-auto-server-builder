@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime
-import shutil
 from pathlib import Path
 
 from .models import WorkDirs
+from .util import ensure_dirs
 
 
 def create_workdirs(base_dir: str | Path = ".") -> WorkDirs:
@@ -17,8 +17,7 @@ def create_workdirs(base_dir: str | Path = ".") -> WorkDirs:
     java_bins = root / "java_bins"
     db = root / "db"
 
-    for d in (root, client_temp, server, backups, logs, java_bins, db):
-        d.mkdir(parents=True, exist_ok=True)
+    ensure_dirs((root, client_temp, server, backups, logs, java_bins, db))
 
     return WorkDirs(
         root=root,
@@ -29,12 +28,3 @@ def create_workdirs(base_dir: str | Path = ".") -> WorkDirs:
         java_bins=java_bins,
         db=db,
     )
-
-
-def backup_directory(src: Path, dst_root: Path, tag: str) -> Path:
-    target = dst_root / tag
-    if target.exists():
-        shutil.rmtree(target)
-    shutil.copytree(src, target)
-    return target
-

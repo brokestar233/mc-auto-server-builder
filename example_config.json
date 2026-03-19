@@ -7,19 +7,59 @@
   "runtime": {
     "max_attempts": 8,
     "start_timeout": 300,
-    "keep_running": false
+    "keep_running": false,
+    "startup_soft_timeout": 45,
+    "startup_hard_timeout": 300,
+    "startup_probe_interval_sec": 1.0,
+    "startup_command_probe_enabled": true,
+    "startup_command_probe_initial_delay_sec": 12.0,
+    "startup_command_probe_retry_sec": 6.0
   },
   "ai": {
-    "enabled": false,
-    "provider": "ollama",
-    "model": "qwen3.5:4b",
-    "endpoint": "http://127.0.0.1:11434/api/generate"
+    "enabled": true,
+    "provider": "openai_compatible",
+    "model": "gpt-5.4-mini",
+    "endpoint": "http://127.0.0.1:11434/api/generate",
+    "base_url": "https://api.openai.com",
+    "api_key": "<YOUR_API_KEY>",
+    "chat_path": "/v1/chat/completions",
+    "stream": false,
+    "temperature": 0.2,
+    "top_p": 0.95,
+    "max_tokens": 1024,
+    "stop": [],
+    "timeout_sec": 300,
+    "max_retries": 2,
+    "retry_backoff_sec": 1.0,
+    "debug": false
+  },
+  "logging": {
+    "level": "INFO",
+    "color_policy": "auto"
+  },
+  "download": {
+    "enable_parallel_download": true,
+    "max_workers": 32,
+    "manifest_resolve_parallel_enabled": true,
+    "manifest_resolve_max_workers": 16,
+    "curseforge_manifest_batch_size": 50,
+    "curseforge_manifest_batch_retry": 2,
+    "connect_timeout": 15,
+    "read_timeout": 120,
+    "max_retries": 3,
+    "retry_backoff_sec": 1.0,
+    "chunk_size": 262144,
+    "terminal_ui_enabled": true,
+    "terminal_ui_running_rows": 8,
+    "terminal_ui_refresh_interval_sec": 0.1
   },
   "server_port": 25565,
   "github_api_key": "",
+  "oracle_download_cookies": "",
   "curseforge_api_key": "",
   "modrinth_api_token": "",
   "modrinth_user_agent": "brokestar233/mc-auto-server-builder",
+  "graalvm_external_packages": [],
   "extra_jvm_flags": [],
   "user_blacklist_regex": []
 }
