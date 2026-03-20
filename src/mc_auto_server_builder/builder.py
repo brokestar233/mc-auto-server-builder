@@ -362,13 +362,7 @@ class ServerBuilder:
 
     def _detect_command_probe_ready(self, text: str) -> tuple[bool, str]:
         lower = (text or "").lower()
-        if "unknown command" in lower or "unknown or incomplete command" in lower:
-            return True, "cmd_probe_unknown_command"
-        if "available commands" in lower:
-            return True, "cmd_probe_available_commands"
-        if "for help, type" in lower and "help" in lower:
-            return True, "cmd_probe_help_hint"
-        if "there are" in lower and "players online" in lower:
+        if "there are 0 of a max of 20 players online" in lower:
             return True, "cmd_probe_list_response"
         return False, ""
 
@@ -410,8 +404,7 @@ class ServerBuilder:
         hard_deadline = start_at + hard_timeout
         next_probe_at = start_at + max(1.0, float(self.config.runtime.startup_command_probe_initial_delay_sec))
         probe_retry = max(1.0, float(self.config.runtime.startup_command_probe_retry_sec))
-        probe_commands = ["help", "list"]
-        probe_index = 0
+        probe_command = "list"
 
         done = False
         cmd_probe_ok = False
@@ -430,6 +423,16 @@ class ServerBuilder:
             err_tail = "\n".join(stderr_lines[-120:])
             merged_tail = "\n".join([log_tail, out_tail, err_tail])
 
+            if not port_open:
+                try:
+                    port_open = is_local_tcp_port_open(port=int(self.config.server_port), host="127.0.0.1", timeout=0.6)
+                except Exception:
+                    port_open = False
+                if port_open:
+                    readiness_evidence.append("port_open")
+                    if not success_source and proc.poll() is None:
+                        success_source = "port_open_alive"
+
             if not done:
                 done_detected, done_source = self._detect_log_ready_signal(merged_tail)
                 if done_detected:
@@ -438,13 +441,11 @@ class ServerBuilder:
                     readiness_evidence.append(done_source)
 
             if probe_enabled and not cmd_probe_ok and now >= soft_deadline and now >= next_probe_at and proc.poll() is None:
-                command = probe_commands[probe_index % len(probe_commands)]
-                probe_index += 1
                 try:
                     if proc.stdin:
-                        proc.stdin.write(f"{command}\n")
+                        proc.stdin.write(f"{probe_command}\n")
                         proc.stdin.flush()
-                        readiness_evidence.append(f"probe_sent:{command}")
+                        readiness_evidence.append(f"probe_sent:{probe_command}")
                 except Exception as e:
                     readiness_evidence.append(f"probe_send_failed:{type(e).__name__}")
                 next_probe_at = now + probe_retry
@@ -455,16 +456,6 @@ class ServerBuilder:
                     cmd_probe_ok = True
                     success_source = probe_source
                     readiness_evidence.append(probe_source)
-
-            if not port_open:
-                try:
-                    port_open = is_local_tcp_port_open(port=int(self.config.server_port), host="127.0.0.1", timeout=0.6)
-                except Exception:
-                    port_open = False
-                if port_open:
-                    readiness_evidence.append("port_open")
-                    if not success_source and proc.poll() is None:
-                        success_source = "port_open_alive"
 
             if cmd_probe_ok or done or (port_open and proc.poll() is None):
                 break
