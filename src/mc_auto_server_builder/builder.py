@@ -361,8 +361,7 @@ class ServerBuilder:
         return False, ""
 
     def _detect_command_probe_ready(self, text: str) -> tuple[bool, str]:
-        lower = (text or "").lower()
-        if "there are 0 of a max of 20 players online" in lower:
+        if re.search(r"there\s+are.*players\s+online", text or "", flags=re.IGNORECASE | re.DOTALL):
             return True, "cmd_probe_list_response"
         return False, ""
 
