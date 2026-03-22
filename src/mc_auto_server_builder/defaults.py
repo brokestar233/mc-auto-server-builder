@@ -1,6 +1,6 @@
 KNOWN_CLIENT_MOD_REGEX = [
     r"^.*I18nUpdateMod.*\.jar$",
-    r"^.*ModernUI-Forge.*\.jar$",
+    r"^.*ModernUI-.*\.jar$",
     r"^.*RuOK.*\.jar$",
     r"^.*betterchat.*\.jar$",
     r"^.*chloride-FORGE-.*\.jar$",
@@ -8,7 +8,7 @@ KNOWN_CLIENT_MOD_REGEX = [
     r"^.*keepyourmouthhealthy.*\.jar$",
     r"^.*oculus-.*\.jar$",
     r"^.*mekalus-.*\.jar$",
-    r"^.*sodiumdynamiclights-forge.*\.jar$",
+    r"^.*sodiumdynamiclights-.*\.jar$",
     r"^.*BetterLoadingScreen.*\.jar$",
     r"^.*CoreTweaks.*\.jar$",
     r"^.*CustomMainMenu.*\.jar$",
@@ -47,7 +47,10 @@ KNOWN_CLIENT_MOD_REGEX = [
     r"^LegendaryTooltips-.*\.jar$",
     r"^embeddium-.*\.jar$",
     r"^IMBlocker-.*\.jar$",
-    r"^.*fancymenu_forge.*\.jar$",
+    r"^iris-.*\.jar$",
+    r"^.*fancymenu_.*\.jar$",
+    r"^.*sodium.*\.jar$",
+    r"^.*entity_texture_features.*\.jar$", #我真tmd服了,这个mod会在启动秒崩,完全没有任何信息,只能二分排查
     r"^.*statuseffectbars.*\.jar$",
     r"^.*tooltipoverhaul.*\.jar$",
     r"^.*drippyloadingscreen.*\.jar$",

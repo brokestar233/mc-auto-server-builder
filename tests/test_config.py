@@ -9,7 +9,7 @@ def test_load_default_config_when_path_is_none():
     cfg = AppConfig.load(None)
 
     assert cfg.memory.xmx == "6G"
-    assert cfg.runtime.max_attempts == 8
+    assert cfg.runtime.max_attempts == 20
     assert cfg.ai.enabled is False
 
 
@@ -30,3 +30,8 @@ def test_load_config_normalizes_ai_stop_string(tmp_path):
     assert cfg.ai.provider == "openai_compatible"
     assert cfg.ai.stop == ["<END>"]
 
+
+def test_load_default_runtime_max_attempts_is_twenty():
+    cfg = AppConfig.load(None)
+
+    assert cfg.runtime.max_attempts == 20

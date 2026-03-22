@@ -14,7 +14,7 @@ class MemoryConfig:
 
 @dataclass(slots=True)
 class RuntimeConfig:
-    max_attempts: int = 8
+    max_attempts: int = 20
     start_timeout: int = 300
     keep_running: bool = False
     startup_soft_timeout: int = 45
