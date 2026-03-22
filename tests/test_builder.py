@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from mc_auto_server_builder.ai import BuilderAIService
-from mc_auto_server_builder.models import AIAction, AIResult, ActionPreflight, BisectMoveRecord, BisectRoundRecord, BisectSession
 from mc_auto_server_builder.builder import ServerBuilder
+from mc_auto_server_builder.models import ActionPreflight, AIResult, BisectMoveRecord, BisectRoundRecord, BisectSession
 
 
 def test_detect_command_probe_ready_accepts_player_count_line():
@@ -15,6 +15,35 @@ def test_detect_command_probe_ready_accepts_player_count_line():
     assert source == "cmd_probe_list_response"
 
 
+def test_extract_full_pack_version_payload_if_needed_moves_first_version_payload(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder._log = lambda *_args, **_kwargs: None
+    builder.operations = []
+    builder.workdirs = type("WorkDirs", (), {"client_temp": tmp_path / "client_temp"})()
+    builder.workdirs.client_temp.mkdir(parents=True)
+    builder.manifest = type(
+        "Manifest",
+        (),
+        {"raw": {"full_pack": {"version_name": "1.20.1-forge-47.2.0"}}},
+    )()
+
+    version_dir = builder.workdirs.client_temp / ".minecraft" / "versions" / "1.20.1-forge-47.2.0"
+    (version_dir / "mods").mkdir(parents=True)
+    (version_dir / "config").mkdir(parents=True)
+    (version_dir / "mods" / "a.jar").write_text("mod", encoding="utf-8")
+    (version_dir / "config" / "settings.toml").write_text("cfg", encoding="utf-8")
+    (version_dir / "1.20.1-forge-47.2.0.jar").write_text("client", encoding="utf-8")
+    (version_dir / "1.20.1-forge-47.2.0.json").write_text("{}", encoding="utf-8")
+
+    ServerBuilder._extract_full_pack_version_payload_if_needed(builder)
+
+    assert (builder.workdirs.client_temp / "mods" / "a.jar").exists()
+    assert (builder.workdirs.client_temp / "config" / "settings.toml").exists()
+    assert not (builder.workdirs.client_temp / "1.20.1-forge-47.2.0.jar").exists()
+    assert not (builder.workdirs.client_temp / "1.20.1-forge-47.2.0.json").exists()
+    assert any(op.startswith("full_pack_extract:1.20.1-forge-47.2.0:copied=") for op in builder.operations)
+
+
 def test_detect_command_probe_ready_ignores_case():
     ready, source = ServerBuilder._detect_command_probe_ready(
         None,
@@ -24,10 +53,11 @@ def test_detect_command_probe_ready_ignores_case():
     assert ready is True
     assert source == "cmd_probe_list_response"
 
+
 def test_detect_command_probe_ready_rejects_unrelated_output():
     ready, source = ServerBuilder._detect_command_probe_ready(
         None,
-        "Done (12.345s)! For help, type \"help\"",
+        'Done (12.345s)! For help, type "help"',
     )
 
     assert ready is False
@@ -158,7 +188,20 @@ def test_normalize_ai_result_accepts_move_bisect_mods_action():
     service = BuilderAIService(builder)
 
     result = service._normalize_ai_result(
-        {"final_output": {"primary_issue": "missing_dependency", "confidence": 0.72, "reason": "需要迁移依赖", "actions": [{"type": "move_bisect_mods", "targets": ["lib.jar"], "reason": "迁移依赖"}]}}
+        {
+            "final_output": {
+                "primary_issue": "missing_dependency",
+                "confidence": 0.72,
+                "reason": "需要迁移依赖",
+                "actions": [
+                    {
+                        "type": "move_bisect_mods",
+                        "targets": ["lib.jar"],
+                        "reason": "迁移依赖",
+                    }
+                ],
+            }
+        }
     )
 
     assert result.actions[0].type == "move_bisect_mods"
@@ -171,12 +214,14 @@ def test_build_prompt_uses_compact_rule_sections_for_bisect_state():
     builder.config = type("Cfg", (), {"ai": type("AI", (), {"enabled": False, "debug": False})()})()
     service = BuilderAIService(builder)
 
-    prompt = service.build_prompt({
-        "bisect_active": True,
-        "bisect_next_allowed_requests": ["initial"],
-        "bisect_fallback_targets": ["a.jar", "b.jar"],
-        "bisect_suspects_invalidated": True,
-    })
+    prompt = service.build_prompt(
+        {
+            "bisect_active": True,
+            "bisect_next_allowed_requests": ["initial"],
+            "bisect_fallback_targets": ["a.jar", "b.jar"],
+            "bisect_suspects_invalidated": True,
+        }
+    )
 
     assert "硬规则：1." in prompt
     assert "二分状态机：1." in prompt
@@ -278,11 +323,13 @@ def test_build_prompt_allows_initial_bisect_when_session_inactive():
     builder.config = type("Cfg", (), {"ai": type("AI", (), {"enabled": False, "debug": False})()})()
     service = BuilderAIService(builder)
 
-    prompt = service.build_prompt({
-        "bisect_active": False,
-        "bisect_next_allowed_requests": [],
-        "current_installed_mods": ["a.jar", "b.jar", "c.jar"],
-    })
+    prompt = service.build_prompt(
+        {
+            "bisect_active": False,
+            "bisect_next_allowed_requests": [],
+            "current_installed_mods": ["a.jar", "b.jar", "c.jar"],
+        }
+    )
 
     assert "若 bisect_state.active=false，且仍有至少 2 个可疑 mod，则允许发起 initial" in prompt
 
@@ -520,7 +567,10 @@ def test_run_bisect_mods_action_switch_group_can_fail_and_enable_continuation():
     builder.list_mods = lambda: list(state["mods"])
     builder.backup_mods = lambda _tag: None
     builder.rollback_mods = lambda _tag: state.__setitem__("mods", ["a.jar", "b.jar", "c.jar", "lib.jar", "x.jar"])
-    builder.remove_mods_by_name = lambda names, source="manual", reason="": state.__setitem__("mods", [m for m in state["mods"] if m not in names])
+    builder.remove_mods_by_name = lambda names, source="manual", reason="": state.__setitem__(
+        "mods",
+        [m for m in state["mods"] if m not in names],
+    )
     builder.start_server = lambda timeout=300: {"success": False, "stderr_tail": "missing dependency for lib.jar"}
 
     stop, execution, rollback = ServerBuilder._run_bisect_mods_action(
@@ -573,7 +623,10 @@ def test_run_bisect_mods_action_initial_success_invalidates_ai_suspects_and_requ
     builder.list_mods = lambda: list(state["mods"])
     builder.backup_mods = lambda _tag: None
     builder.rollback_mods = lambda _tag: state.__setitem__("mods", ["a.jar", "b.jar", "c.jar", "d.jar"])
-    builder.remove_mods_by_name = lambda names, source="manual", reason="": state.__setitem__("mods", [m for m in state["mods"] if m not in names])
+    builder.remove_mods_by_name = lambda names, source="manual", reason="": state.__setitem__(
+        "mods",
+        [m for m in state["mods"] if m not in names],
+    )
     builder.start_server = lambda timeout=300: {"success": True, "success_source": "log_done"}
 
     stop, execution, rollback = ServerBuilder._run_bisect_mods_action(
@@ -619,7 +672,10 @@ def test_run_bisect_mods_action_auto_resume_initial_enters_fallback_phase_and_tr
     builder.list_mods = lambda: list(state["mods"])
     builder.backup_mods = lambda _tag: None
     builder.rollback_mods = lambda _tag: state.__setitem__("mods", ["a.jar", "b.jar", "c.jar", "d.jar"])
-    builder.remove_mods_by_name = lambda names, source="manual", reason="": state.__setitem__("mods", [m for m in state["mods"] if m not in names])
+    builder.remove_mods_by_name = lambda names, source="manual", reason="": state.__setitem__(
+        "mods",
+        [m for m in state["mods"] if m not in names],
+    )
     builder.start_server = lambda timeout=300: {"success": True, "success_source": "log_done"}
 
     stop, execution, rollback = ServerBuilder._run_bisect_mods_action(
@@ -666,25 +722,29 @@ def test_generate_report_contains_complete_bisect_tree_section(tmp_path):
         next_allowed_requests=["continue_failed_group"],
         stagnant_rounds=1,
         rounds=[
-            type("Round", (), {
-                "round_index": 1,
-                "bisect_mode": "initial",
-                "tested_side": "keep",
-                "result": "pass",
-                "startup_success": True,
-                "requested_targets": ["a.jar", "b.jar", "c.jar", "d.jar"],
-                "kept_group": ["a.jar", "b.jar"],
-                "tested_group": ["c.jar", "d.jar"],
-                "moved_mods": [],
-                "continuation_targets": [],
-                "pending_other_group": ["c.jar", "d.jar"],
-                "next_allowed_requests": ["switch_group"],
-                "fallback_targets": [],
-                "suspects_invalidated": False,
-                "failure_kind": "",
-                "failure_detail": "",
-                "notes": ["start_success=True"],
-            })(),
+            type(
+                "Round",
+                (),
+                {
+                    "round_index": 1,
+                    "bisect_mode": "initial",
+                    "tested_side": "keep",
+                    "result": "pass",
+                    "startup_success": True,
+                    "requested_targets": ["a.jar", "b.jar", "c.jar", "d.jar"],
+                    "kept_group": ["a.jar", "b.jar"],
+                    "tested_group": ["c.jar", "d.jar"],
+                    "moved_mods": [],
+                    "continuation_targets": [],
+                    "pending_other_group": ["c.jar", "d.jar"],
+                    "next_allowed_requests": ["switch_group"],
+                    "fallback_targets": [],
+                    "suspects_invalidated": False,
+                    "failure_kind": "",
+                    "failure_detail": "",
+                    "notes": ["start_success=True"],
+                },
+            )(),
         ],
     )
 
@@ -693,7 +753,7 @@ def test_generate_report_contains_complete_bisect_tree_section(tmp_path):
 
     assert "完整 Bisect Tree:" in report_text
     assert "Round 1: mode=initial" in report_text
-    assert "session.final_suspects=[\"b.jar\", \"c.jar\"]" in report_text
+    assert 'session.final_suspects=["b.jar", "c.jar"]' in report_text
 
 
 def test_format_bisect_tree_lines_accepts_legacy_dict_round_records():
@@ -833,7 +893,17 @@ def test_successful_start_with_pending_bisect_followup_triggers_success_ai_analy
     builder._append_attempt_trace = lambda *args, **kwargs: None
     builder.extract_relevant_log = lambda *_args, **_kwargs: {"log_tail": "", "crash_excerpt": "", "conflicts_or_exceptions": []}
     builder.start_server = lambda timeout=300: {"success": True, "success_source": "log_done", "stdout_tail": "Done", "stderr_tail": ""}
-    builder.analyze_with_ai = lambda context: {"primary_issue": "mod_conflict", "confidence": 0.5, "actions": [{"type": "bisect_mods", "bisect_mode": "switch_group", "bisect_reason": "继续验证另一组"}]}
+    builder.analyze_with_ai = lambda context: {
+        "primary_issue": "mod_conflict",
+        "confidence": 0.5,
+        "actions": [
+            {
+                "type": "bisect_mods",
+                "bisect_mode": "switch_group",
+                "bisect_reason": "继续验证另一组",
+            }
+        ],
+    }
 
     applied_actions: list[dict] = []
 
@@ -1000,13 +1070,15 @@ def test_build_prompt_mentions_success_guard_and_stable_split_strategy():
     builder = ServerBuilder.__new__(ServerBuilder)
     service = BuilderAIService(builder)
 
-    prompt = service.build_prompt({
-        "bisect_active": True,
-        "bisect_phase": "fallback",
-        "bisect_next_allowed_requests": ["switch_group"],
-        "bisect_success_ready": True,
-        "bisect_consecutive_same_issue_on_success": 1,
-    })
+    prompt = service.build_prompt(
+        {
+            "bisect_active": True,
+            "bisect_phase": "fallback",
+            "bisect_next_allowed_requests": ["switch_group"],
+            "bisect_success_ready": True,
+            "bisect_consecutive_same_issue_on_success": 1,
+        }
+    )
 
     assert "按文件名稳定排序后平分为 keep_group 与 test_group" in prompt
     assert "成功态防回归规则" in prompt

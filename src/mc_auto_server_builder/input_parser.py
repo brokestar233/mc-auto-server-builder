@@ -21,6 +21,109 @@ MODRINTH_PROJECT_RE = re.compile(
     r"modrinth\.com/(?:mod|modpack|resourcepack|shader|plugin|datapack)/([A-Za-z0-9\-_]+)",
     re.IGNORECASE,
 )
+
+
+def _zip_dir_exists(names: set[str], target: str) -> bool:
+    normalized = target.strip("/")
+    if not normalized:
+        return False
+    prefix = f"{normalized}/"
+    return any(name == normalized or name.startswith(prefix) for name in names)
+
+
+def _find_full_pack_version_entries(names: set[str]) -> tuple[str, list[str]] | None:
+    version_roots: dict[str, list[str]] = {}
+    for name in sorted(names):
+        parts = [part for part in name.split("/") if part]
+        if len(parts) < 3:
+            continue
+        if parts[0] != ".minecraft" or parts[1] != "versions":
+            continue
+        version_name = parts[2]
+        version_roots.setdefault(version_name, []).append(name)
+
+    if not version_roots:
+        return None
+
+    first_version = sorted(version_roots)[0]
+    return first_version, version_roots[first_version]
+
+
+def _infer_loader_from_version_json(version_json: dict) -> tuple[LoaderType, str | None]:
+    release_time = str(version_json.get("releaseTime") or "")
+    if "neoforge" in release_time.lower():
+        return "neoforge", None
+
+    libraries = version_json.get("libraries")
+    if not isinstance(libraries, list):
+        return "unknown", None
+
+    for lib in libraries:
+        if not isinstance(lib, dict):
+            continue
+        name = str(lib.get("name") or "")
+        if not name:
+            continue
+        lowered = name.lower()
+        parts = name.split(":")
+        version = parts[-1] if len(parts) >= 3 else None
+        if lowered.startswith("net.neoforged:neoforge"):
+            return "neoforge", version
+        if lowered.startswith("net.minecraftforge:forge"):
+            return "forge", version
+        if lowered.startswith("net.fabricmc:fabric-loader"):
+            return "fabric", version
+        if lowered.startswith("org.quiltmc:quilt-loader"):
+            return "quilt", version
+
+    return "unknown", None
+
+
+def _from_full_pack_zip(zf: ZipFile, names: set[str]) -> PackManifest:
+    if not _zip_dir_exists(names, ".minecraft"):
+        raise ValueError("ZIP 不包含 .minecraft 目录")
+
+    version_info = _find_full_pack_version_entries(names)
+    if not version_info:
+        raise ValueError("ZIP 未找到 .minecraft/versions 下的版本目录")
+
+    version_name, version_entries = version_info
+    version_json_path = f".minecraft/versions/{version_name}/{version_name}.json"
+    if version_json_path not in names:
+        raise ValueError(f"ZIP 未找到版本元数据: {version_json_path}")
+
+    version_json = json.loads(zf.read(version_json_path).decode("utf-8"))
+    mc_version = str(
+        version_json.get("clientVersion")
+        or version_json.get("inheritsFrom")
+        or version_json.get("id")
+        or version_name
+        or "unknown"
+    )
+    loader, loader_version = _infer_loader_from_version_json(version_json)
+
+    return PackManifest(
+        pack_name=version_name,
+        mc_version=mc_version,
+        loader=loader,
+        loader_version=loader_version,
+        mods=[],
+        raw={
+            "pack_type": "full_pack",
+            "full_pack": {
+                "version_name": version_name,
+                "version_dir": f".minecraft/versions/{version_name}",
+                "version_entries": sorted(version_entries),
+                "remove_files": [
+                    f"{version_name}.jar",
+                    f"{version_name}.json",
+                ],
+            },
+            "version_json": version_json,
+        },
+    )
+
+
 def parse_pack_input(value: str) -> PackInput:
     value = value.strip()
     p = Path(value)
@@ -73,6 +176,8 @@ def parse_manifest_from_zip(zip_path: str | Path) -> PackManifest:
         if "modrinth.index.json" in names:
             data = json.loads(zf.read("modrinth.index.json").decode("utf-8"))
             return _from_modrinth_manifest(data)
+        if _zip_dir_exists(names, ".minecraft"):
+            return _from_full_pack_zip(zf, names)
 
     raise ValueError(f"ZIP 内未找到 manifest.json 或 modrinth.index.json: {zpath}")
 

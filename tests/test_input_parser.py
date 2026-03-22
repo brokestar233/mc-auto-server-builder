@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import zipfile
 
-from mc_auto_server_builder.input_parser import parse_pack_input
+from mc_auto_server_builder.input_parser import parse_manifest_from_zip, parse_pack_input
 
 
 def test_parse_pack_input_local_zip(tmp_path):
@@ -32,3 +33,37 @@ def test_parse_pack_input_modrinth_version_url():
     assert result.source == "fabulously-optimized"
     assert result.file_id == "abc12345"
 
+
+def test_parse_manifest_from_zip_full_pack_uses_first_version_dir(tmp_path):
+    zip_path = tmp_path / "full-pack.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr(
+            ".minecraft/versions/1.20.1-forge-47.2.0/1.20.1-forge-47.2.0.json",
+            json.dumps(
+                {
+                    "id": "1.20.1-forge-47.2.0",
+                    "clientVersion": "1.20.1",
+                    "inheritsFrom": "1.20.1",
+                    "libraries": [
+                        {"name": "net.minecraftforge:forge:1.20.1-47.2.0"},
+                    ],
+                }
+            ),
+        )
+        zf.writestr(".minecraft/versions/1.20.1-forge-47.2.0/mods/example.jar", "mod")
+        zf.writestr(
+            ".minecraft/versions/zzz-second/zzz-second.json",
+            json.dumps({"id": "zzz-second", "libraries": []}),
+        )
+
+    manifest = parse_manifest_from_zip(zip_path)
+
+    assert manifest.pack_name == "1.20.1-forge-47.2.0"
+    assert manifest.mc_version == "1.20.1"
+    assert manifest.loader == "forge"
+    assert manifest.loader_version == "1.20.1-47.2.0"
+    assert manifest.raw["pack_type"] == "full_pack"
+    assert manifest.raw["full_pack"]["remove_files"] == [
+        "1.20.1-forge-47.2.0.jar",
+        "1.20.1-forge-47.2.0.json",
+    ]

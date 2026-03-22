@@ -43,7 +43,7 @@ class BuilderAIService:
         text = str(value)
         if len(text) <= limit:
             return text
-        return f"{text[:limit]}...<truncated:{len(text)-limit}>"
+        return f"{text[:limit]}...<truncated:{len(text) - limit}>"
 
     def _serialize_ai_action(self, action: object) -> dict:
         if isinstance(action, dict):
@@ -107,9 +107,7 @@ class BuilderAIService:
                 if isinstance(obj, dict):
                     self._ai_debug(f"response.parse.stage=raw_decode status=ok start={start} end={end}")
                     return obj
-                self._ai_debug(
-                    f"response.parse.stage=raw_decode status=skip_non_dict start={start} type={type(obj).__name__}"
-                )
+                self._ai_debug(f"response.parse.stage=raw_decode status=skip_non_dict start={start} type={type(obj).__name__}")
                 search_pos = max(start + 1, end)
             except json.JSONDecodeError:
                 search_pos = start + 1
@@ -159,7 +157,15 @@ class BuilderAIService:
             "config_error",
             "other",
         }
-        allowed_action = {"remove_mods", "adjust_memory", "change_java", "stop_and_report", "report_manual_fix", "bisect_mods", "move_bisect_mods"}
+        allowed_action = {
+            "remove_mods",
+            "adjust_memory",
+            "change_java",
+            "stop_and_report",
+            "report_manual_fix",
+            "bisect_mods",
+            "move_bisect_mods",
+        }
 
         final_output = data.get("final_output")
         final_output = final_output if isinstance(final_output, dict) else {}
@@ -584,7 +590,9 @@ class BuilderAIService:
         schema = {
             "thought_chain": ["最多 8 条简短推理"],
             "final_output": {
-                "primary_issue": "client_mod|memory_allocation|memory_oom|java_version_mismatch|mod_conflict|missing_dependency|config_error|other",
+                "primary_issue": (
+                    "client_mod|memory_allocation|memory_oom|java_version_mismatch|mod_conflict|missing_dependency|config_error|other"
+                ),
                 "confidence": 0.0,
                 "reason": "技术原因摘要",
                 "input_summary": "输入信息摘要",
@@ -597,28 +605,90 @@ class BuilderAIService:
                 "suggested_manual_steps": ["人工修复步骤"],
                 "actions": [
                     {"type": "remove_mods", "targets": ["modA.jar"], "rollback_on_failure": True},
-                    {"type": "bisect_mods", "bisect_mode": "initial", "targets": ["modA.jar", "modB.jar"], "bisect_reason": "日志无法唯一命中单个 mod，但这两个 mod 最可疑，申请系统先对最小 suspects 集合做受控二分", "max_rounds": 1},
-                    {"type": "bisect_mods", "bisect_mode": "switch_group", "bisect_reason": "当前组已启动成功，申请系统切换验证另一组"},
-                    {"type": "bisect_mods", "bisect_mode": "continue_failed_group", "bisect_reason": "失败组仍包含多个嫌疑 mod，申请继续稳定二分"},
+                    {
+                        "type": "bisect_mods",
+                        "bisect_mode": "initial",
+                        "targets": ["modA.jar", "modB.jar"],
+                        "bisect_reason": "日志无法唯一命中单个 mod，但这两个 mod 最可疑，申请系统先对最小 suspects 集合做受控二分",
+                        "max_rounds": 1,
+                    },
+                    {
+                        "type": "bisect_mods",
+                        "bisect_mode": "switch_group",
+                        "bisect_reason": "当前组已启动成功，申请系统切换验证另一组",
+                    },
+                    {
+                        "type": "bisect_mods",
+                        "bisect_mode": "continue_failed_group",
+                        "bisect_reason": "失败组仍包含多个嫌疑 mod，申请继续稳定二分",
+                    },
                     {"type": "move_bisect_mods", "targets": ["libX.jar"], "reason": "当前测试组缺少前置依赖，申请从另一组临时迁移"},
                     {"type": "adjust_memory", "xmx": "6G", "xms": "4G"},
                     {"type": "change_java", "version": 21},
-                    {"type": "report_manual_fix", "final_reason": "崩溃主因", "reason": "为什么无法自动修复", "manual_steps": ["步骤1"], "evidence": ["证据1"]},
+                    {
+                        "type": "report_manual_fix",
+                        "final_reason": "崩溃主因",
+                        "reason": "为什么无法自动修复",
+                        "manual_steps": ["步骤1"],
+                        "evidence": ["证据1"],
+                    },
                     {"type": "stop_and_report", "final_reason": "证据不足，保守停止"},
                 ],
             },
         }
-        return (
-            "你是一个专业的Minecraft服务器部署与优化助手。\n"
-            "任务目标：先识别主因，再选择最安全、最可执行的动作。证据优先级：异常堆栈/错误关键字 > 已删除客户端mod依赖链 > 最近自动操作 > 其他上下文。\n"
-            "硬规则：1. 若某个 mod 依赖任何已知且已删除的客户端 mod，则该 mod 必须判定为 remove_mods。2. 若 remove_mods 存在多个可能候选，默认一次只删除 1 个最有把握的 mod；不要一次删除多个候选，因为这类批量删除更容易被系统拦截。3. 对 remove_mods，若你希望系统在删除后做一次启动验证并在失败时自动回滚，则显式输出 rollback_on_failure=true。4. 若单个 remove_mods 候选执行后仍不能解决问题，且证据不再足以唯一锁定下一个单一 mod，则优先回到删除前基线并改用受控二分，而不是继续盲目累计删除。5. 输出 bisect_mods 时，bisect_mode 只能是 initial|switch_group|continue_failed_group，且 AI 不得指定 keep_group 或 test_group。6. 若最近一次阻止原因为 duplicate_bisect_stage_request 或 duplicate_bisect_request_after_previous_round，则禁止再次输出任何 bisect_mods，必须改为 report_manual_fix、remove_mods、adjust_memory、change_java 或 stop_and_report。\n"
-            "二分状态机：1. 若 bisect_state.active=true，优先消费 last_feedback、next_allowed_requests、fallback_targets，不得自由重猜 suspects。2. 系统分组方式固定为：按文件名稳定排序后平分为 keep_group 与 test_group；AI 只能请求 suspects，不能手工指定分组。3. 只有系统明确允许 switch_group 时，才能申请 switch_group；只有系统明确允许 continue_failed_group 时，才能申请 continue_failed_group。4. 若 suspects_invalidated=true 且 next_allowed_requests 包含 initial，则这表示系统已进入新的 fallback initial phase；此时 initial 只能使用 fallback_targets，不能复用旧的最小猜测子集，也不应视为重复请求。5. 仅当 bisect_state.active=true 且 next_allowed_requests 为空时，才不得输出 bisect_mods；若 bisect_state.active=false，且仍有至少 2 个可疑 mod，则允许发起 initial。6. 若上一轮 keep/test 分组与结果已明确，你的 actions 必须与 tested_side、pending_group、continuation_targets 保持一致。\n"
-            "成功态防回归规则：1. 普通安装可由 log_done 等信号判成功，但只要 bisect_state.active=true，就绝不能把这次启动视为最终成功。2. 若 bisect_state.success_ready=true，说明系统已收敛完二分，AI 应避免再发起新的大范围回归动作。3. 若 bisect_state.consecutive_same_issue_on_success>=1，表示系统已经在成功态连续观察到同类问题；此时必须更保守，优先 remove_mods 或 report_manual_fix，不要重复输出等价的 client_mod 二分。4. 若 success_guard_history 已显示连续同类 client_mod 判断，而证据仍不能收敛到新动作，则必须 report_manual_fix，禁止无意义循环。\n"
-            "动作优先级：1. 证据已唯一命中单个 mod 或明确依赖链时，优先 remove_mods；若同时有多个 remove_mods 候选，也应只提交其中最有把握的那 1 个。2. 若该单删动作只是高置信试探、删除后可能需要立即验证是否误删，优先为 remove_mods 增加 rollback_on_failure=true。3. 若多个候选都可疑但没有足够把握安全单删，或单删后问题依旧且需要重新缩小范围，则优先回滚该删除思路并给出最小 suspects 集合申请 bisect_mods。4. 只有在证据明确表明当前测试组缺少必要依赖，且该依赖位于另一组时，才可追加 move_bisect_mods。5. 若系统连续无进展或无法安全自动修复，但能说明原因与修复步骤，必须输出 report_manual_fix。6. 只有当无法唯一命中单一 mod、无法构造至少 2 个 mod 的 suspects、系统也未开放任何续轮二分动作、且现有证据不足以支持 remove_mods、adjust_memory、change_java 或 report_manual_fix 时，才允许 stop_and_report。\n"
-            "schema补充：move_bisect_mods 只能跟在一个已准备好的 bisect_mods 之后，targets 表示要从另一组临时迁移到当前测试组的少量 mod。\n"
-            "输出必须是严格 JSON，不要包含 markdown 代码块，不要输出额外解释。\n"
-            f"结构化上下文: {json.dumps(context, ensure_ascii=False)[:12000]}\n"
-            f"返回 JSON Schema 示例: {json.dumps(schema, ensure_ascii=False)}"
+        return "".join(
+            [
+                "你是一个专业的Minecraft服务器部署与优化助手。\n",
+                "任务目标：先识别主因，再选择最安全、最可执行的动作。"
+                "证据优先级：异常堆栈/错误关键字 > 已删除客户端mod依赖链 > 最近自动操作 > 其他上下文。\n",
+                "硬规则：1. 若某个 mod 依赖任何已知且已删除的客户端 mod，则该 mod 必须判定为 remove_mods。"
+                "2. 若 remove_mods 存在多个可能候选，默认一次只删除 1 个最有把握的 mod；"
+                "不要一次删除多个候选，因为这类批量删除更容易被系统拦截。"
+                "3. 对 remove_mods，若你希望系统在删除后做一次启动验证并在失败时自动回滚，"
+                "则显式输出 rollback_on_failure=true。"
+                "4. 若单个 remove_mods 候选执行后仍不能解决问题，且证据不再足以唯一锁定下一个单一 mod，"
+                "则优先回到删除前基线并改用受控二分，而不是继续盲目累计删除。"
+                "5. 输出 bisect_mods 时，bisect_mode 只能是 initial|switch_group|continue_failed_group，"
+                "且 AI 不得指定 keep_group 或 test_group。"
+                "6. 若最近一次阻止原因为 duplicate_bisect_stage_request 或 "
+                "duplicate_bisect_request_after_previous_round，则禁止再次输出任何 bisect_mods，"
+                "必须改为 report_manual_fix、remove_mods、adjust_memory、change_java 或 stop_and_report。\n",
+                "二分状态机：1. 若 bisect_state.active=true，优先消费 last_feedback、"
+                "next_allowed_requests、fallback_targets，不得自由重猜 suspects。"
+                "2. 系统分组方式固定为：按文件名稳定排序后平分为 keep_group 与 test_group；"
+                "AI 只能请求 suspects，不能手工指定分组。"
+                "3. 只有系统明确允许 switch_group 时，才能申请 switch_group；"
+                "只有系统明确允许 continue_failed_group 时，才能申请 continue_failed_group。"
+                "4. 若 suspects_invalidated=true 且 next_allowed_requests 包含 initial，"
+                "则这表示系统已进入新的 fallback initial phase；此时 initial 只能使用 fallback_targets，"
+                "不能复用旧的最小猜测子集，也不应视为重复请求。"
+                "5. 仅当 bisect_state.active=true 且 next_allowed_requests 为空时，才不得输出 bisect_mods；"
+                "若 bisect_state.active=false，且仍有至少 2 个可疑 mod，则允许发起 initial。"
+                "6. 若上一轮 keep/test 分组与结果已明确，你的 actions 必须与 tested_side、"
+                "pending_group、continuation_targets 保持一致。\n",
+                "成功态防回归规则：1. 普通安装可由 log_done 等信号判成功，但只要 bisect_state.active=true，"
+                "就绝不能把这次启动视为最终成功。2. 若 bisect_state.success_ready=true，说明系统已收敛完二分，"
+                "AI 应避免再发起新的大范围回归动作。3. 若 bisect_state.consecutive_same_issue_on_success>=1，"
+                "表示系统已经在成功态连续观察到同类问题；此时必须更保守，优先 remove_mods 或 report_manual_fix，"
+                "不要重复输出等价的 client_mod 二分。4. 若 success_guard_history 已显示连续同类 client_mod 判断，"
+                "而证据仍不能收敛到新动作，则必须 report_manual_fix，禁止无意义循环。\n",
+                "动作优先级：1. 证据已唯一命中单个 mod 或明确依赖链时，优先 remove_mods；"
+                "若同时有多个 remove_mods 候选，也应只提交其中最有把握的那 1 个。"
+                "2. 若该单删动作只是高置信试探、删除后可能需要立即验证是否误删，"
+                "优先为 remove_mods 增加 rollback_on_failure=true。"
+                "3. 若多个候选都可疑但没有足够把握安全单删，或单删后问题依旧且需要重新缩小范围，"
+                "则优先回滚该删除思路并给出最小 suspects 集合申请 bisect_mods。"
+                "4. 只有在证据明确表明当前测试组缺少必要依赖，且该依赖位于另一组时，"
+                "才可追加 move_bisect_mods。5. 若系统连续无进展或无法安全自动修复，但能说明原因与修复步骤，"
+                "必须输出 report_manual_fix。6. 只有当无法唯一命中单一 mod、无法构造至少 2 个 mod 的 suspects、"
+                "系统也未开放任何续轮二分动作、且现有证据不足以支持 remove_mods、adjust_memory、change_java "
+                "或 report_manual_fix 时，才允许 stop_and_report。\n",
+                "schema补充：move_bisect_mods 只能跟在一个已准备好的 bisect_mods 之后，"
+                "targets 表示要从另一组临时迁移到当前测试组的少量 mod。\n",
+                "输出必须是严格 JSON，不要包含 markdown 代码块，不要输出额外解释。\n",
+                f"结构化上下文: {json.dumps(context, ensure_ascii=False)[:12000]}\n",
+                f"返回 JSON Schema 示例: {json.dumps(schema, ensure_ascii=False)}",
+            ]
         )
 
     def analyze(self, context: dict) -> dict:
@@ -669,7 +739,7 @@ class BuilderAIService:
                 if not isinstance(parsed, dict):
                     self._ai_debug("response.parse failed reason=no_json_object attempt=2")
                     raise ValueError("ai_response_invalid_json")
-            self._ai_debug("response.parse success parsed=" f"{json.dumps(parsed, ensure_ascii=False)[:2000]}")
+            self._ai_debug(f"response.parse success parsed={json.dumps(parsed, ensure_ascii=False)[:2000]}")
             self.builder.last_ai_payload = parsed
             result = self._normalize_ai_result(parsed)
         except Exception as e:

@@ -28,8 +28,8 @@ from .defaults import (
 )
 from .input_parser import parse_manifest_from_zip, parse_pack_input
 from .models import (
-    AIResult,
     ActionPreflight,
+    AIResult,
     AttemptTrace,
     BisectMoveRecord,
     BisectRoundRecord,
@@ -94,10 +94,12 @@ class ServerBuilder:
         self.jvm_xmx = self.config.memory.xmx
         self.jvm_xms = self.config.memory.xms
         self.extra_jvm_flags = list(
-            dict.fromkeys([
-                *self._resolve_java_params_for_version(self.current_java_version),
-                *self.config.extra_jvm_flags,
-            ])
+            dict.fromkeys(
+                [
+                    *self._resolve_java_params_for_version(self.current_java_version),
+                    *self.config.extra_jvm_flags,
+                ]
+            )
         )
         self.operations: list[str] = []
         self.removed_mods: list[str] = []
@@ -488,35 +490,43 @@ class ServerBuilder:
                 }
                 for item in round_record.moved_mods
             ]
-            lines.extend([
-                f"- Round {round_record.round_index}: mode={round_record.bisect_mode}, tested_side={round_record.tested_side}, result={round_record.result}, startup_success={round_record.startup_success}",
-                f"  requested_targets={json.dumps(round_record.requested_targets, ensure_ascii=False)}",
-                f"  keep_group={json.dumps(round_record.kept_group, ensure_ascii=False)}",
-                f"  test_group={json.dumps(round_record.tested_group, ensure_ascii=False)}",
-                f"  moved_mods={json.dumps(moved, ensure_ascii=False)}",
-                f"  continuation_targets={json.dumps(round_record.continuation_targets, ensure_ascii=False)}",
-                f"  pending_other_group={json.dumps(round_record.pending_other_group, ensure_ascii=False)}",
-                f"  next_allowed_requests={json.dumps(round_record.next_allowed_requests, ensure_ascii=False)}",
-                f"  fallback_targets={json.dumps(round_record.fallback_targets, ensure_ascii=False)}",
-                f"  suspects_invalidated={round_record.suspects_invalidated}",
-                f"  failure_kind={round_record.failure_kind or 'none'}",
-                f"  failure_detail={round_record.failure_detail or 'none'}",
-                f"  notes={json.dumps(round_record.notes, ensure_ascii=False)}",
-            ])
-        lines.extend([
-            f"- session.phase={getattr(session, 'phase', 'initial')}",
-            f"- session.final_suspects={json.dumps(session.final_suspects, ensure_ascii=False)}",
-            f"- session.pending_group={json.dumps(session.pending_group, ensure_ascii=False)}",
-            f"- session.continuation_targets={json.dumps(session.continuation_targets, ensure_ascii=False)}",
-            f"- session.next_allowed_requests={json.dumps(session.next_allowed_requests, ensure_ascii=False)}",
-            f"- session.fallback_targets={json.dumps(session.fallback_targets, ensure_ascii=False)}",
-            f"- session.suspects_invalidated={session.suspects_invalidated}",
-            f"- session.stagnant_rounds={getattr(session, 'stagnant_rounds', 0)}",
-            f"- session.last_preflight_block_reason={getattr(session, 'last_preflight_block_reason', '') or 'none'}",
-            f"- session.success_ready={getattr(session, 'success_ready', False)}",
-            f"- session.success_guard_reason={getattr(session, 'success_guard_reason', '') or 'none'}",
-            f"- session.consecutive_same_issue_on_success={getattr(session, 'consecutive_same_issue_on_success', 0)}",
-        ])
+            lines.extend(
+                [
+                    (
+                        f"- Round {round_record.round_index}: mode={round_record.bisect_mode}, "
+                        f"tested_side={round_record.tested_side}, result={round_record.result}, "
+                        f"startup_success={round_record.startup_success}"
+                    ),
+                    f"  requested_targets={json.dumps(round_record.requested_targets, ensure_ascii=False)}",
+                    f"  keep_group={json.dumps(round_record.kept_group, ensure_ascii=False)}",
+                    f"  test_group={json.dumps(round_record.tested_group, ensure_ascii=False)}",
+                    f"  moved_mods={json.dumps(moved, ensure_ascii=False)}",
+                    f"  continuation_targets={json.dumps(round_record.continuation_targets, ensure_ascii=False)}",
+                    f"  pending_other_group={json.dumps(round_record.pending_other_group, ensure_ascii=False)}",
+                    f"  next_allowed_requests={json.dumps(round_record.next_allowed_requests, ensure_ascii=False)}",
+                    f"  fallback_targets={json.dumps(round_record.fallback_targets, ensure_ascii=False)}",
+                    f"  suspects_invalidated={round_record.suspects_invalidated}",
+                    f"  failure_kind={round_record.failure_kind or 'none'}",
+                    f"  failure_detail={round_record.failure_detail or 'none'}",
+                    f"  notes={json.dumps(round_record.notes, ensure_ascii=False)}",
+                ]
+            )
+        lines.extend(
+            [
+                f"- session.phase={getattr(session, 'phase', 'initial')}",
+                f"- session.final_suspects={json.dumps(session.final_suspects, ensure_ascii=False)}",
+                f"- session.pending_group={json.dumps(session.pending_group, ensure_ascii=False)}",
+                f"- session.continuation_targets={json.dumps(session.continuation_targets, ensure_ascii=False)}",
+                f"- session.next_allowed_requests={json.dumps(session.next_allowed_requests, ensure_ascii=False)}",
+                f"- session.fallback_targets={json.dumps(session.fallback_targets, ensure_ascii=False)}",
+                f"- session.suspects_invalidated={session.suspects_invalidated}",
+                f"- session.stagnant_rounds={getattr(session, 'stagnant_rounds', 0)}",
+                f"- session.last_preflight_block_reason={getattr(session, 'last_preflight_block_reason', '') or 'none'}",
+                f"- session.success_ready={getattr(session, 'success_ready', False)}",
+                f"- session.success_guard_reason={getattr(session, 'success_guard_reason', '') or 'none'}",
+                f"- session.consecutive_same_issue_on_success={getattr(session, 'consecutive_same_issue_on_success', 0)}",
+            ]
+        )
         return lines
 
     def _has_pending_bisect_followup(self) -> bool:
@@ -641,12 +651,12 @@ class ServerBuilder:
             return bisect_mode, list(getattr(session, "pending_group", []) or [])
         if bisect_mode == "continue_failed_group":
             return bisect_mode, list(getattr(session, "continuation_targets", []) or [])
-        suspects = self._resolve_mod_names_to_installed(
-            [str(x) for x in (action.get("targets") or self.list_mods()) if str(x).strip()]
-        )
+        suspects = self._resolve_mod_names_to_installed([str(x) for x in (action.get("targets") or self.list_mods()) if str(x).strip()])
         if bisect_mode == "initial":
             fallback_targets = list(getattr(session, "fallback_targets", []) or [])
-            fallback_allowed = bool(getattr(session, "suspects_invalidated", False)) and "initial" in list(getattr(session, "next_allowed_requests", []) or [])
+            fallback_allowed = bool(getattr(session, "suspects_invalidated", False)) and "initial" in list(
+                getattr(session, "next_allowed_requests", []) or []
+            )
             if fallback_allowed and fallback_targets:
                 resolved_fallback = self._resolve_mod_names_to_installed(fallback_targets)
                 if resolved_fallback:
@@ -702,16 +712,11 @@ class ServerBuilder:
         inactive = [m for m in installed if m not in resolved_active]
         if inactive:
             self.remove_mods_by_name(inactive, source="bisect", reason=reason)
-        self.operations.append(
-            f"bisect_set_active:snapshot={snapshot_tag}:active={json.dumps(resolved_active, ensure_ascii=False)}"
-        )
+        self.operations.append(f"bisect_set_active:snapshot={snapshot_tag}:active={json.dumps(resolved_active, ensure_ascii=False)}")
         return resolved_active
 
     def _build_bisect_move_records(self, moved_mods: list[str], from_group: str, to_group: str, reason: str) -> list[BisectMoveRecord]:
-        return [
-            BisectMoveRecord(mod_name=mod_name, from_group=from_group, to_group=to_group, reason=reason)
-            for mod_name in moved_mods
-        ]
+        return [BisectMoveRecord(mod_name=mod_name, from_group=from_group, to_group=to_group, reason=reason) for mod_name in moved_mods]
 
     def _prepare_bisect_round_plan(self, idx: int, action: dict, snapshot_tag: str) -> tuple[dict[str, object], dict[str, object]]:
         bisect_mode, suspects = self._consume_bisect_targets(action)
@@ -750,7 +755,10 @@ class ServerBuilder:
             "test_group": test_group,
             "suspects": suspects,
         }
-        self._log_bisect_event("install.bisect.start", {"round_index": plan["round_index"], "bisect_mode": bisect_mode, "suspects": suspects, "snapshot_tag": snapshot_tag})
+        self._log_bisect_event(
+            "install.bisect.start",
+            {"round_index": plan["round_index"], "bisect_mode": bisect_mode, "suspects": suspects, "snapshot_tag": snapshot_tag},
+        )
         self._log_bisect_event("install.bisect.groups", {"bisect_mode": bisect_mode, "keep_group": keep_group, "test_group": test_group})
         return plan, execution
 
@@ -778,18 +786,22 @@ class ServerBuilder:
         start_res = self.start_server(timeout=self.config.runtime.start_timeout)
         round_result = "pass" if bool(start_res.get("success")) else "fail"
         failure_kind, failure_detail = self._classify_bisect_failure(start_res)
-        final_suspects, pending_group, continuation_targets, next_allowed_requests, fallback_targets, suspects_invalidated = self._derive_bisect_followups(
-            bisect_mode=bisect_mode,
-            tested_side=tested_side,
-            round_result=round_result,
-            failure_kind=failure_kind,
-            keep_group=keep_group,
-            test_group=test_group,
-            active_after_setup=active_after_setup,
-            suspects=suspects,
-            source_mods=source_mods,
+        final_suspects, pending_group, continuation_targets, next_allowed_requests, fallback_targets, suspects_invalidated = (
+            self._derive_bisect_followups(
+                bisect_mode=bisect_mode,
+                tested_side=tested_side,
+                round_result=round_result,
+                failure_kind=failure_kind,
+                keep_group=keep_group,
+                test_group=test_group,
+                active_after_setup=active_after_setup,
+                suspects=suspects,
+                source_mods=source_mods,
+            )
         )
-        move_records = self._build_bisect_move_records(moved_mods, from_group="test" if tested_side == "keep" else "keep", to_group=tested_side, reason="startup_dependency_probe")
+        move_records = self._build_bisect_move_records(
+            moved_mods, from_group="test" if tested_side == "keep" else "keep", to_group=tested_side, reason="startup_dependency_probe"
+        )
         round_record = BisectRoundRecord(
             round_index=int(plan.get("round_index") or max(1, len(session.rounds) + 1)),
             requested_targets=list(suspects),
@@ -810,9 +822,33 @@ class ServerBuilder:
             suspects_invalidated=suspects_invalidated,
             notes=notes + [f"start_success={bool(start_res.get('success'))}"],
         )
-        feedback = self._build_bisect_feedback_payload(suspects=suspects, bisect_mode=bisect_mode, tested_side=tested_side, keep_group=keep_group, test_group=test_group, moved_mods=moved_mods, round_result=round_result, startup_success=bool(start_res.get("success")), failure_kind="" if round_result == "pass" else failure_kind, failure_detail="" if round_result == "pass" else failure_detail, reason=bisect_reason, pending_group=pending_group, continuation_targets=continuation_targets, next_allowed_requests=next_allowed_requests, fallback_targets=fallback_targets, suspects_invalidated=suspects_invalidated)
+        feedback = self._build_bisect_feedback_payload(
+            suspects=suspects,
+            bisect_mode=bisect_mode,
+            tested_side=tested_side,
+            keep_group=keep_group,
+            test_group=test_group,
+            moved_mods=moved_mods,
+            round_result=round_result,
+            startup_success=bool(start_res.get("success")),
+            failure_kind="" if round_result == "pass" else failure_kind,
+            failure_detail="" if round_result == "pass" else failure_detail,
+            reason=bisect_reason,
+            pending_group=pending_group,
+            continuation_targets=continuation_targets,
+            next_allowed_requests=next_allowed_requests,
+            fallback_targets=fallback_targets,
+            suspects_invalidated=suspects_invalidated,
+        )
         completed_requests = list(dict.fromkeys([*(getattr(session, "completed_requests", []) or []), bisect_mode]))
-        progress_token = self._make_bisect_progress_token(suspects=suspects, bisect_mode=bisect_mode, tested_side=tested_side, round_result=round_result, final_suspects=final_suspects, next_allowed_requests=next_allowed_requests)
+        progress_token = self._make_bisect_progress_token(
+            suspects=suspects,
+            bisect_mode=bisect_mode,
+            tested_side=tested_side,
+            round_result=round_result,
+            final_suspects=final_suspects,
+            next_allowed_requests=next_allowed_requests,
+        )
         previous_token = str(getattr(session, "progress_token", "") or "")
         stagnant_rounds = int(getattr(session, "stagnant_rounds", 0) or 0)
         if progress_token == previous_token:
@@ -820,16 +856,89 @@ class ServerBuilder:
             round_record.notes.append(f"stagnant_round_detected={stagnant_rounds}")
         else:
             stagnant_rounds = 0
-        self.bisect_session = BisectSession(**{**asdict(session), "active": bool(next_allowed_requests or pending_group or continuation_targets or fallback_targets or (round_result != "pass" and len(final_suspects) > 1)), "source_mods": list(source_mods), "suspect_mods": list(final_suspects), "safe_mods": [m for m in source_mods if m not in final_suspects], "rounds": [*session.rounds, round_record], "final_suspects": list(final_suspects if len(final_suspects) <= 3 else final_suspects[:3]), "stopped_reason": "bisect_round_completed", "last_round_feedback": feedback, "pending_group": list(pending_group), "continuation_targets": list(continuation_targets), "next_allowed_requests": list(next_allowed_requests), "completed_requests": completed_requests, "fallback_targets": list(fallback_targets), "suspects_invalidated": suspects_invalidated, "progress_token": progress_token, "stagnant_rounds": stagnant_rounds, "pending_round_plan": {}})
+        self.bisect_session = BisectSession(
+            **{
+                **asdict(session),
+                "active": bool(
+                    next_allowed_requests
+                    or pending_group
+                    or continuation_targets
+                    or fallback_targets
+                    or (round_result != "pass" and len(final_suspects) > 1)
+                ),
+                "source_mods": list(source_mods),
+                "suspect_mods": list(final_suspects),
+                "safe_mods": [m for m in source_mods if m not in final_suspects],
+                "rounds": [*session.rounds, round_record],
+                "final_suspects": list(final_suspects if len(final_suspects) <= 3 else final_suspects[:3]),
+                "stopped_reason": "bisect_round_completed",
+                "last_round_feedback": feedback,
+                "pending_group": list(pending_group),
+                "continuation_targets": list(continuation_targets),
+                "next_allowed_requests": list(next_allowed_requests),
+                "completed_requests": completed_requests,
+                "fallback_targets": list(fallback_targets),
+                "suspects_invalidated": suspects_invalidated,
+                "progress_token": progress_token,
+                "stagnant_rounds": stagnant_rounds,
+                "pending_round_plan": {},
+            }
+        )
         self.last_bisect_feedback = feedback
         self.rollback_mods(snapshot_tag)
-        self._log_bisect_event("install.bisect.result", {"bisect_mode": bisect_mode, "tested_side": tested_side, "result": round_result, "startup_success": bool(start_res.get("success")), "failure_kind": "" if round_result == "pass" else failure_kind, "moved_mods": moved_mods, "active_after_setup": active_after_setup, "stagnant_rounds": stagnant_rounds})
-        self._log_bisect_event("install.bisect.next", {"next_suspects": final_suspects, "pending_group": pending_group, "continuation_targets": continuation_targets, "next_allowed_requests": next_allowed_requests, "fallback_targets": fallback_targets, "suspects_invalidated": suspects_invalidated})
-        self.operations.append("bisect_round:" f"result={round_result}:keep={json.dumps(keep_group, ensure_ascii=False)}:" f"test={json.dumps(test_group, ensure_ascii=False)}:moves={json.dumps(moved_mods, ensure_ascii=False)}")
-        execution = {"index": idx, "action_type": "bisect_mods", "status": "applied", "snapshot_tag": snapshot_tag, "result": round_result, "tested_side": tested_side, "keep_group": keep_group, "test_group": test_group, "moved_mods": moved_mods, "next_suspects": final_suspects, "startup_success": bool(start_res.get("success")), "failure_kind": "" if round_result == "pass" else failure_kind, "already_bisected": True, "next_allowed_requests": next_allowed_requests, "fallback_targets": fallback_targets, "suspects_invalidated": suspects_invalidated, "feedback": feedback}
+        self._log_bisect_event(
+            "install.bisect.result",
+            {
+                "bisect_mode": bisect_mode,
+                "tested_side": tested_side,
+                "result": round_result,
+                "startup_success": bool(start_res.get("success")),
+                "failure_kind": "" if round_result == "pass" else failure_kind,
+                "moved_mods": moved_mods,
+                "active_after_setup": active_after_setup,
+                "stagnant_rounds": stagnant_rounds,
+            },
+        )
+        self._log_bisect_event(
+            "install.bisect.next",
+            {
+                "next_suspects": final_suspects,
+                "pending_group": pending_group,
+                "continuation_targets": continuation_targets,
+                "next_allowed_requests": next_allowed_requests,
+                "fallback_targets": fallback_targets,
+                "suspects_invalidated": suspects_invalidated,
+            },
+        )
+        self.operations.append(
+            "bisect_round:"
+            f"result={round_result}:keep={json.dumps(keep_group, ensure_ascii=False)}:"
+            f"test={json.dumps(test_group, ensure_ascii=False)}:moves={json.dumps(moved_mods, ensure_ascii=False)}"
+        )
+        execution = {
+            "index": idx,
+            "action_type": "bisect_mods",
+            "status": "applied",
+            "snapshot_tag": snapshot_tag,
+            "result": round_result,
+            "tested_side": tested_side,
+            "keep_group": keep_group,
+            "test_group": test_group,
+            "moved_mods": moved_mods,
+            "next_suspects": final_suspects,
+            "startup_success": bool(start_res.get("success")),
+            "failure_kind": "" if round_result == "pass" else failure_kind,
+            "already_bisected": True,
+            "next_allowed_requests": next_allowed_requests,
+            "fallback_targets": fallback_targets,
+            "suspects_invalidated": suspects_invalidated,
+            "feedback": feedback,
+        }
         return False, execution, None
 
-    def _run_move_bisect_mods_action(self, idx: int, action: dict, snapshot_tag: str) -> tuple[bool, dict[str, object], dict[str, object] | None]:
+    def _run_move_bisect_mods_action(
+        self, idx: int, action: dict, snapshot_tag: str
+    ) -> tuple[bool, dict[str, object], dict[str, object] | None]:
         session = self._coerce_bisect_session()
         plan = dict(getattr(session, "pending_round_plan", {}) or {})
         execution: dict[str, object] = {"index": idx, "action_type": "move_bisect_mods", "status": "skipped", "snapshot_tag": snapshot_tag}
@@ -838,7 +947,9 @@ class ServerBuilder:
             return False, execution, None
         tested_side = str(plan.get("tested_side") or "keep")
         opposite_group = list(plan.get("test_group") or []) if tested_side == "keep" else list(plan.get("keep_group") or [])
-        move_targets = self._resolve_mod_names_to_installed([str(x) for x in (action.get("targets") or []) if str(x).strip()], candidates=opposite_group)
+        move_targets = self._resolve_mod_names_to_installed(
+            [str(x) for x in (action.get("targets") or []) if str(x).strip()], candidates=opposite_group
+        )
         active_group = list(plan.get("active_group") or [])
         moved_mods = list(plan.get("moved_mods") or [])
         for mod_name in move_targets:
@@ -851,7 +962,9 @@ class ServerBuilder:
         self._store_pending_bisect_round_plan(plan)
         return self._execute_pending_bisect_round(plan)
 
-    def _run_bisect_mods_action(self, idx: int, action: dict, snapshot_tag: str) -> tuple[bool, dict[str, object], dict[str, object] | None]:
+    def _run_bisect_mods_action(
+        self, idx: int, action: dict, snapshot_tag: str
+    ) -> tuple[bool, dict[str, object], dict[str, object] | None]:
         bisect_mode, suspects = self._consume_bisect_targets(action)
         session = self._coerce_bisect_session()
         source_mods = list(getattr(session, "source_mods", []) or self.list_mods())
@@ -921,16 +1034,18 @@ class ServerBuilder:
         start_res = self.start_server(timeout=self.config.runtime.start_timeout)
         round_result = "pass" if bool(start_res.get("success")) else "fail"
         failure_kind, failure_detail = self._classify_bisect_failure(start_res)
-        final_suspects, pending_group, continuation_targets, next_allowed_requests, fallback_targets, suspects_invalidated = self._derive_bisect_followups(
-            bisect_mode=bisect_mode,
-            tested_side=tested_side,
-            round_result=round_result,
-            failure_kind=failure_kind,
-            keep_group=keep_group,
-            test_group=test_group,
-            active_after_setup=active_after_setup,
-            suspects=suspects,
-            source_mods=source_mods,
+        final_suspects, pending_group, continuation_targets, next_allowed_requests, fallback_targets, suspects_invalidated = (
+            self._derive_bisect_followups(
+                bisect_mode=bisect_mode,
+                tested_side=tested_side,
+                round_result=round_result,
+                failure_kind=failure_kind,
+                keep_group=keep_group,
+                test_group=test_group,
+                active_after_setup=active_after_setup,
+                suspects=suspects,
+                source_mods=source_mods,
+            )
         )
         move_records = self._build_bisect_move_records(
             moved_mods,
@@ -999,7 +1114,13 @@ class ServerBuilder:
         else:
             stagnant_rounds = 0
         self.bisect_session = BisectSession(
-            active=bool(next_allowed_requests or pending_group or continuation_targets or fallback_targets or (round_result != "pass" and len(final_suspects) > 1)),
+            active=bool(
+                next_allowed_requests
+                or pending_group
+                or continuation_targets
+                or fallback_targets
+                or (round_result != "pass" and len(final_suspects) > 1)
+            ),
             source_mods=list(source_mods),
             suspect_mods=list(final_suspects),
             safe_mods=[m for m in source_mods if m not in final_suspects],
@@ -1017,8 +1138,22 @@ class ServerBuilder:
             suspects_invalidated=suspects_invalidated,
             progress_token=progress_token,
             stagnant_rounds=stagnant_rounds,
-            success_ready=bool(round_result == "pass" and not next_allowed_requests and not pending_group and not continuation_targets and not fallback_targets),
-            success_guard_reason=("bisect_converged" if round_result == "pass" and not next_allowed_requests and not pending_group and not continuation_targets and not fallback_targets else ""),
+            success_ready=bool(
+                round_result == "pass"
+                and not next_allowed_requests
+                and not pending_group
+                and not continuation_targets
+                and not fallback_targets
+            ),
+            success_guard_reason=(
+                "bisect_converged"
+                if round_result == "pass"
+                and not next_allowed_requests
+                and not pending_group
+                and not continuation_targets
+                and not fallback_targets
+                else ""
+            ),
             success_guard_history=list(getattr(session, "success_guard_history", []) or []),
             consecutive_same_issue_on_success=0,
         )
@@ -1126,7 +1261,13 @@ class ServerBuilder:
         if action_type == "bisect_mods":
             bisect_mode = str(action.get("bisect_mode") or "initial").strip() or "initial"
             if bisect_mode not in {"initial", "switch_group", "continue_failed_group"}:
-                return ActionPreflight(action_type=action_type, risk="high", allowed=False, reason="invalid_bisect_mode", details=[f"bisect_mode={bisect_mode}"])
+                return ActionPreflight(
+                    action_type=action_type,
+                    risk="high",
+                    allowed=False,
+                    reason="invalid_bisect_mode",
+                    details=[f"bisect_mode={bisect_mode}"],
+                )
             session = self._coerce_bisect_session()
             next_allowed = list(getattr(session, "next_allowed_requests", []) or [])
             completed = set(getattr(session, "completed_requests", []) or [])
@@ -1136,7 +1277,13 @@ class ServerBuilder:
             details.append(f"request_source={request_source}")
             if bisect_mode != "initial" and bisect_mode not in next_allowed:
                 details.append(f"next_allowed_requests={json.dumps(next_allowed, ensure_ascii=False)}")
-                return ActionPreflight(action_type=action_type, risk="medium", allowed=False, reason="bisect_request_not_allowed_in_current_state", details=details)
+                return ActionPreflight(
+                    action_type=action_type,
+                    risk="medium",
+                    allowed=False,
+                    reason="bisect_request_not_allowed_in_current_state",
+                    details=details,
+                )
             if bisect_mode == "switch_group":
                 resolved = self._resolve_mod_names_to_installed(list(getattr(session, "pending_group", []) or []))
             elif bisect_mode == "continue_failed_group":
@@ -1167,17 +1314,31 @@ class ServerBuilder:
                 request_token = f"initial:fallback:{','.join(sorted(resolved, key=str.lower))}"
                 details.append("fallback_phase=auto_resume")
             if len(resolved) < 2:
-                return ActionPreflight(action_type=action_type, risk="medium", allowed=False, reason="insufficient_mods_for_bisect", details=details)
+                return ActionPreflight(
+                    action_type=action_type, risk="medium", allowed=False, reason="insufficient_mods_for_bisect", details=details
+                )
             if len(resolved) > 24:
-                return ActionPreflight(action_type=action_type, risk="high", allowed=False, reason="too_many_mod_targets_for_bisect", details=details)
+                return ActionPreflight(
+                    action_type=action_type, risk="high", allowed=False, reason="too_many_mod_targets_for_bisect", details=details
+                )
             if len(move_candidates) > 3:
-                return ActionPreflight(action_type=action_type, risk="high", allowed=False, reason="too_many_dependency_moves", details=details)
+                return ActionPreflight(
+                    action_type=action_type, risk="high", allowed=False, reason="too_many_dependency_moves", details=details
+                )
             if request_token in completed_tokens and bisect_mode != "continue_failed_group":
                 details.append(f"completed_request_tokens={json.dumps(sorted(completed_tokens), ensure_ascii=False)}")
-                return ActionPreflight(action_type=action_type, risk="medium", allowed=False, reason="duplicate_bisect_stage_request", details=details)
+                return ActionPreflight(
+                    action_type=action_type,
+                    risk="medium",
+                    allowed=False,
+                    reason="duplicate_bisect_stage_request",
+                    details=details,
+                )
             if request_token == bisect_mode and bisect_mode in completed and bisect_mode != "continue_failed_group":
                 details.append(f"completed_requests={json.dumps(sorted(completed), ensure_ascii=False)}")
-                return ActionPreflight(action_type=action_type, risk="medium", allowed=False, reason="duplicate_bisect_stage_request", details=details)
+                return ActionPreflight(
+                    action_type=action_type, risk="medium", allowed=False, reason="duplicate_bisect_stage_request", details=details
+                )
             last_bisect_feedback = dict(getattr(self, "last_bisect_feedback", {}) or {})
             if bisect_mode == "initial" and last_bisect_feedback and not fallback_phase_allowed:
                 last_targets = self._resolve_mod_names_to_installed(
@@ -1186,8 +1347,20 @@ class ServerBuilder:
                 )
                 if set(last_targets) == set(resolved) and not move_candidates:
                     details.append(f"last_bisect_feedback={json.dumps(last_bisect_feedback, ensure_ascii=False)}")
-                    return ActionPreflight(action_type=action_type, risk="medium", allowed=False, reason="duplicate_bisect_request_after_previous_round", details=details)
-            return ActionPreflight(action_type=action_type, risk="medium", allowed=True, reason="controlled_bisect_allowed", details=details)
+                    return ActionPreflight(
+                        action_type=action_type,
+                        risk="medium",
+                        allowed=False,
+                        reason="duplicate_bisect_request_after_previous_round",
+                        details=details,
+                    )
+            return ActionPreflight(
+                action_type=action_type,
+                risk="medium",
+                allowed=True,
+                reason="controlled_bisect_allowed",
+                details=details,
+            )
         if action_type == "remove_mods":
             targets = [str(x).strip() for x in (action.get("targets") or []) if str(x).strip()]
             rollback_on_failure = bool(action.get("rollback_on_failure", False))
@@ -1203,12 +1376,36 @@ class ServerBuilder:
             if unresolved:
                 details.append(f"unresolved_targets={json.dumps(unresolved, ensure_ascii=False)}")
             if regex_targets:
-                return ActionPreflight(action_type=action_type, risk="high", allowed=False, reason="regex_remove_requires_manual_review", details=details)
+                return ActionPreflight(
+                    action_type=action_type,
+                    risk="high",
+                    allowed=False,
+                    reason="regex_remove_requires_manual_review",
+                    details=details,
+                )
             if not resolved:
-                return ActionPreflight(action_type=action_type, risk="medium", allowed=False, reason="no_installed_targets_resolved", details=details)
+                return ActionPreflight(
+                    action_type=action_type,
+                    risk="medium",
+                    allowed=False,
+                    reason="no_installed_targets_resolved",
+                    details=details,
+                )
             if len(resolved) > 3:
-                return ActionPreflight(action_type=action_type, risk="high", allowed=False, reason="too_many_mod_targets", details=details)
-            return ActionPreflight(action_type=action_type, risk="medium", allowed=True, reason="resolved_low_volume_mod_removal", details=details)
+                return ActionPreflight(
+                    action_type=action_type,
+                    risk="high",
+                    allowed=False,
+                    reason="too_many_mod_targets",
+                    details=details,
+                )
+            return ActionPreflight(
+                action_type=action_type,
+                risk="medium",
+                allowed=True,
+                reason="resolved_low_volume_mod_removal",
+                details=details,
+            )
 
         if action_type == "adjust_memory":
             xmx = str(action.get("xmx", self.jvm_xmx) or self.jvm_xmx)
@@ -1218,20 +1415,56 @@ class ServerBuilder:
             current_xmx_gb = parse_mem_to_gb(self.jvm_xmx)
             next_xmx_gb = parse_mem_to_gb(xmx_norm)
             if next_xmx_gb > self.get_system_memory() * float(self.config.memory.max_ram_ratio):
-                return ActionPreflight(action_type=action_type, risk="high", allowed=False, reason="memory_plan_exceeds_cap", details=details)
+                return ActionPreflight(
+                    action_type=action_type,
+                    risk="high",
+                    allowed=False,
+                    reason="memory_plan_exceeds_cap",
+                    details=details,
+                )
             delta = abs(next_xmx_gb - current_xmx_gb)
             if delta > 4:
-                return ActionPreflight(action_type=action_type, risk="high", allowed=False, reason="memory_change_too_large", details=details)
-            return ActionPreflight(action_type=action_type, risk="low", allowed=True, reason="bounded_memory_adjustment", details=details)
+                return ActionPreflight(
+                    action_type=action_type,
+                    risk="high",
+                    allowed=False,
+                    reason="memory_change_too_large",
+                    details=details,
+                )
+            return ActionPreflight(
+                action_type=action_type,
+                risk="low",
+                allowed=True,
+                reason="bounded_memory_adjustment",
+                details=details,
+            )
 
         if action_type == "change_java":
             version = int(action.get("version", self.current_java_version) or self.current_java_version)
             details.append(f"target_version={version}")
             if version not in SUPPORTED_JAVA_VERSIONS:
-                return ActionPreflight(action_type=action_type, risk="high", allowed=False, reason="unsupported_java_version", details=details)
+                return ActionPreflight(
+                    action_type=action_type,
+                    risk="high",
+                    allowed=False,
+                    reason="unsupported_java_version",
+                    details=details,
+                )
             if abs(version - self.current_java_version) > 4:
-                return ActionPreflight(action_type=action_type, risk="high", allowed=False, reason="java_version_jump_too_large", details=details)
-            return ActionPreflight(action_type=action_type, risk="medium", allowed=True, reason="whitelisted_java_switch", details=details)
+                return ActionPreflight(
+                    action_type=action_type,
+                    risk="high",
+                    allowed=False,
+                    reason="java_version_jump_too_large",
+                    details=details,
+                )
+            return ActionPreflight(
+                action_type=action_type,
+                risk="medium",
+                allowed=True,
+                reason="whitelisted_java_switch",
+                details=details,
+            )
 
         if action_type in {"stop_and_report", "report_manual_fix"}:
             return ActionPreflight(action_type=action_type, risk="low", allowed=True, reason="non_mutating_action", details=details)
@@ -1267,7 +1500,9 @@ class ServerBuilder:
             result["error"] = f"{type(exc).__name__}:{exc}"
         return result
 
-    def _execute_action_with_safeguards(self, idx: int, action: dict, preflight: ActionPreflight, snapshot_tag: str) -> tuple[bool, dict[str, object], dict[str, object] | None]:
+    def _execute_action_with_safeguards(
+        self, idx: int, action: dict, preflight: ActionPreflight, snapshot_tag: str
+    ) -> tuple[bool, dict[str, object], dict[str, object] | None]:
         action_type = str(action.get("type") or "unknown")
         current_jvm_xmx = str(getattr(self, "jvm_xmx", "4G") or "4G")
         current_jvm_xms = str(getattr(self, "jvm_xms", current_jvm_xmx) or current_jvm_xmx)
@@ -1312,46 +1547,51 @@ class ServerBuilder:
                     self.last_ai_result.dependency_chains if self.last_ai_result else [],
                     installed_after_ai,
                 )
-                execution.update({
-                    "status": "applied",
-                    "resolved_targets": resolved_names,
-                    "rollback_on_failure": rollback_on_failure,
-                    "forced_targets": forced_targets,
-                    "forced_rationale": forced_rationale[:20],
-                    "matched_dependency_chains": matched_chains[:10],
-                })
+                execution.update(
+                    {
+                        "status": "applied",
+                        "resolved_targets": resolved_names,
+                        "rollback_on_failure": rollback_on_failure,
+                        "forced_targets": forced_targets,
+                        "forced_rationale": forced_rationale[:20],
+                        "matched_dependency_chains": matched_chains[:10],
+                    }
+                )
                 if forced_targets:
                     self.remove_mods_by_name(
                         forced_targets,
                         source="dependency_cleanup",
                         reason="depend_on_known_deleted_client_mod",
                     )
-                    self.operations.append(
-                        "dependency_cleanup_forced_remove:"
-                        f"targets={json.dumps(forced_targets, ensure_ascii=False)}"
-                    )
+                    self.operations.append(f"dependency_cleanup_forced_remove:targets={json.dumps(forced_targets, ensure_ascii=False)}")
                 if rollback_on_failure:
                     validation_res = self.start_server(timeout=self.config.runtime.start_timeout)
                     validation_success = bool(validation_res.get("success"))
-                    execution.update({
-                        "validation_start_performed": True,
-                        "validation_success": validation_success,
-                        "validation_success_source": validation_res.get("success_source"),
-                    })
+                    execution.update(
+                        {
+                            "validation_start_performed": True,
+                            "validation_success": validation_success,
+                            "validation_success_source": validation_res.get("success_source"),
+                        }
+                    )
                     if not validation_success:
                         rollback = self._rollback_action(action_type, snapshot_tag, previous_state)
-                        execution.update({
-                            "status": "rolled_back",
-                            "rollback_reason": "startup_validation_failed",
-                            "validation_failure_excerpt": self._extract_log_signal_lines(
-                                "\n".join([
-                                    str(validation_res.get("stdout") or ""),
-                                    str(validation_res.get("stderr") or ""),
-                                    str(validation_res.get("reason") or ""),
-                                ]),
-                                limit=8,
-                            ),
-                        })
+                        execution.update(
+                            {
+                                "status": "rolled_back",
+                                "rollback_reason": "startup_validation_failed",
+                                "validation_failure_excerpt": self._extract_log_signal_lines(
+                                    "\n".join(
+                                        [
+                                            str(validation_res.get("stdout") or ""),
+                                            str(validation_res.get("stderr") or ""),
+                                            str(validation_res.get("reason") or ""),
+                                        ]
+                                    ),
+                                    limit=8,
+                                ),
+                            }
+                        )
                         return False, execution, rollback
             elif action_type == "adjust_memory":
                 xmx = action.get("xmx", self.jvm_xmx)
@@ -1413,10 +1653,12 @@ class ServerBuilder:
         self.current_java_bin = java_bin
         self.current_java_version = version
         self.extra_jvm_flags = list(
-            dict.fromkeys([
-                *self._resolve_java_params_for_version(version),
-                *self.config.extra_jvm_flags,
-            ])
+            dict.fromkeys(
+                [
+                    *self._resolve_java_params_for_version(version),
+                    *self.config.extra_jvm_flags,
+                ]
+            )
         )
         self._write_start_script()
         self.operations.append(f"switch_java_version:{version}")
@@ -1749,11 +1991,7 @@ class ServerBuilder:
             if len(clean_chain) < 2:
                 continue
 
-            hit_indexes = [
-                idx
-                for idx, node in enumerate(clean_chain)
-                if self._normalize_mod_token(node) in known_deleted_tokens
-            ]
+            hit_indexes = [idx for idx, node in enumerate(clean_chain) if self._normalize_mod_token(node) in known_deleted_tokens]
             if not hit_indexes:
                 continue
 
@@ -1827,7 +2065,10 @@ class ServerBuilder:
             evidence = self.deleted_mod_evidence.get(mod_name, [])
             deleted_history_lines.append(f"- {mod_name}: {json.dumps(evidence, ensure_ascii=False)}")
         attempt_trace_lines = [
-            f"- attempt={trace.attempt}, stage={trace.stage}, status={trace.status}, file={self._attempt_trace_path(trace.attempt, trace.stage).name}"
+            (
+                f"- attempt={trace.attempt}, stage={trace.stage}, status={trace.status}, "
+                f"file={self._attempt_trace_path(trace.attempt, trace.stage).name}"
+            )
             for trace in self.attempt_traces
         ]
         bisect_tree_lines = self._format_bisect_tree_lines()
@@ -1847,8 +2088,16 @@ class ServerBuilder:
             f"最后一次AI结论: {ai_summary}",
             "AI 手动兜底摘要:",
             f"- 用户摘要: {self.last_ai_manual_report.get('user_summary', 'none') if self.last_ai_manual_report else 'none'}",
-            f"- 手动步骤: {json.dumps(self.last_ai_manual_report.get('suggested_manual_steps', []), ensure_ascii=False) if self.last_ai_manual_report else '[]'}",
-            f"- 证据: {json.dumps(self.last_ai_manual_report.get('evidence', []), ensure_ascii=False) if self.last_ai_manual_report else '[]'}",
+            (
+                f"- 手动步骤: {json.dumps(self.last_ai_manual_report.get('suggested_manual_steps', []), ensure_ascii=False)}"
+                if self.last_ai_manual_report
+                else "- 手动步骤: []"
+            ),
+            (
+                f"- 证据: {json.dumps(self.last_ai_manual_report.get('evidence', []), ensure_ascii=False)}"
+                if self.last_ai_manual_report
+                else "- 证据: []"
+            ),
             "AI高价值分析明细:",
             *(ai_detail_lines or ["- none"]),
             "Attempt Trace 索引:",
@@ -1924,12 +2173,15 @@ class ServerBuilder:
                             success = True
                             self.stop_reason = f"server_ready:{source}"
                             break
-                        ai_context = self._build_ai_context(start_res, log_info={
-                            "log_tail": str(start_res.get("stdout_tail") or ""),
-                            "crash_excerpt": str(start_res.get("stderr_tail") or ""),
-                            "crash_mod_issue": str(log_info.get("crash_mod_issue") or ""),
-                            "conflicts_or_exceptions": [],
-                        })
+                        ai_context = self._build_ai_context(
+                            start_res,
+                            log_info={
+                                "log_tail": str(start_res.get("stdout_tail") or ""),
+                                "crash_excerpt": str(start_res.get("stderr_tail") or ""),
+                                "crash_mod_issue": "",
+                                "conflicts_or_exceptions": [],
+                            },
+                        )
                         self._append_attempt_trace(
                             i,
                             "success_context_prepared",
@@ -1954,7 +2206,10 @@ class ServerBuilder:
                         if same_issue_count >= 2:
                             self.stop_reason = "success_guard_same_issue_requires_manual_review"
                             self.last_ai_manual_report = {
-                                "user_summary": "服务器虽然出现启动成功信号，但 AI 连续两轮在成功态识别出同类 client_mod 风险，已停止自动回归以避免无意义重试。",
+                                "user_summary": (
+                                    "服务器虽然出现启动成功信号，但 AI 连续两轮在成功态识别出同类 "
+                                    "client_mod 风险，已停止自动回归以避免无意义重试。"
+                                ),
                                 "suggested_manual_steps": [
                                     "检查最后两轮 success_ai_analysis 与 bisect feedback，确认剩余嫌疑 mod。",
                                     "优先人工验证 success_guard_history 中涉及的客户端模组或渲染相关模组。",
@@ -2054,6 +2309,8 @@ class ServerBuilder:
             zf.extractall(self.workdirs.client_temp)
         self._log("install.unpack", f"解压完成 -> {self.workdirs.client_temp}")
 
+        self._extract_full_pack_version_payload_if_needed()
+
         merged_files, merged_dirs, removed_dirs = merge_overrides_into_base(self.workdirs.client_temp)
         self._log(
             "install.overrides",
@@ -2095,6 +2352,29 @@ class ServerBuilder:
         self._install_server_core()
         self._write_start_script()
         self._log("install.finalize", "启动脚本生成完成")
+
+    def _extract_full_pack_version_payload_if_needed(self) -> None:
+        if not self.manifest:
+            return
+        full_pack = self.manifest.raw.get("full_pack") if isinstance(self.manifest.raw, dict) else None
+        if not isinstance(full_pack, dict):
+            return
+
+        version_name = str(full_pack.get("version_name") or "").strip()
+        version_dir = self.workdirs.client_temp / ".minecraft" / "versions" / version_name
+        if not version_name or not version_dir.exists() or not version_dir.is_dir():
+            return
+
+        copied = 0
+        for child in sorted(version_dir.iterdir(), key=lambda p: p.name.lower()):
+            if child.name in {f"{version_name}.jar", f"{version_name}.json"}:
+                continue
+            destination = self.workdirs.client_temp / child.name
+            replace_path(child, destination)
+            copied += 1
+
+        self.operations.append(f"full_pack_extract:{version_name}:copied={copied}")
+        self._log("install.unpack", f"全量包版本目录提取完成: version={version_name}, copied={copied}")
 
     def _download_curseforge_pack(self, project_id: str, file_id: str | None = None) -> Path:
         out = self.workdirs.root / "pack.zip"
@@ -2232,10 +2512,7 @@ class ServerBuilder:
         action: str,
         reason: str,
     ) -> None:
-        detail = (
-            f"platform={platform},project_id={project_id},file_id={file_id},"
-            f"file_type={file_type},action={action},reason={reason}"
-        )
+        detail = f"platform={platform},project_id={project_id},file_id={file_id},file_type={file_type},action={action},reason={reason}"
         self.operations.append(f"manifest_type_decision:{detail}")
         self._log("install.download.filter", detail, level="DEBUG")
 
@@ -2312,6 +2589,7 @@ class ServerBuilder:
         batched_hit = len(pair_to_data)
 
         if unresolved_pairs:
+
             def _fetch_single(pair: tuple[int, int]) -> tuple[tuple[int, int], dict | None]:
                 project_id_val, file_id_val = pair
                 try:
@@ -2429,9 +2707,7 @@ class ServerBuilder:
 
         if version_id:
             version = self._mr_get_json(f"/v2/version/{version_id}")
-            self.operations.append(
-                f"modrinth_selected_version:project={resolved_project_id},version={version.get('id')},manual=true"
-            )
+            self.operations.append(f"modrinth_selected_version:project={resolved_project_id},version={version.get('id')},manual=true")
         else:
             versions = self._mr_get_json(f"/v2/project/{project_or_slug}/version")
             if not isinstance(versions, list) or not versions:
@@ -2448,9 +2724,7 @@ class ServerBuilder:
 
         file_data = self._pick_modrinth_primary_pack_file(version.get("files") or [])
         if not file_data:
-            raise ValueError(
-                f"Modrinth 版本缺少可下载整合包文件: project={resolved_project_id}, version={version.get('id')}"
-            )
+            raise ValueError(f"Modrinth 版本缺少可下载整合包文件: project={resolved_project_id}, version={version.get('id')}")
 
         url = str(file_data.get("url") or "")
         if not url:
@@ -2855,10 +3129,12 @@ class ServerBuilder:
             self.operations.append(f"download_java:fallback_system_java_target_{version}")
 
         self.extra_jvm_flags = list(
-            dict.fromkeys([
-                *self._resolve_java_params_for_version(version),
-                *self.config.extra_jvm_flags,
-            ])
+            dict.fromkeys(
+                [
+                    *self._resolve_java_params_for_version(version),
+                    *self.config.extra_jvm_flags,
+                ]
+            )
         )
 
     def _resolve_java_params_for_version(self, version: int) -> list[str]:
@@ -2909,9 +3185,7 @@ class ServerBuilder:
                 body_preview = (resp.text or "")[:220].replace("\n", " ").replace("\r", " ").strip()
                 body_preview = re.sub(r"\s+", " ", body_preview)
 
-                self.operations.append(
-                    f"{op_prefix}:http:{version}:profile={profile_name}:status={status}:ctype={content_type[:80]}"
-                )
+                self.operations.append(f"{op_prefix}:http:{version}:profile={profile_name}:status={status}:ctype={content_type[:80]}")
                 self._log(
                     stage,
                     f"{op_prefix} 请求 profile={profile_name} status={status} ctype={content_type or 'unknown'}",
@@ -3135,10 +3409,7 @@ class ServerBuilder:
             self.operations.append(f"temurin_platform_unsupported:{type(e).__name__}")
             return False
 
-        url = (
-            "https://api.adoptium.net/v3/binary/latest/"
-            f"{version}/ga/{os_name}/{arch_name}/jdk/hotspot/normal/eclipse"
-        )
+        url = f"https://api.adoptium.net/v3/binary/latest/{version}/ga/{os_name}/{arch_name}/jdk/hotspot/normal/eclipse"
 
         suffix = ".zip" if ext == "zip" else ".tar.gz"
         archive_path = self.workdirs.java_bins / f"temurin-{version}{suffix}"
@@ -3383,7 +3654,7 @@ class ServerBuilder:
         jvm_part = " ".join(jvm_parts)
 
         bat_value = value.replace('"', '""')
-        sh_value = value.replace('"', r'\"')
+        sh_value = value.replace('"', r"\"")
 
         if os.name == "nt":
             if mode == "argsfile":
@@ -3394,35 +3665,35 @@ class ServerBuilder:
                 "@echo off\n"
                 "setlocal\n"
                 "\n"
-                "set \"SCRIPT_DIR=%~dp0\"\n"
-                "cd /d \"%SCRIPT_DIR%\"\n"
+                'set "SCRIPT_DIR=%~dp0"\n'
+                'cd /d "%SCRIPT_DIR%"\n'
                 "\n"
-                "set \"JAVA_BIN=\"\n"
+                'set "JAVA_BIN="\n'
                 "\n"
-                "if exist \"%SCRIPT_DIR%java_bins\\bin\\java.exe\" set \"JAVA_BIN=%SCRIPT_DIR%java_bins\\bin\\java.exe\"\n"
-                "if not defined JAVA_BIN if exist \"%SCRIPT_DIR%..\\java_bins\\bin\\java.exe\" "
-                "set \"JAVA_BIN=%SCRIPT_DIR%..\\java_bins\\bin\\java.exe\"\n"
+                'if exist "%SCRIPT_DIR%java_bins\\bin\\java.exe" set "JAVA_BIN=%SCRIPT_DIR%java_bins\\bin\\java.exe"\n'
+                'if not defined JAVA_BIN if exist "%SCRIPT_DIR%..\\java_bins\\bin\\java.exe" '
+                'set "JAVA_BIN=%SCRIPT_DIR%..\\java_bins\\bin\\java.exe"\n'
                 "\n"
                 "if not defined JAVA_BIN (\n"
-                "  for /d %%D in (\"%SCRIPT_DIR%java_bins\\jdk-*\") do (\n"
-                "    if exist \"%%~fD\\bin\\java.exe\" (\n"
-                "      set \"JAVA_BIN=%%~fD\\bin\\java.exe\"\n"
+                '  for /d %%D in ("%SCRIPT_DIR%java_bins\\jdk-*") do (\n'
+                '    if exist "%%~fD\\bin\\java.exe" (\n'
+                '      set "JAVA_BIN=%%~fD\\bin\\java.exe"\n'
                 "      goto :java_found\n"
                 "    )\n"
                 "  )\n"
                 ")\n"
                 "\n"
                 "if not defined JAVA_BIN (\n"
-                "  for /d %%D in (\"%SCRIPT_DIR%..\\java_bins\\jdk-*\") do (\n"
-                "    if exist \"%%~fD\\bin\\java.exe\" (\n"
-                "      set \"JAVA_BIN=%%~fD\\bin\\java.exe\"\n"
+                '  for /d %%D in ("%SCRIPT_DIR%..\\java_bins\\jdk-*") do (\n'
+                '    if exist "%%~fD\\bin\\java.exe" (\n'
+                '      set "JAVA_BIN=%%~fD\\bin\\java.exe"\n'
                 "      goto :java_found\n"
                 "    )\n"
                 "  )\n"
                 ")\n"
                 "\n"
                 ":java_found\n"
-                "if not defined JAVA_BIN set \"JAVA_BIN=java\"\n"
+                'if not defined JAVA_BIN set "JAVA_BIN=java"\n'
                 "\n"
                 f"{exec_line}"
             )
@@ -3435,25 +3706,25 @@ class ServerBuilder:
                 "#!/usr/bin/env sh\n"
                 "set -e\n"
                 "\n"
-                "SCRIPT_DIR=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n"
-                "cd \"$SCRIPT_DIR\"\n"
+                'SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\n'
+                'cd "$SCRIPT_DIR"\n'
                 "\n"
-                "JAVA_BIN=\"\"\n"
+                'JAVA_BIN=""\n'
                 "\n"
-                "if [ -x \"$SCRIPT_DIR/java_bins/bin/java\" ]; then\n"
-                "  JAVA_BIN=\"$SCRIPT_DIR/java_bins/bin/java\"\n"
-                "elif [ -x \"$SCRIPT_DIR/../java_bins/bin/java\" ]; then\n"
-                "  JAVA_BIN=\"$SCRIPT_DIR/../java_bins/bin/java\"\n"
+                'if [ -x "$SCRIPT_DIR/java_bins/bin/java" ]; then\n'
+                '  JAVA_BIN="$SCRIPT_DIR/java_bins/bin/java"\n'
+                'elif [ -x "$SCRIPT_DIR/../java_bins/bin/java" ]; then\n'
+                '  JAVA_BIN="$SCRIPT_DIR/../java_bins/bin/java"\n'
                 "else\n"
-                "  for candidate in \"$SCRIPT_DIR\"/java_bins/jdk-*/bin/java \"$SCRIPT_DIR\"/../java_bins/jdk-*/bin/java; do\n"
-                "    if [ -x \"$candidate\" ]; then\n"
-                "      JAVA_BIN=\"$candidate\"\n"
+                '  for candidate in "$SCRIPT_DIR"/java_bins/jdk-*/bin/java "$SCRIPT_DIR"/../java_bins/jdk-*/bin/java; do\n'
+                '    if [ -x "$candidate" ]; then\n'
+                '      JAVA_BIN="$candidate"\n'
                 "      break\n"
                 "    fi\n"
                 "  done\n"
                 "fi\n"
                 "\n"
-                "if [ -z \"$JAVA_BIN\" ]; then\n"
+                'if [ -z "$JAVA_BIN" ]; then\n'
                 "  JAVA_BIN=java\n"
                 "fi\n"
                 "\n"
@@ -3498,9 +3769,7 @@ class ServerBuilder:
                         "action": dict(a),
                     },
                 )
-            self.operations.append(
-                f"action_preflight:{t}:allowed={preflight.allowed}:risk={preflight.risk}:reason={preflight.reason}"
-            )
+            self.operations.append(f"action_preflight:{t}:allowed={preflight.allowed}:risk={preflight.risk}:reason={preflight.reason}")
             if attempt > 0:
                 self._append_attempt_trace(
                     attempt,
@@ -3521,7 +3790,11 @@ class ServerBuilder:
                         }
                     )
                 self._ai_debug(
-                    f"apply.actions[{idx}] blocked risk={preflight.risk} reason={preflight.reason} details={json.dumps(preflight.details, ensure_ascii=False)}"
+                    (
+                        f"apply.actions[{idx}] blocked risk={preflight.risk} "
+                        f"reason={preflight.reason} "
+                        f"details={json.dumps(preflight.details, ensure_ascii=False)}"
+                    )
                 )
                 continue
             current_attempt = attempt or int(getattr(self, "attempts_used", 0) or 0)
@@ -3623,10 +3896,7 @@ class ServerBuilder:
             if loader == "forge":
                 forge_ver = self._resolve_forge_version(mc_version, loader_version)
                 forge_coord = self._normalize_forge_installer_coord(mc_version, forge_ver)
-                url = (
-                    "https://maven.minecraftforge.net/net/minecraftforge/forge/"
-                    f"{forge_coord}/forge-{forge_coord}-installer.jar"
-                )
+                url = f"https://maven.minecraftforge.net/net/minecraftforge/forge/{forge_coord}/forge-{forge_coord}-installer.jar"
                 self.operations.append(f"forge_installer_url:{url}")
             else:
                 neo_mc_ver, neo_ver = self._resolve_neoforge_version(mc_version, loader_version)
@@ -3636,10 +3906,7 @@ class ServerBuilder:
                         f"{neo_mc_ver}-{neo_ver}/forge-{neo_mc_ver}-{neo_ver}-installer.jar"
                     )
                 else:
-                    url = (
-                        "https://maven.neoforged.net/releases/net/neoforged/neoforge/"
-                        f"{neo_ver}/neoforge-{neo_ver}-installer.jar"
-                    )
+                    url = f"https://maven.neoforged.net/releases/net/neoforged/neoforge/{neo_ver}/neoforge-{neo_ver}-installer.jar"
 
             self._download_file(url, installer)
             installer_paths.append(installer)
@@ -3676,8 +3943,7 @@ class ServerBuilder:
                 loader_ver = (loader_version or self._resolve_fabric_loader_version()).strip()
                 installer = self.workdirs.server / f"fabric-installer-{installer_ver}.jar"
                 installer_url = (
-                    "https://maven.fabricmc.net/net/fabricmc/fabric-installer/"
-                    f"{installer_ver}/fabric-installer-{installer_ver}.jar"
+                    f"https://maven.fabricmc.net/net/fabricmc/fabric-installer/{installer_ver}/fabric-installer-{installer_ver}.jar"
                 )
                 args_candidates = [
                     ["server", "-mcversion", mc_version, "-loader", loader_ver, "-downloadMinecraft"],
@@ -3857,7 +4123,4 @@ class ServerBuilder:
         if cp.returncode != 0:
             stderr_tail = "\n".join((cp.stderr or "").splitlines()[-40:])
             stdout_tail = "\n".join((cp.stdout or "").splitlines()[-40:])
-            raise RuntimeError(
-                "installer_failed "
-                f"exit={cp.returncode} stdout_tail={stdout_tail!r} stderr_tail={stderr_tail!r}"
-            )
+            raise RuntimeError(f"installer_failed exit={cp.returncode} stdout_tail={stdout_tail!r} stderr_tail={stderr_tail!r}")
