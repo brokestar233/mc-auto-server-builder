@@ -7,7 +7,7 @@
 - 许可证：`GPL-3.0-only`
 - CLI 入口：`mcasb`
 
-核心实现入口：[`main()`](src/mc_auto_server_builder/cli.py:1)、[`ServerBuilder.run()`](src/mc_auto_server_builder/builder.py:1)
+核心实现入口：[`main()`](src/mc_auto_server_builder/cli.py#L24)、[`ServerBuilder.run()`](src/mc_auto_server_builder/builder.py#L2129)
 
 ---
 
