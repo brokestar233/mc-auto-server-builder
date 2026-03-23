@@ -39,6 +39,13 @@ from .models import (
     StartResult,
     WorkDirs,
 )
+from .recognition import (
+    RecognitionFallbackPlan,
+    choose_java_version,
+    choose_latest_lts_java_version,
+    infer_java_from_runtime_feedback,
+    top_candidate_values,
+)
 from .rule_db import RuleDB
 from .util import (
     ColorPolicy,
@@ -119,6 +126,7 @@ class ServerBuilder:
         self.server_jar_name: str = "server.jar"
         self.start_command_mode: str = "jar"
         self.start_command_value: str = self.server_jar_name
+        self.recognition_attempts: list[dict[str, object]] = []
         self.log_file_path: Path = self.workdirs.logs / "install.log"
         try:
             color_policy = ColorPolicy((self.config.logging.color_policy or "auto").lower())
@@ -177,6 +185,30 @@ class ServerBuilder:
         existing = self.deleted_mod_evidence.setdefault(clean, [])
         if evidence not in existing:
             existing.append(evidence)
+
+    def _record_deleted_mod_detail(self, mod_name: str, category: str, source: str, reason: str) -> None:
+        clean = str(mod_name or "").strip()
+        if not clean:
+            return
+        detail_map = getattr(self, "deleted_mod_sources", None)
+        if not isinstance(detail_map, dict):
+            detail_map = {}
+            self.deleted_mod_sources = detail_map
+        entry = detail_map.setdefault(
+            clean,
+            {
+                "builtin_rule": [],
+                "user_rule": [],
+                "ai_suggested": [],
+                "dependency_cleanup": [],
+                "bisect": [],
+                "other": [],
+            },
+        )
+        bucket = category if category in entry else "other"
+        payload = f"{source}:{reason}"
+        if payload not in entry[bucket]:
+            entry[bucket].append(payload)
 
     def _normalize_mod_token(self, value: str) -> str:
         token = str(value or "").strip().lower()
@@ -245,6 +277,18 @@ class ServerBuilder:
                 self.operations.append(f"remove_mod_by_name:{n}")
                 self._log("install.remove_mod", f"删除mod:{n} 原因:{reason}")
                 self._record_deleted_client_mod(n, source=source, reason=reason or "explicit_name")
+                category = "other"
+                if source == "bisect":
+                    category = "bisect"
+                elif source == "builtin_rule":
+                    category = "builtin_rule"
+                elif source in {"regex_rule", "user_rule"}:
+                    category = "user_rule"
+                elif source == "ai":
+                    category = "ai_suggested"
+                elif source == "dependency_cleanup":
+                    category = "dependency_cleanup"
+                self._record_deleted_mod_detail(n, category=category, source=source, reason=reason or "explicit_name")
 
     def remove_mods_by_regex(self, patterns: list[str], source: str = "regex_rule"):
         for pat in patterns:
@@ -271,6 +315,37 @@ class ServerBuilder:
     def apply_known_client_blacklist(self):
         patterns = self.rule_db.list_rules()
         self.remove_mods_by_regex(patterns, source="builtin_rule")
+
+    def apply_recognition_based_client_cleanup(self) -> list[str]:
+        manifest = getattr(self, "manifest", None)
+        if not manifest:
+            return []
+        mods_dir = self.workdirs.server / "mods"
+        if not mods_dir.exists():
+            return []
+
+        removal_patterns = (
+            (
+                re.compile(r"(?:fancymenu|embeddiumplus|oculus|rubidium|sodiumextras|reeses[_\-.]?sodium)", re.IGNORECASE),
+                "client_visual_mod",
+            ),
+            (re.compile(r"(?:xaeros[_\-.]?minimap|journeymap|controlling|notenoughanimations)", re.IGNORECASE), "client_utility_mod"),
+            (re.compile(r"(?:presencefootsteps|entityculling|3dskinlayers|skinlayers)", re.IGNORECASE), "client_render_mod"),
+        )
+        removed: list[str] = []
+        for mod_path in sorted(mods_dir.glob("*.jar"), key=lambda p: p.name.lower()):
+            for pattern, reason in removal_patterns:
+                if pattern.search(mod_path.name):
+                    self.remove_mods_by_name(
+                        [mod_path.name],
+                        source="dependency_cleanup",
+                        reason=f"recognition_prior_cleanup:{reason}",
+                    )
+                    removed.append(mod_path.name)
+                    break
+        if removed:
+            self.operations.append(f"recognition_prior_cleanup:removed={json.dumps(removed, ensure_ascii=False)}")
+        return removed
 
     def backup_mods(self, tag: str):
         mods_dir = self.workdirs.server / "mods"
@@ -611,9 +686,15 @@ class ServerBuilder:
 
     def _build_ai_context(self, start_res: dict[str, object], log_info: dict[str, object]) -> dict[str, object]:
         session = self._coerce_bisect_session()
+        manifest = self.manifest
+        recognition_summary = self._build_recognition_summary() if manifest else {}
         return {
-            "mc_version": self.manifest.mc_version if self.manifest else "unknown",
-            "loader": self.manifest.loader if self.manifest else "unknown",
+            "mc_version": manifest.mc_version if manifest else "unknown",
+            "loader": manifest.loader if manifest else "unknown",
+            "loader_version": getattr(manifest, "loader_version", None) if manifest else None,
+            "build": getattr(manifest, "build", None) if manifest else None,
+            "start_mode": getattr(manifest, "start_mode", "unknown") if manifest else "unknown",
+            "recognition_summary": recognition_summary,
             "jvm_args": f"Xmx={self.jvm_xmx} Xms={self.jvm_xms}",
             "available_ram": self.get_system_memory(),
             "mod_count": len(self.list_mods()),
@@ -1219,6 +1300,7 @@ class ServerBuilder:
         status: str,
         *,
         context_summary: dict | None = None,
+        recognition_plan: dict | None = None,
         ai_result: dict | None = None,
         action_plan: list[dict] | None = None,
         preflight: list[dict] | None = None,
@@ -1230,6 +1312,7 @@ class ServerBuilder:
             stage=stage,
             status=status,
             context_summary=dict(context_summary or {}),
+            recognition_plan=dict(recognition_plan or {}),
             ai_result=dict(ai_result or {}),
             action_plan=[dict(item) for item in (action_plan or [])],
             preflight=[dict(item) for item in (preflight or [])],
@@ -1244,9 +1327,14 @@ class ServerBuilder:
         log_excerpt = self._normalize_text_list(context.get("log_signal_summary", []), limit=10)
         if not log_excerpt:
             log_excerpt = self._extract_log_signal_lines(context.get("refined_log", ""), limit=8)
+        recognition_summary = context.get("recognition_summary", {})
         return {
             "mc_version": context.get("mc_version", "unknown"),
             "loader": context.get("loader", "unknown"),
+            "loader_version": context.get("loader_version"),
+            "build": context.get("build"),
+            "start_mode": context.get("start_mode", "unknown"),
+            "recognition_summary": dict(recognition_summary) if isinstance(recognition_summary, dict) else {},
             "mod_count": int(context.get("mod_count", 0) or 0),
             "current_installed_mods_preview": self._normalize_text_list(context.get("current_installed_mods", []), limit=12),
             "known_deleted_client_mods": self._normalize_text_list(context.get("known_deleted_client_mods", []), limit=20),
@@ -1254,6 +1342,263 @@ class ServerBuilder:
             "key_exception": str(context.get("key_exception") or "none"),
             "log_signal_summary": log_excerpt,
         }
+
+    def _serialize_detection_candidates(self, candidates: object, *, limit: int = 3) -> list[dict[str, object]]:
+        items = list(candidates or [])
+        serialized: list[dict[str, object]] = []
+        for candidate in items[:limit]:
+            value = getattr(candidate, "value", None)
+            if not value:
+                continue
+            serialized.append(
+                {
+                    "value": str(value),
+                    "confidence": float(getattr(candidate, "confidence", 0.0) or 0.0),
+                    "reason": str(getattr(candidate, "reason", "") or ""),
+                }
+            )
+        return serialized
+
+    def _build_recognition_summary(self) -> dict[str, object]:
+        manifest = getattr(self, "manifest", None)
+        if not manifest:
+            return {}
+        evidence = []
+        for item in list(getattr(manifest, "evidence", []) or [])[:5]:
+            evidence.append(
+                {
+                    "source_type": str(getattr(item, "source_type", "") or ""),
+                    "evidence_type": str(getattr(item, "evidence_type", "") or ""),
+                    "file": str(getattr(item, "file", "") or ""),
+                    "matched_text": str(getattr(item, "matched_text", "") or ""),
+                    "weight": float(getattr(item, "weight", 0.0) or 0.0),
+                    "reason": str(getattr(item, "reason", "") or ""),
+                }
+            )
+        return {
+            "pack_name": manifest.pack_name,
+            "confidence": float(getattr(manifest, "confidence", 0.0) or 0.0),
+            "active_loader": getattr(manifest, "loader", "unknown"),
+            "active_mc_version": getattr(manifest, "mc_version", "unknown"),
+            "active_loader_version": getattr(manifest, "loader_version", None),
+            "active_build": getattr(manifest, "build", None),
+            "active_start_mode": getattr(manifest, "start_mode", "unknown"),
+            "warnings": list(getattr(manifest, "warnings", []) or []),
+            "loader_candidates": self._serialize_detection_candidates(getattr(manifest, "loader_candidates", [])),
+            "mc_version_candidates": self._serialize_detection_candidates(getattr(manifest, "mc_version_candidates", [])),
+            "loader_version_candidates": self._serialize_detection_candidates(getattr(manifest, "loader_version_candidates", [])),
+            "build_candidates": self._serialize_detection_candidates(getattr(manifest, "build_candidates", [])),
+            "start_mode_candidates": self._serialize_detection_candidates(getattr(manifest, "start_mode_candidates", [])),
+            "evidence_preview": evidence,
+            "fallback_history": list(getattr(self, "recognition_attempts", [])[-5:]),
+            "recognition_strategy_used": str(getattr(manifest, "raw", {}).get("pack_type", "unknown")),
+            "recognition_pipeline": list(getattr(manifest, "raw", {}).get("recognition_pipeline", []) or []),
+            "recognition_phase_hits": list(getattr(manifest, "raw", {}).get("recognition_phase_hits", []) or []),
+            "recognition_phase_details": dict(getattr(manifest, "raw", {}).get("recognition_phase_details", {}) or {}),
+            "recognition_fallback_count": len(list(getattr(self, "recognition_attempts", []) or [])),
+            "recognition_switched": len(list(getattr(self, "recognition_attempts", []) or [])) > 0,
+            "recognition_finalized_after_runtime_feedback": any(
+                str(item.get("reason") or "") == "runtime_feedback_fallback"
+                for item in list(getattr(self, "recognition_attempts", []) or [])
+                if isinstance(item, dict)
+            ),
+        }
+
+    def _recognition_confidence_level(self, confidence: float) -> str:
+        if confidence >= 0.85:
+            return "high"
+        if confidence >= 0.55:
+            return "medium"
+        return "low"
+
+    def _build_recognition_candidates(self) -> list[RecognitionFallbackPlan]:
+        manifest = self.manifest
+        if not manifest:
+            return []
+        loaders = top_candidate_values(getattr(manifest, "loader_candidates", [])) or [
+            str(getattr(manifest, "loader", "unknown") or "unknown")
+        ]
+        mc_versions = top_candidate_values(getattr(manifest, "mc_version_candidates", [])) or [
+            str(getattr(manifest, "mc_version", "unknown") or "unknown")
+        ]
+        loader_versions = top_candidate_values(
+            getattr(manifest, "loader_version_candidates", []),
+            limit=4,
+        ) or [str(getattr(manifest, "loader_version", "") or "")]
+        start_modes = top_candidate_values(getattr(manifest, "start_mode_candidates", [])) or [
+            str(getattr(manifest, "start_mode", "jar") or "jar")
+        ]
+        builds = top_candidate_values(getattr(manifest, "build_candidates", []), limit=4) or [str(getattr(manifest, "build", "") or "")]
+        plans: list[RecognitionFallbackPlan] = []
+        for loader in loaders[:3]:
+            for mc_version in mc_versions[:2]:
+                for start_mode in start_modes[:2]:
+                    loader_version = next(
+                        (
+                            item
+                            for item in loader_versions
+                            if item and (mc_version in item or loader in item.lower())
+                        ),
+                        loader_versions[0] or None,
+                    )
+                    build = next((item for item in builds if item), None)
+                    confidence = 0.4
+                    if loader == getattr(manifest, "loader", "unknown"):
+                        confidence += 0.2
+                    if mc_version == getattr(manifest, "mc_version", "unknown"):
+                        confidence += 0.2
+                    if start_mode == getattr(manifest, "start_mode", "unknown"):
+                        confidence += 0.1
+                    plans.append(
+                        RecognitionFallbackPlan(
+                            loader=loader,
+                            loader_version=loader_version,
+                            mc_version=mc_version,
+                            build=build,
+                            start_mode=start_mode,
+                            java_version=choose_java_version(manifest, loader=loader, mc_version=mc_version),
+                            confidence=min(1.0, round(confidence, 3)),
+                            reason="候选识别计划",
+                            source_candidates=[loader, mc_version, start_mode],
+                        )
+                    )
+        dedup: dict[tuple[str, str | None, str | None, str], RecognitionFallbackPlan] = {}
+        for plan in plans:
+            key = (plan.loader, plan.loader_version, plan.mc_version, plan.start_mode)
+            if key not in dedup or dedup[key].confidence < plan.confidence:
+                dedup[key] = plan
+        return sorted(dedup.values(), key=lambda item: (-item.confidence, item.loader, item.start_mode))
+
+    def _preflight_recognition_plan(self, plan: RecognitionFallbackPlan) -> dict[str, object]:
+        server = self.workdirs.server
+        checks: list[str] = []
+        score = 0
+        if plan.start_mode in {"argsfile", "args_file"} and any(server.glob("libraries/**/unix_args.txt")):
+            score += 1
+            checks.append("argsfile_path_present")
+        if plan.loader == "forge" and (server / "libraries" / "net" / "minecraftforge").exists():
+            score += 1
+            checks.append("forge_libraries_present")
+        if plan.loader == "neoforge" and (server / "libraries" / "net" / "neoforged").exists():
+            score += 1
+            checks.append("neoforge_libraries_present")
+        if plan.loader in {"fabric", "quilt"} and any(server.glob("**/*fabric*loader*.jar")):
+            score += 1
+            checks.append("fabric_like_loader_present")
+        if (server / self.server_jar_name).exists():
+            score += 1
+            checks.append("server_jar_present")
+        if plan.java_version == choose_java_version(self.manifest, loader=plan.loader, mc_version=plan.mc_version):
+            score += 1
+            checks.append("java_version_matches_loader_strategy")
+        return {
+            "allowed": score > 0,
+            "score": score,
+            "checks": checks,
+            "confidence_level": self._recognition_confidence_level(plan.confidence),
+        }
+
+    def _apply_recognition_plan(self, plan: RecognitionFallbackPlan, *, reason: str) -> None:
+        if not self.manifest:
+            return
+        self.manifest.loader = plan.loader  # type: ignore[assignment]
+        self.manifest.mc_version = plan.mc_version or self.manifest.mc_version
+        self.manifest.loader_version = plan.loader_version
+        self.manifest.build = plan.build
+        self.manifest.start_mode = "args_file" if plan.start_mode in {"argsfile", "args_file"} else plan.start_mode  # type: ignore[assignment]
+        if plan.start_mode in {"argsfile", "args_file"}:
+            self._apply_modern_loader_start_mode()
+        self.recognition_attempts.append(
+            {
+                "loader": plan.loader,
+                "loader_version": plan.loader_version,
+                "mc_version": plan.mc_version,
+                "start_mode": plan.start_mode,
+                "java_version": plan.java_version,
+                "reason": reason,
+                "confidence": plan.confidence,
+                "confidence_level": self._recognition_confidence_level(plan.confidence),
+            }
+        )
+        if plan.java_version != self.current_java_version:
+            self.switch_java_version(plan.java_version)
+
+    def _recognition_runtime_feedback(self, start_res: dict[str, object], log_info: dict[str, object]) -> dict[str, object]:
+        text = "\n".join(
+            [
+                str(start_res.get("stdout_tail") or ""),
+                str(start_res.get("stderr_tail") or ""),
+                str(log_info.get("refined_log") or ""),
+                str(log_info.get("key_exception") or ""),
+            ]
+        ).lower()
+        inferred_loader = None
+        if any(token in text for token in ("fml", "minecraftforge", "forge mod loader")):
+            inferred_loader = "forge"
+        elif "neoforge" in text:
+            inferred_loader = "neoforge"
+        elif "fabric-loader" in text or "fabricloader" in text:
+            inferred_loader = "fabric"
+        elif "quilt-loader" in text or "quilt" in text:
+            inferred_loader = "quilt"
+        inferred_mc_version = None
+        version_match = re.search(r"\b1\.\d+(?:\.\d+)?\b", text)
+        if version_match:
+            inferred_mc_version = version_match.group(0)
+        java_hint = infer_java_from_runtime_feedback(text, self.current_java_version)
+        return {
+            "inferred_loader": inferred_loader,
+            "inferred_mc_version": inferred_mc_version,
+            "java_hint": java_hint,
+            "raw": text[:800],
+        }
+
+    def _select_next_recognition_plan(self, start_res: dict[str, object], log_info: dict[str, object]) -> RecognitionFallbackPlan | None:
+        runtime = self._recognition_runtime_feedback(start_res, log_info)
+        plans = self._build_recognition_candidates()
+        tried = {
+            (
+                str(item.get("loader")),
+                str(item.get("loader_version")),
+                str(item.get("mc_version")),
+                str(item.get("start_mode")),
+            )
+            for item in self.recognition_attempts
+        }
+        inferred_loader = runtime.get("inferred_loader")
+        inferred_mc_version = runtime.get("inferred_mc_version")
+        runtime_java_hint = runtime.get("java_hint")
+        boosted: list[RecognitionFallbackPlan] = []
+        for plan in plans:
+            if (plan.loader, str(plan.loader_version), str(plan.mc_version), plan.start_mode) in tried:
+                continue
+            preflight = self._preflight_recognition_plan(plan)
+            if not preflight.get("allowed"):
+                continue
+            confidence = plan.confidence + (0.25 if inferred_loader and plan.loader == inferred_loader else 0.0)
+            confidence += 0.12 if inferred_mc_version and plan.mc_version == inferred_mc_version else 0.0
+            confidence += 0.08 if runtime_java_hint and plan.java_version == runtime_java_hint else 0.0
+            confidence += min(float(preflight.get("score") or 0) * 0.03, 0.15)
+            boosted.append(
+                RecognitionFallbackPlan(
+                    loader=plan.loader,
+                    loader_version=plan.loader_version,
+                    mc_version=plan.mc_version,
+                    build=plan.build,
+                    start_mode=plan.start_mode,
+                    java_version=int(runtime_java_hint or plan.java_version),
+                    confidence=min(1.0, round(confidence, 3)),
+                    reason=(
+                        f"{plan.reason}; runtime_loader={inferred_loader or 'unknown'}; "
+                        f"runtime_mc={inferred_mc_version or 'unknown'}; "
+                        f"preflight={','.join(preflight.get('checks', [])) or 'none'}"
+                    ),
+                    source_candidates=list(plan.source_candidates),
+                )
+            )
+        if not boosted:
+            return None
+        return sorted(boosted, key=lambda item: (-item.confidence, item.java_version))[0]
 
     def _assess_action_preflight(self, action: dict) -> ActionPreflight:
         action_type = str(action.get("type") or "unknown")
@@ -1663,6 +2008,66 @@ class ServerBuilder:
         self._write_start_script()
         self.operations.append(f"switch_java_version:{version}")
 
+    def _select_java_version_for_current_manifest(self) -> int:
+        manifest = self.manifest
+        if not manifest:
+            return choose_latest_lts_java_version()
+        plans = self._build_recognition_candidates()
+        if plans:
+            preferred = plans[0]
+            return choose_java_version(manifest, loader=preferred.loader, mc_version=preferred.mc_version)
+        return choose_java_version(manifest)
+
+    def _collect_process_resource_snapshot(self, proc: subprocess.Popen) -> dict[str, float | int | str | None]:
+        try:
+            ps_proc = psutil.Process(proc.pid)
+            children = ps_proc.children(recursive=True)
+            rss_bytes = ps_proc.memory_info().rss
+            cpu_percent = ps_proc.cpu_percent(interval=None)
+            for child in children:
+                try:
+                    rss_bytes += child.memory_info().rss
+                    cpu_percent += child.cpu_percent(interval=None)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            return {
+                "timestamp": datetime.now().isoformat(),
+                "rss_mb": round(rss_bytes / 1024 / 1024, 2),
+                "cpu_percent": round(cpu_percent, 2),
+                "process_count": len(children) + 1,
+            }
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            return {
+                "timestamp": datetime.now().isoformat(),
+                "rss_mb": 0.0,
+                "cpu_percent": 0.0,
+                "process_count": 0,
+                "error": "process_unavailable",
+            }
+
+    def _detect_failure_signals(self, text: str) -> list[str]:
+        lowered = (text or "").lower()
+        patterns = (
+            (r"outofmemoryerror|java heap space|gc overhead limit exceeded", "memory_oom"),
+            (r"could not reserve enough space|insufficient memory|os::commit_memory", "memory_allocation"),
+            (r"address already in use|failed to bind to port|port .* in use", "port_in_use"),
+            (r"unsupportedclassversionerror|has been compiled by a more recent version", "java_version_mismatch"),
+            (r"could not find or load main class|unable to access jarfile|no such file", "start_command_error"),
+            (r"missing dependency|depends on|requires .* but it is missing", "missing_dependency"),
+            (r"client-only|dedicated server|invalid dist|wrong side", "client_mod_detected"),
+            (r"main class .* not found|@.*args\.txt|argument file .* not found", "loader_misclassification"),
+            (r"watchdog|server watchdog|deadlock", "watchdog_or_deadlock"),
+            (r"neoforge", "loader_signal_neoforge"),
+            (r"quilt", "loader_signal_quilt"),
+            (r"fabricloader|fabric", "loader_signal_fabric"),
+            (r"fml|forge", "loader_signal_forge"),
+        )
+        matched: list[str] = []
+        for pattern, label in patterns:
+            if re.search(pattern, lowered):
+                matched.append(label)
+        return matched
+
     def detect_current_java_version(self) -> int:
         cmd = [str(self.current_java_bin or "java"), "-version"]
         cp = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -1736,6 +2141,8 @@ class ServerBuilder:
         port_open = False
         success_source = ""
         readiness_evidence: list[str] = []
+        resource_samples: list[dict[str, float | int | str | None]] = []
+        failure_signals: list[str] = []
 
         while True:
             now = time.monotonic()
@@ -1747,6 +2154,13 @@ class ServerBuilder:
             out_tail = "\n".join(stdout_lines[-120:])
             err_tail = "\n".join(stderr_lines[-120:])
             merged_tail = "\n".join([log_tail, out_tail, err_tail])
+
+            if proc.poll() is None:
+                resource_samples.append(self._collect_process_resource_snapshot(proc))
+
+            for signal in self._detect_failure_signals(merged_tail):
+                if signal not in failure_signals:
+                    failure_signals.append(signal)
 
             if not port_open:
                 try:
@@ -1808,6 +2222,9 @@ class ServerBuilder:
         stdout_tail = "\n".join(stdout_lines[-80:])
         stderr_tail = "\n".join(stderr_lines[-80:])
         success = bool(success_source)
+        peak_rss_mb = max((float(item.get("rss_mb") or 0.0) for item in resource_samples), default=0.0)
+        peak_cpu_percent = max((float(item.get("cpu_percent") or 0.0) for item in resource_samples), default=0.0)
+        max_process_count = max((int(item.get("process_count") or 0) for item in resource_samples), default=0)
 
         result = StartResult(
             success=success,
@@ -1817,6 +2234,13 @@ class ServerBuilder:
             process_alive=process_alive,
             success_source=success_source or "none",
             readiness_evidence=readiness_evidence[-12:],
+            failure_signals=failure_signals[-12:],
+            resource_samples=resource_samples[-20:],
+            resource_summary={
+                "peak_rss_mb": round(peak_rss_mb, 2),
+                "peak_cpu_percent": round(peak_cpu_percent, 2),
+                "max_process_count": max_process_count,
+            },
             exit_code=exit_code,
             log_path=latest_log,
             crash_dir=self.workdirs.server / "crash-reports",
@@ -1826,7 +2250,9 @@ class ServerBuilder:
         self.operations.append(
             "start_server:"
             f"success={success},source={result.success_source},"
-            f"done={done},cmd_probe={cmd_probe_ok},port={port_open},exit={exit_code},alive={process_alive}"
+            f"done={done},cmd_probe={cmd_probe_ok},port={port_open},exit={exit_code},alive={process_alive},"
+            f"failure_signals={json.dumps(result.failure_signals, ensure_ascii=False)},"
+            f"resource={json.dumps(result.resource_summary, ensure_ascii=False)}"
         )
         return asdict(result)
 
@@ -2040,6 +2466,7 @@ class ServerBuilder:
     # 输出
     def generate_report(self) -> str:
         report_path = self.workdirs.root / "report.txt"
+        recognition_summary = self._build_recognition_summary()
         ai_summary = "none"
         ai_detail_lines: list[str] = []
         if self.last_ai_result:
@@ -2064,6 +2491,10 @@ class ServerBuilder:
         for mod_name in sorted(self.known_deleted_client_mods):
             evidence = self.deleted_mod_evidence.get(mod_name, [])
             deleted_history_lines.append(f"- {mod_name}: {json.dumps(evidence, ensure_ascii=False)}")
+        deleted_mod_sources = getattr(self, "deleted_mod_sources", {}) if isinstance(getattr(self, "deleted_mod_sources", {}), dict) else {}
+        deleted_source_lines: list[str] = []
+        for mod_name in sorted(deleted_mod_sources):
+            deleted_source_lines.append(f"- {mod_name}: {json.dumps(deleted_mod_sources.get(mod_name, {}), ensure_ascii=False)}")
         attempt_trace_lines = [
             (
                 f"- attempt={trace.attempt}, stage={trace.stage}, status={trace.status}, "
@@ -2072,6 +2503,28 @@ class ServerBuilder:
             for trace in self.attempt_traces
         ]
         bisect_tree_lines = self._format_bisect_tree_lines()
+        loader_candidate_values = [item.get("value") for item in recognition_summary.get("loader_candidates", [])]
+        mc_candidate_values = [item.get("value") for item in recognition_summary.get("mc_version_candidates", [])]
+        build_candidate_values = [item.get("value") for item in recognition_summary.get("build_candidates", [])]
+        start_mode_candidate_values = [item.get("value") for item in recognition_summary.get("start_mode_candidates", [])]
+        recognition_lines = [
+            f"- 输入包名: {recognition_summary.get('pack_name', 'unknown')}",
+            f"- 当前 loader: {recognition_summary.get('active_loader', 'unknown')}",
+            f"- 当前 MC 版本: {recognition_summary.get('active_mc_version', 'unknown')}",
+            f"- 当前 loader_version: {recognition_summary.get('active_loader_version', None)}",
+            f"- 当前 build: {recognition_summary.get('active_build', None)}",
+            f"- 当前启动模式: {recognition_summary.get('active_start_mode', 'unknown')}",
+            f"- 识别置信度: {recognition_summary.get('confidence', 0.0):.2f}",
+            f"- 候选 loader: {json.dumps(loader_candidate_values, ensure_ascii=False)}",
+            f"- 候选 MC 版本: {json.dumps(mc_candidate_values, ensure_ascii=False)}",
+            f"- 候选 build: {json.dumps(build_candidate_values, ensure_ascii=False)}",
+            f"- 候选启动模式: {json.dumps(start_mode_candidate_values, ensure_ascii=False)}",
+            f"- 识别流水线: {json.dumps(recognition_summary.get('recognition_pipeline', []), ensure_ascii=False)}",
+            f"- 命中的识别阶段: {json.dumps(recognition_summary.get('recognition_phase_hits', []), ensure_ascii=False)}",
+            f"- 阶段明细: {json.dumps(recognition_summary.get('recognition_phase_details', {}), ensure_ascii=False)}",
+            f"- 回退历史: {json.dumps(recognition_summary.get('fallback_history', []), ensure_ascii=False)}",
+            f"- 证据摘要: {json.dumps(recognition_summary.get('evidence_preview', []), ensure_ascii=False)}",
+        ]
         lines = [
             "MC Auto Server Builder 报告",
             f"生成时间: {datetime.now().isoformat()}",
@@ -2085,6 +2538,8 @@ class ServerBuilder:
             *[f"- {m}" for m in self.removed_mods],
             f"最终JVM: Xmx={self.jvm_xmx}, Xms={self.jvm_xms}",
             f"Java版本: {self.detect_current_java_version()}",
+            "识别过程摘要:",
+            *recognition_lines,
             f"最后一次AI结论: {ai_summary}",
             "AI 手动兜底摘要:",
             f"- 用户摘要: {self.last_ai_manual_report.get('user_summary', 'none') if self.last_ai_manual_report else 'none'}",
@@ -2106,6 +2561,8 @@ class ServerBuilder:
             *bisect_tree_lines,
             "已知且已删除客户端mod（本次运行历史）:",
             *(deleted_history_lines or ["- none"]),
+            "删除 mod 来源分层统计:",
+            *(deleted_source_lines or ["- none"]),
             f"终止原因: {self.stop_reason or 'success_or_attempt_limit'}",
             f"总操作数: {len(self.operations)}",
             "操作记录:",
@@ -2114,9 +2571,59 @@ class ServerBuilder:
         report_path.write_text("\n".join(lines), encoding="utf-8")
         return str(report_path)
 
+    def _build_meta_payload(self) -> dict[str, object]:
+        manifest = self.manifest
+        recognition_summary = self._build_recognition_summary()
+        return {
+            "pack_source": {
+                "input_type": getattr(self.pack_input, "input_type", "unknown"),
+                "source": getattr(self.pack_input, "source", "unknown"),
+                "file_id": getattr(self.pack_input, "file_id", None),
+            },
+            "manifest_summary": {
+                "pack_name": getattr(manifest, "pack_name", "unknown") if manifest else "unknown",
+                "mc_version": getattr(manifest, "mc_version", "unknown") if manifest else "unknown",
+                "loader": getattr(manifest, "loader", "unknown") if manifest else "unknown",
+                "loader_version": getattr(manifest, "loader_version", None) if manifest else None,
+                "build": getattr(manifest, "build", None) if manifest else None,
+                "start_mode": getattr(manifest, "start_mode", "unknown") if manifest else "unknown",
+                "warnings": list(getattr(manifest, "warnings", []) or []) if manifest else [],
+            },
+            "recognition_result": recognition_summary,
+            "java": {
+                "selected_version": self.current_java_version,
+                "detected_version": self.detect_current_java_version(),
+                "xmx": self.jvm_xmx,
+                "xms": self.jvm_xms,
+                "extra_jvm_flags": list(self.extra_jvm_flags),
+            },
+            "start_command": {
+                "mode": self.start_command_mode,
+                "value": self.start_command_value,
+            },
+            "deleted_mods": {
+                "removed_mods": list(self.removed_mods),
+                "bisect_removed_mods": list(self.bisect_removed_mods),
+                "evidence": dict(self.deleted_mod_evidence),
+                "source_breakdown": dict(getattr(self, "deleted_mod_sources", {})),
+            },
+            "ai": {
+                "last_result": asdict(self.last_ai_result) if self.last_ai_result else None,
+                "manual_report": dict(self.last_ai_manual_report),
+            },
+            "attempts": {
+                "attempts_used": self.attempts_used,
+                "run_success": self.run_success,
+                "stop_reason": self.stop_reason,
+                "recognition_attempts": list(self.recognition_attempts),
+            },
+            "operations": list(self.operations),
+        }
+
     def package_server(self) -> str:
         out = self.workdirs.root / "server_pack.zip"
         with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("build_meta.json", json.dumps(self._build_meta_payload(), ensure_ascii=False, indent=2))
             for p in self.workdirs.server.rglob("*"):
                 if p.is_file():
                     zf.write(p, p.relative_to(self.workdirs.server))
@@ -2141,6 +2648,9 @@ class ServerBuilder:
 
             self._log("install.meta", "首次启动前生成 eula.txt 与 server.properties")
             self._ensure_server_meta_files()
+            desired_java = self._select_java_version_for_current_manifest()
+            if desired_java != self.current_java_version:
+                self.switch_java_version(desired_java)
 
             success = False
             for i in range(1, self.config.runtime.max_attempts + 1):
@@ -2228,12 +2738,53 @@ class ServerBuilder:
                     break
                 log_info = self.extract_relevant_log(str(start_res["log_path"]), str(start_res["crash_dir"]))
                 ai_context = self._build_ai_context(start_res, log_info)
+                next_plan = self._select_next_recognition_plan(start_res, log_info)
                 self._append_attempt_trace(
                     i,
                     "context_prepared",
                     "ok",
                     context_summary=self._summarize_ai_context(ai_context),
+                    recognition_plan=(
+                        {
+                            "loader": next_plan.loader,
+                            "loader_version": next_plan.loader_version,
+                            "mc_version": next_plan.mc_version,
+                            "build": next_plan.build,
+                            "start_mode": next_plan.start_mode,
+                            "java_version": next_plan.java_version,
+                            "confidence": next_plan.confidence,
+                            "confidence_level": self._recognition_confidence_level(next_plan.confidence),
+                            "reason": next_plan.reason,
+                            "source_candidates": list(next_plan.source_candidates),
+                            "preflight": self._preflight_recognition_plan(next_plan),
+                        }
+                        if next_plan
+                        else {}
+                    ),
                 )
+                if next_plan:
+                    self._apply_recognition_plan(next_plan, reason="runtime_feedback_fallback")
+                    self._append_attempt_trace(
+                        i,
+                        "recognition_fallback_applied",
+                        "ok",
+                        context_summary=self._summarize_ai_context(ai_context),
+                        recognition_plan={
+                            "loader": next_plan.loader,
+                            "loader_version": next_plan.loader_version,
+                            "mc_version": next_plan.mc_version,
+                            "build": next_plan.build,
+                            "start_mode": next_plan.start_mode,
+                            "java_version": next_plan.java_version,
+                            "confidence": next_plan.confidence,
+                            "confidence_level": self._recognition_confidence_level(next_plan.confidence),
+                            "reason": next_plan.reason,
+                            "source_candidates": list(next_plan.source_candidates),
+                            "switch_reason": "runtime_feedback_fallback",
+                            "preflight": self._preflight_recognition_plan(next_plan),
+                        },
+                    )
+                    continue
                 ai = self.analyze_with_ai(ai_context)
                 self._append_attempt_trace(
                     i,
@@ -3033,7 +3584,19 @@ class ServerBuilder:
         top_dirs = [p for p in base.iterdir() if p.is_dir()]
         if len(top_dirs) == 1:
             nested_root = top_dirs[0]
-            if nested_root.name.lower() not in {"overrides", "server", "serverfiles", "server-files", "serverpack", "server_pack"}:
+            if nested_root.name.lower() not in {
+                "overrides",
+                "override",
+                "server-overrides",
+                "server_overrides",
+                "serveroverrides",
+                "server",
+                "serverfiles",
+                "server-files",
+                "serverpack",
+                "server_pack",
+                "resourcepacks",
+            }:
                 # 若 client_temp 仅有一层根目录且没有根层文件，则仅展开该目录内容，避免多一层路径
                 if not base_files:
                     roots = [nested_root]
@@ -3053,8 +3616,15 @@ class ServerBuilder:
                 name_lc = src.name.lower()
 
                 # overrides 必须在 prepare 阶段被扁平合并，不允许作为目录层级进入 server
-                if name_lc == "overrides":
+                if name_lc in {"overrides", "override", "server-overrides", "server_overrides", "serveroverrides"}:
                     skipped += 1
+                    continue
+                if name_lc == "resourcepacks" and src.is_dir():
+                    kept = self._extract_server_resourcepacks(src)
+                    if kept:
+                        copied += kept
+                    else:
+                        skipped += 1
                     continue
                 if name_lc in blacklist:
                     skipped += 1
@@ -3065,6 +3635,29 @@ class ServerBuilder:
                 copied += 1
 
         return copied, skipped
+
+    def _extract_server_resourcepacks(self, resourcepacks_dir: Path) -> int:
+        if not resourcepacks_dir.exists() or not resourcepacks_dir.is_dir():
+            return 0
+
+        copied = 0
+        target_root = self.workdirs.server / "resourcepacks"
+        keep_markers = {"pack.mcmeta", "server-resource-packs.json", "server-resource-pack.txt"}
+
+        for item in sorted(resourcepacks_dir.iterdir(), key=lambda p: p.name.lower()):
+            should_keep = False
+            if item.is_file() and item.name.lower().endswith(".zip"):
+                should_keep = True
+            elif item.is_dir() and any((item / marker).exists() for marker in keep_markers):
+                should_keep = True
+            if not should_keep:
+                continue
+            replace_path(item, target_root / item.name)
+            copied += 1
+
+        if copied:
+            self.operations.append(f"resourcepacks_subset:copied={copied}")
+        return copied
 
     def _install_server_core(self) -> None:
         if not self.manifest:
@@ -3082,11 +3675,11 @@ class ServerBuilder:
 
         try:
             if loader in ("forge", "neoforge"):
-                self._install_forge_family_server(loader=loader, mc_version=mc_version, loader_version=loader_version)
+                self._install_forge_like_server(loader=loader, mc_version=mc_version, loader_version=loader_version)
                 self.operations.append(f"install_server_core:{loader}:ok")
                 return
             if loader in ("fabric", "quilt"):
-                self._install_fabric_family_server(loader=loader, mc_version=mc_version, loader_version=loader_version)
+                self._install_fabric_like_server(loader=loader, mc_version=mc_version, loader_version=loader_version)
                 self.operations.append(f"install_server_core:{loader}:ok")
                 return
         except Exception as e:
@@ -3100,22 +3693,38 @@ class ServerBuilder:
         self._set_start_command("jar", self.server_jar_name, f"install_server_core:fallback:{loader}")
         self.operations.append(f"install_server_core:fallback_placeholder_loader_{loader}")
 
+    def _install_forge_like_server(self, loader: str, mc_version: str, loader_version: str | None) -> None:
+        if loader == "forge":
+            self._install_forge_server(mc_version=mc_version, loader_version=loader_version)
+            return
+        self._install_neoforge_server(mc_version=mc_version, loader_version=loader_version)
+
+    def _install_forge_server(self, mc_version: str, loader_version: str | None) -> None:
+        self._install_forge_family_server(loader="forge", mc_version=mc_version, loader_version=loader_version)
+
+    def _install_neoforge_server(self, mc_version: str, loader_version: str | None) -> None:
+        self._install_forge_family_server(loader="neoforge", mc_version=mc_version, loader_version=loader_version)
+
+    def _install_fabric_like_server(self, loader: str, mc_version: str, loader_version: str | None) -> None:
+        if loader == "fabric":
+            self._install_fabric_server(mc_version=mc_version, loader_version=loader_version)
+            return
+        self._install_quilt_server(mc_version=mc_version, loader_version=loader_version)
+
+    def _install_fabric_server(self, mc_version: str, loader_version: str | None) -> None:
+        self._install_fabric_family_server(loader="fabric", mc_version=mc_version, loader_version=loader_version)
+
+    def _install_quilt_server(self, mc_version: str, loader_version: str | None) -> None:
+        self._install_fabric_family_server(loader="quilt", mc_version=mc_version, loader_version=loader_version)
+
     def _download_recommended_java(self) -> None:
         if not self.manifest:
             return
-        version = 21
+        version = choose_latest_lts_java_version()
         try:
-            mc = self.manifest.mc_version
-            nums = [int(x) for x in mc.split(".") if x.isdigit()]
-            minor = nums[1] if len(nums) > 1 else 18
-            if minor <= 16:
-                version = 8
-            elif minor == 17:
-                version = 17
-            else:
-                version = 21
+            version = choose_java_version(self.manifest)
         except Exception:
-            version = 21
+            version = choose_latest_lts_java_version()
 
         if self._ensure_java_installed(version):
             self.current_java_bin = self._java_bin_path(version)
@@ -3635,6 +4244,60 @@ class ServerBuilder:
 
         self.operations.append("start_command_parse_run_scripts:miss")
         return False
+
+    def _apply_modern_loader_start_mode(self) -> bool:
+        candidates = [
+            *self.workdirs.server.glob("libraries/**/unix_args.txt"),
+            *self.workdirs.server.glob("libraries/**/win_args.txt"),
+        ]
+        if not candidates:
+            return False
+
+        manifest = getattr(self, "manifest", None)
+        loader = str(getattr(manifest, "loader", "") or "").lower()
+        loader_version = str(getattr(manifest, "loader_version", "") or "")
+        mc_version = str(getattr(manifest, "mc_version", "") or "")
+
+        def score(item: Path) -> tuple[int, int, int, int, str]:
+            posix = item.as_posix().lower()
+            value = 0
+
+            if loader == "neoforge":
+                if "/net/neoforged/neoforge/" in posix:
+                    value += 12
+                if "/net/minecraftforge/forge/" in posix:
+                    value -= 4
+            elif loader == "forge":
+                if "/net/minecraftforge/forge/" in posix:
+                    value += 12
+                if "/net/neoforged/neoforge/" in posix:
+                    value -= 4
+            else:
+                if "/net/neoforged/neoforge/" in posix:
+                    value += 6
+                if "/net/minecraftforge/forge/" in posix:
+                    value += 6
+
+            if loader_version and loader_version.lower() in posix:
+                value += 8
+            elif mc_version and mc_version.lower() in posix:
+                value += 4
+
+            if item.name == "unix_args.txt":
+                value += 2 if os.name != "nt" else 0
+            elif item.name == "win_args.txt":
+                value += 2 if os.name == "nt" else 0
+
+            return (value, -len(item.parts), -len(item.as_posix()), 0, item.as_posix())
+
+        preferred = sorted(
+            candidates,
+            key=score,
+            reverse=True,
+        )[0]
+        rel = preferred.relative_to(self.workdirs.server).as_posix()
+        self._set_start_command("argsfile", rel, "modern_loader_args")
+        return True
 
     def _write_start_script(self) -> None:
         script = self._start_script_path()

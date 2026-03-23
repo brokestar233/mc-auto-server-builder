@@ -6,6 +6,25 @@ from typing import Any, Literal
 
 LoaderType = Literal["forge", "neoforge", "fabric", "quilt", "unknown"]
 InputType = Literal["local_zip", "curseforge", "modrinth", "url"]
+StartMode = Literal["jar", "args_file", "script", "unknown"]
+
+
+@dataclass(slots=True)
+class DetectionEvidence:
+    source_type: str
+    evidence_type: str
+    file: str
+    matched_text: str = ""
+    weight: float = 0.0
+    reason: str = ""
+
+
+@dataclass(slots=True)
+class DetectionCandidate:
+    value: str
+    confidence: float
+    evidence: list[DetectionEvidence] = field(default_factory=list)
+    reason: str = ""
 
 
 @dataclass(slots=True)
@@ -29,6 +48,16 @@ class PackManifest:
     loader: LoaderType
     loader_version: str | None = None
     mods: list[ModInfo] = field(default_factory=list)
+    start_mode: StartMode = "unknown"
+    build: str | None = None
+    loader_candidates: list[DetectionCandidate] = field(default_factory=list)
+    mc_version_candidates: list[DetectionCandidate] = field(default_factory=list)
+    loader_version_candidates: list[DetectionCandidate] = field(default_factory=list)
+    build_candidates: list[DetectionCandidate] = field(default_factory=list)
+    start_mode_candidates: list[DetectionCandidate] = field(default_factory=list)
+    evidence: list[DetectionEvidence] = field(default_factory=list)
+    confidence: float = 0.0
+    warnings: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -55,13 +84,25 @@ class StartResult:
     log_path: Path
     crash_dir: Path
     readiness_evidence: list[str] = field(default_factory=list)
+    failure_signals: list[str] = field(default_factory=list)
+    resource_samples: list[dict[str, float | int | str | None]] = field(default_factory=list)
+    resource_summary: dict[str, float | int | str | None] = field(default_factory=dict)
     stdout_tail: str = ""
     stderr_tail: str = ""
 
 
 @dataclass(slots=True)
 class AIAction:
-    type: Literal["remove_mods", "adjust_memory", "change_java", "stop_and_report", "report_manual_fix", "bisect_mods", "move_bisect_mods"]
+    type: Literal[
+        "remove_mods",
+        "adjust_memory",
+        "change_java",
+        "stop_and_report",
+        "report_manual_fix",
+        "bisect_mods",
+        "move_bisect_mods",
+        "switch_recognition_candidate",
+    ]
     targets: list[str] | None = None
     rollback_on_failure: bool | None = None
     xmx: str | None = None
@@ -76,6 +117,11 @@ class AIAction:
     move_candidates: list[str] | None = None
     max_rounds: int | None = None
     allow_dependency_moves: bool | None = None
+    loader: str | None = None
+    loader_version: str | None = None
+    mc_version: str | None = None
+    start_mode: str | None = None
+    build: str | None = None
 
 
 @dataclass(slots=True)
@@ -170,6 +216,7 @@ class AttemptTrace:
     stage: str
     status: str
     context_summary: dict[str, Any] = field(default_factory=dict)
+    recognition_plan: dict[str, Any] = field(default_factory=dict)
     ai_result: dict[str, Any] = field(default_factory=dict)
     action_plan: list[dict[str, Any]] = field(default_factory=list)
     preflight: list[dict[str, Any]] = field(default_factory=list)

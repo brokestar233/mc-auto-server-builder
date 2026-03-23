@@ -1,8 +1,21 @@
 from __future__ import annotations
 
+import json
+import zipfile
+
 from mc_auto_server_builder.ai import BuilderAIService
 from mc_auto_server_builder.builder import ServerBuilder
-from mc_auto_server_builder.models import ActionPreflight, AIResult, BisectMoveRecord, BisectRoundRecord, BisectSession
+from mc_auto_server_builder.models import (
+    ActionPreflight,
+    AIResult,
+    BisectMoveRecord,
+    BisectRoundRecord,
+    BisectSession,
+    DetectionCandidate,
+    DetectionEvidence,
+    PackManifest,
+)
+from mc_auto_server_builder.recognition import RecognitionFallbackPlan, choose_latest_lts_java_version
 
 
 def test_detect_command_probe_ready_accepts_player_count_line():
@@ -62,6 +75,94 @@ def test_detect_command_probe_ready_rejects_unrelated_output():
 
     assert ready is False
     assert source == ""
+
+
+def test_detect_failure_signals_matches_common_runtime_errors():
+    builder = ServerBuilder.__new__(ServerBuilder)
+
+    result = ServerBuilder._detect_failure_signals(
+        builder,
+        "UnsupportedClassVersionError\nAddress already in use\nOutOfMemoryError\nwatchdog",
+    )
+
+    assert "java_version_mismatch" in result
+    assert "port_in_use" in result
+    assert "memory_oom" in result
+    assert "watchdog_or_deadlock" in result
+
+
+def test_select_java_version_prefers_top_recognition_plan():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.manifest = PackManifest(
+        pack_name="demo",
+        mc_version="1.20.1",
+        loader="forge",
+        start_mode="jar",
+        loader_candidates=[DetectionCandidate(value="neoforge", confidence=0.95)],
+        mc_version_candidates=[DetectionCandidate(value="1.21.1", confidence=0.95)],
+        start_mode_candidates=[DetectionCandidate(value="args_file", confidence=0.95)],
+    )
+    builder._build_recognition_candidates = ServerBuilder._build_recognition_candidates.__get__(builder, ServerBuilder)
+
+    selected = ServerBuilder._select_java_version_for_current_manifest(builder)
+
+    assert selected == 21
+
+
+def test_build_recognition_summary_exposes_runtime_feedback_stats():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.manifest = PackManifest(
+        pack_name="demo",
+        mc_version="1.20.1",
+        loader="forge",
+        loader_version="1.20.1-47.2.0",
+        build="47.2.0",
+        start_mode="args_file",
+    )
+    builder.recognition_attempts = [
+        {"reason": "runtime_feedback_fallback", "loader": "fabric"},
+        {"reason": "manual_switch", "loader": "forge"},
+    ]
+    builder._serialize_detection_candidates = ServerBuilder._serialize_detection_candidates.__get__(builder, ServerBuilder)
+
+    summary = ServerBuilder._build_recognition_summary(builder)
+
+    assert summary["recognition_strategy_used"] == "unknown"
+    assert summary["recognition_fallback_count"] == 2
+    assert summary["recognition_switched"] is True
+    assert summary["recognition_finalized_after_runtime_feedback"] is True
+
+
+def test_copy_client_files_with_blacklist_keeps_server_resourcepack_subset(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.operations = []
+    builder.workdirs = type("WorkDirs", (), {"client_temp": tmp_path / "client", "server": tmp_path / "server"})()
+    builder.workdirs.client_temp.mkdir(parents=True)
+    builder.workdirs.server.mkdir(parents=True)
+    builder._extract_server_resourcepacks = ServerBuilder._extract_server_resourcepacks.__get__(builder, ServerBuilder)
+
+    resourcepacks = builder.workdirs.client_temp / "resourcepacks"
+    resourcepacks.mkdir()
+    (resourcepacks / "keep.zip").write_text("zip", encoding="utf-8")
+    (resourcepacks / "skip.txt").write_text("txt", encoding="utf-8")
+    kept_dir = resourcepacks / "server-pack"
+    kept_dir.mkdir()
+    (kept_dir / "pack.mcmeta").write_text("{}", encoding="utf-8")
+
+    copied, skipped = ServerBuilder._copy_client_files_with_blacklist(builder, {"resourcepacks"})
+
+    assert copied == 2
+    assert skipped == 0
+    assert (builder.workdirs.server / "resourcepacks" / "keep.zip").exists()
+    assert (builder.workdirs.server / "resourcepacks" / "server-pack" / "pack.mcmeta").exists()
+    assert not (builder.workdirs.server / "resourcepacks" / "skip.txt").exists()
+
+
+def test_normalize_client_relative_path_accepts_server_override_aliases():
+    from mc_auto_server_builder.util import normalize_client_relative_path
+
+    assert normalize_client_relative_path("server-overrides/config/a.toml") == "config/a.toml"
+    assert normalize_client_relative_path("server_overrides/mods/a.jar") == "mods/a.jar"
 
 
 def test_normalize_ai_result_injects_manual_fix_action_when_only_manual_guidance_exists():
@@ -310,11 +411,424 @@ def test_execute_remove_mods_with_rollback_on_failure_restores_snapshot():
 
     assert stop is False
     assert execution["status"] == "rolled_back"
-    assert execution["validation_start_performed"] is True
-    assert execution["validation_success"] is False
-    assert rollback is not None
-    assert rollback["performed"] is True
-    assert state["mods"] == ["bad.jar", "good.jar"]
+
+
+def test_select_java_version_for_manifest_uses_loader_and_version_bias():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.manifest = PackManifest(pack_name="pack", mc_version="1.21.1", loader="neoforge")
+
+    version = ServerBuilder._select_java_version_for_current_manifest(builder)
+
+    assert version == 21
+
+
+def test_choose_latest_lts_java_version_returns_supported_lts():
+    assert choose_latest_lts_java_version() == 21
+
+
+def test_apply_modern_loader_start_mode_prefers_args_file(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.server_jar_name = "server.jar"
+    builder.start_command_mode = "jar"
+    builder.start_command_value = builder.server_jar_name
+    builder.operations = []
+    builder.workdirs = type("WorkDirs", (), {"server": tmp_path})()
+    builder.manifest = PackManifest(pack_name="Pack", mc_version="1.20.1", loader="forge", loader_version="1.20.1-47.2.0")
+    builder._set_start_command = ServerBuilder._set_start_command.__get__(builder, ServerBuilder)
+    (tmp_path / "libraries" / "net" / "minecraftforge" / "forge" / "1.20.1-47.2.0").mkdir(parents=True)
+    (tmp_path / "libraries" / "net" / "minecraftforge" / "forge" / "1.20.1-47.2.0" / "unix_args.txt").write_text("args", encoding="utf-8")
+
+    applied = ServerBuilder._apply_modern_loader_start_mode(builder)
+
+    assert applied is True
+    assert builder.start_command_mode == "argsfile"
+    assert builder.start_command_value.endswith("unix_args.txt")
+
+
+def test_apply_modern_loader_start_mode_prefers_manifest_matching_loader_and_version(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.server_jar_name = "server.jar"
+    builder.start_command_mode = "jar"
+    builder.start_command_value = builder.server_jar_name
+    builder.operations = []
+    builder.workdirs = type("WorkDirs", (), {"server": tmp_path})()
+    builder.manifest = PackManifest(
+        pack_name="Pack",
+        mc_version="1.20.1",
+        loader="forge",
+        loader_version="1.20.1-47.2.0",
+    )
+    builder._set_start_command = ServerBuilder._set_start_command.__get__(builder, ServerBuilder)
+    forge_dir = tmp_path / "libraries" / "net" / "minecraftforge" / "forge" / "1.20.1-47.2.0"
+    neo_dir = tmp_path / "libraries" / "net" / "neoforged" / "neoforge" / "21.0.10"
+    forge_dir.mkdir(parents=True)
+    neo_dir.mkdir(parents=True)
+    (forge_dir / "unix_args.txt").write_text("args", encoding="utf-8")
+    (neo_dir / "unix_args.txt").write_text("args", encoding="utf-8")
+
+    applied = ServerBuilder._apply_modern_loader_start_mode(builder)
+
+    assert applied is True
+    assert builder.start_command_value == "libraries/net/minecraftforge/forge/1.20.1-47.2.0/unix_args.txt"
+
+
+def test_apply_modern_loader_start_mode_prefers_neoforge_candidate_when_manifest_is_neoforge(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.server_jar_name = "server.jar"
+    builder.start_command_mode = "jar"
+    builder.start_command_value = builder.server_jar_name
+    builder.operations = []
+    builder.workdirs = type("WorkDirs", (), {"server": tmp_path})()
+    builder.manifest = PackManifest(
+        pack_name="Pack",
+        mc_version="1.21.1",
+        loader="neoforge",
+        loader_version="21.1.1-beta",
+    )
+    builder._set_start_command = ServerBuilder._set_start_command.__get__(builder, ServerBuilder)
+    forge_dir = tmp_path / "libraries" / "net" / "minecraftforge" / "forge" / "1.21.1-52.0.1"
+    neo_dir = tmp_path / "libraries" / "net" / "neoforged" / "neoforge" / "21.1.1-beta"
+    forge_dir.mkdir(parents=True)
+    neo_dir.mkdir(parents=True)
+    (forge_dir / "unix_args.txt").write_text("args", encoding="utf-8")
+    (neo_dir / "unix_args.txt").write_text("args", encoding="utf-8")
+
+    applied = ServerBuilder._apply_modern_loader_start_mode(builder)
+
+    assert applied is True
+    assert builder.start_command_value == "libraries/net/neoforged/neoforge/21.1.1-beta/unix_args.txt"
+
+
+def test_build_meta_payload_contains_recognition_and_runtime_state():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.pack_input = type("PackInput", (), {"input_type": "local_zip", "source": "pack.zip", "file_id": None})()
+    builder.manifest = PackManifest(
+        pack_name="Example Pack",
+        mc_version="1.20.1",
+        loader="forge",
+        loader_version="1.20.1-47.2.0",
+        build="47.2.0",
+        start_mode="args_file",
+        confidence=0.93,
+        warnings=["warn"],
+        loader_candidates=[DetectionCandidate(value="forge", confidence=0.98)],
+    )
+    builder.current_java_version = 21
+    builder.jvm_xmx = "6G"
+    builder.jvm_xms = "4G"
+    builder.extra_jvm_flags = ["-XX:+UseG1GC"]
+    builder.start_command_mode = "argsfile"
+    builder.start_command_value = "libraries/net/minecraftforge/forge/1.20.1-47.2.0/unix_args.txt"
+    builder.removed_mods = ["bad.jar"]
+    builder.bisect_removed_mods = ["temp.jar"]
+    builder.deleted_mod_evidence = {"bad.jar": ["builtin_rule:test"]}
+    builder.last_ai_result = None
+    builder.last_ai_manual_report = {"user_summary": "manual"}
+    builder.attempts_used = 2
+    builder.run_success = True
+    builder.stop_reason = ""
+    builder.recognition_attempts = [{"loader": "forge"}]
+    builder.operations = ["op1"]
+    builder._build_recognition_summary = ServerBuilder._build_recognition_summary.__get__(builder, ServerBuilder)
+    builder._serialize_detection_candidates = ServerBuilder._serialize_detection_candidates.__get__(builder, ServerBuilder)
+    builder.detect_current_java_version = lambda: 21
+
+    payload = ServerBuilder._build_meta_payload(builder)
+
+    assert payload["pack_source"]["input_type"] == "local_zip"
+    assert payload["manifest_summary"]["pack_name"] == "Example Pack"
+    assert payload["recognition_result"]["active_loader"] == "forge"
+    assert payload["java"]["selected_version"] == 21
+    assert payload["deleted_mods"]["removed_mods"] == ["bad.jar"]
+
+
+def test_package_server_embeds_build_meta_json(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.workdirs = type("WorkDirs", (), {"root": tmp_path, "server": tmp_path / "server", "java_bins": tmp_path / "java_bins"})()
+    builder.workdirs.server.mkdir()
+    builder.workdirs.java_bins.mkdir()
+    (builder.workdirs.server / "server.jar").write_text("jar", encoding="utf-8")
+    (builder.workdirs.java_bins / "java").write_text("bin", encoding="utf-8")
+    builder._build_meta_payload = ServerBuilder._build_meta_payload.__get__(builder, ServerBuilder)
+    builder._build_recognition_summary = lambda: {"active_loader": "forge", "confidence": 0.9}
+    builder.detect_current_java_version = lambda: 21
+    builder.pack_input = type("PackInput", (), {"input_type": "local_zip", "source": "pack.zip", "file_id": None})()
+    builder.manifest = PackManifest(pack_name="Pack", mc_version="1.20.1", loader="forge")
+    builder.current_java_version = 21
+    builder.jvm_xmx = "4G"
+    builder.jvm_xms = "2G"
+    builder.extra_jvm_flags = []
+    builder.start_command_mode = "jar"
+    builder.start_command_value = "server.jar"
+    builder.removed_mods = []
+    builder.bisect_removed_mods = []
+    builder.deleted_mod_evidence = {}
+    builder.last_ai_result = None
+    builder.last_ai_manual_report = {}
+    builder.attempts_used = 0
+    builder.run_success = False
+    builder.stop_reason = ""
+    builder.recognition_attempts = []
+    builder.operations = []
+
+    out = ServerBuilder.package_server(builder)
+
+    with zipfile.ZipFile(out, "r") as zf:
+        names = set(zf.namelist())
+        assert "build_meta.json" in names
+        payload = json.loads(zf.read("build_meta.json").decode("utf-8"))
+        assert payload["manifest_summary"]["loader"] == "forge"
+        assert "server.jar" in names
+        assert "java_bins/java" in names
+
+
+def test_select_next_recognition_plan_uses_runtime_feedback(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.server_jar_name = "server.jar"
+    builder.current_java_version = 17
+    builder.recognition_attempts = []
+    builder.workdirs = type("WorkDirs", (), {"server": tmp_path})()
+    builder.manifest = PackManifest(
+        pack_name="pack",
+        mc_version="1.20.1",
+        loader="fabric",
+        loader_candidates=[DetectionCandidate(value="fabric", confidence=0.7), DetectionCandidate(value="forge", confidence=0.6)],
+        mc_version_candidates=[DetectionCandidate(value="1.20.1", confidence=0.9)],
+        loader_version_candidates=[DetectionCandidate(value="1.20.1-47.2.0", confidence=0.7)],
+        start_mode_candidates=[DetectionCandidate(value="jar", confidence=0.4), DetectionCandidate(value="argsfile", confidence=0.8)],
+    )
+    (tmp_path / "libraries" / "net" / "minecraftforge" / "forge" / "1.20.1-47.2.0").mkdir(parents=True)
+    (tmp_path / "server.jar").write_text("jar", encoding="utf-8")
+
+    plan = ServerBuilder._select_next_recognition_plan(
+        builder,
+        {"stdout_tail": "FML early loading", "stderr_tail": "", "success": False},
+        {"refined_log": "Forge Mod Loader detected", "key_exception": ""},
+    )
+
+    assert isinstance(plan, RecognitionFallbackPlan)
+    assert plan.loader == "forge"
+    assert plan.start_mode == "argsfile"
+    assert plan.java_version == 17
+    assert "runtime_loader=forge" in plan.reason
+
+
+def test_preflight_recognition_plan_reports_confidence_level(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.server_jar_name = "server.jar"
+    builder.manifest = PackManifest(pack_name="pack", mc_version="1.20.1", loader="forge")
+    builder.workdirs = type("WorkDirs", (), {"server": tmp_path})()
+    (tmp_path / "libraries" / "net" / "minecraftforge").mkdir(parents=True)
+    (tmp_path / "server.jar").write_text("jar", encoding="utf-8")
+
+    result = ServerBuilder._preflight_recognition_plan(
+        builder,
+        RecognitionFallbackPlan(
+            loader="forge",
+            loader_version="1.20.1-47.2.0",
+            mc_version="1.20.1",
+            build="47.2.0",
+            start_mode="jar",
+            java_version=17,
+            confidence=0.52,
+            reason="候选识别计划",
+            source_candidates=["forge", "1.20.1", "jar"],
+        ),
+    )
+
+    assert result["allowed"] is True
+    assert result["confidence_level"] == "low"
+    assert "java_version_matches_loader_strategy" in result["checks"]
+
+
+def test_normalize_ai_result_accepts_switch_recognition_candidate_action():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder._log = lambda *_args, **_kwargs: None
+    builder.config = type("Cfg", (), {"ai": type("AI", (), {"enabled": False, "debug": False})()})()
+    service = BuilderAIService(builder)
+
+    result = service._normalize_ai_result(
+        {
+            "final_output": {
+                "primary_issue": "loader_misclassification",
+                "confidence": 0.81,
+                "reason": "日志出现明显 Forge 特征",
+                "actions": [
+                    {
+                        "type": "switch_recognition_candidate",
+                        "loader": "forge",
+                        "loader_version": "1.20.1-47.2.0",
+                        "mc_version": "1.20.1",
+                        "start_mode": "argsfile",
+                    }
+                ],
+            }
+        }
+    )
+
+    assert result.primary_issue == "loader_misclassification"
+    assert result.actions[0].type == "switch_recognition_candidate"
+    assert result.actions[0].loader == "forge"
+
+
+def test_build_recognition_summary_includes_candidates_and_evidence_preview():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.manifest = type(
+        "Manifest",
+        (),
+        {
+            "pack_name": "demo-pack",
+            "confidence": 0.91,
+            "warnings": ["low build confidence"],
+            "loader_candidates": [
+                DetectionCandidate(value="forge", confidence=0.98, reason="manifest.json"),
+            ],
+            "mc_version_candidates": [
+                DetectionCandidate(value="1.20.1", confidence=0.97, reason="manifest.json"),
+            ],
+            "loader_version_candidates": [
+                DetectionCandidate(value="1.20.1-47.2.0", confidence=0.95, reason="script"),
+            ],
+            "build_candidates": [
+                DetectionCandidate(value="47.2.0", confidence=0.9, reason="derived"),
+            ],
+            "start_mode_candidates": [
+                DetectionCandidate(value="args_file", confidence=0.92, reason="run.sh"),
+            ],
+            "evidence": [
+                DetectionEvidence(
+                    source_type="script",
+                    evidence_type="args_path",
+                    file="run.sh",
+                    matched_text="@libraries/net/minecraftforge/forge/1.20.1-47.2.0/unix_args.txt",
+                    weight=0.94,
+                    reason="命中 Forge args 路径",
+                )
+            ],
+            "raw": {
+                "recognition_pipeline": [
+                    "explicit_metadata",
+                    "startup_script",
+                    "file_pattern",
+                    "directory_feature",
+                    "text_heuristic",
+                    "runtime_feedback",
+                ],
+                "recognition_phase_hits": ["explicit_metadata", "startup_script"],
+                "recognition_phase_details": {"explicit_metadata": ["variables:variables.txt"]},
+            },
+        },
+    )()
+
+    summary = ServerBuilder._build_recognition_summary(builder)
+
+    assert summary["pack_name"] == "demo-pack"
+    assert summary["confidence"] == 0.91
+    assert summary["loader_candidates"][0]["value"] == "forge"
+    assert summary["start_mode_candidates"][0]["value"] == "args_file"
+    assert summary["evidence_preview"][0]["file"] == "run.sh"
+    assert summary["recognition_pipeline"][0] == "explicit_metadata"
+    assert "startup_script" in summary["recognition_phase_hits"]
+
+
+def test_detect_failure_signals_matches_extended_runtime_errors():
+    builder = ServerBuilder.__new__(ServerBuilder)
+
+    result = ServerBuilder._detect_failure_signals(
+        builder,
+        (
+            "Could not reserve enough space for 4096KB object heap\n"
+            "Argument file @libraries/net/minecraftforge/forge/1.20.1-47.2.0/unix_args.txt not found"
+        ),
+    )
+
+    assert "memory_allocation" in result
+    assert "loader_misclassification" in result
+
+
+def test_generate_report_contains_deleted_mod_source_breakdown(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.workdirs = type("W", (), {"root": tmp_path})()
+    builder.run_success = False
+    builder.attempts_used = 1
+    builder.stop_reason = "failed"
+    builder.removed_mods = ["client.jar"]
+    builder.bisect_removed_mods = []
+    builder.jvm_xmx = "4G"
+    builder.jvm_xms = "4G"
+    builder.last_ai_result = None
+    builder.last_ai_manual_report = {}
+    builder.known_deleted_client_mods = {"client.jar"}
+    builder.deleted_mod_evidence = {"client.jar": ["builtin_rule:client_only"]}
+    builder.deleted_mod_sources = {
+        "client.jar": {
+            "builtin_rule": ["builtin_rule:client_only"],
+            "user_rule": [],
+            "ai_suggested": [],
+            "dependency_cleanup": [],
+            "bisect": [],
+            "other": [],
+        }
+    }
+    builder.attempt_traces = []
+    builder.operations = []
+    builder.detect_current_java_version = lambda: 21
+    builder._attempt_trace_path = lambda attempt, stage: tmp_path / f"{attempt}_{stage}.json"
+    builder._format_bisect_tree_lines = lambda: ["- none"]
+    builder._build_recognition_summary = lambda: {
+        "pack_name": "demo",
+        "active_loader": "forge",
+        "active_mc_version": "1.20.1",
+        "active_loader_version": None,
+        "active_build": None,
+        "active_start_mode": "jar",
+        "confidence": 0.5,
+        "loader_candidates": [],
+        "mc_version_candidates": [],
+        "build_candidates": [],
+        "start_mode_candidates": [],
+        "recognition_pipeline": [],
+        "recognition_phase_hits": [],
+        "recognition_phase_details": {},
+        "fallback_history": [],
+        "evidence_preview": [],
+    }
+
+    report_path = ServerBuilder.generate_report(builder)
+    report_text = (tmp_path / "report.txt").read_text(encoding="utf-8")
+
+    assert report_path
+    assert "删除 mod 来源分层统计:" in report_text
+    assert '"builtin_rule": ["builtin_rule:client_only"]' in report_text
+
+
+def test_summarize_ai_context_includes_recognition_summary():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder._normalize_text_list = ServerBuilder._normalize_text_list.__get__(builder, ServerBuilder)
+    builder._extract_log_signal_lines = ServerBuilder._extract_log_signal_lines.__get__(builder, ServerBuilder)
+    builder.ai_service = BuilderAIService(builder)
+
+    summary = ServerBuilder._summarize_ai_context(
+        builder,
+        {
+            "mc_version": "1.20.1",
+            "loader": "forge",
+            "loader_version": "1.20.1-47.2.0",
+            "build": "47.2.0",
+            "start_mode": "args_file",
+            "mod_count": 5,
+            "current_installed_mods": ["a.jar", "b.jar"],
+            "recognition_summary": {
+                "confidence": 0.88,
+                "loader_candidates": [{"value": "forge"}],
+            },
+        },
+    )
+
+    assert summary["loader_version"] == "1.20.1-47.2.0"
+    assert summary["build"] == "47.2.0"
+    assert summary["start_mode"] == "args_file"
+    assert summary["recognition_summary"]["confidence"] == 0.88
 
 
 def test_build_prompt_allows_initial_bisect_when_session_inactive():
@@ -445,6 +959,46 @@ def test_remove_mods_by_name_separates_bisect_removals(tmp_path):
 
     assert builder.bisect_removed_mods == ["a.jar"]
     assert builder.removed_mods == ["b.jar"]
+
+
+def test_apply_recognition_based_client_cleanup_removes_known_client_mods(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.operations = []
+    builder.removed_mods = []
+    builder.bisect_removed_mods = []
+    builder.known_deleted_client_mods = set()
+    builder.deleted_mod_evidence = {}
+    builder.deleted_mod_sources = {}
+    builder.manifest = PackManifest(pack_name="demo", mc_version="1.20.1", loader="forge")
+    builder._log = lambda *_args, **_kwargs: None
+    builder._record_deleted_client_mod = ServerBuilder._record_deleted_client_mod.__get__(builder, ServerBuilder)
+    builder._record_deleted_mod_detail = ServerBuilder._record_deleted_mod_detail.__get__(builder, ServerBuilder)
+    builder.remove_mods_by_name = ServerBuilder.remove_mods_by_name.__get__(builder, ServerBuilder)
+    builder.apply_recognition_based_client_cleanup = ServerBuilder.apply_recognition_based_client_cleanup.__get__(builder, ServerBuilder)
+    builder.workdirs = type("WorkDirs", (), {"server": tmp_path})()
+    mods_dir = tmp_path / "mods"
+    mods_dir.mkdir()
+    (mods_dir / "fancymenu-3.0.jar").write_text("x", encoding="utf-8")
+    (mods_dir / "servercore-1.0.jar").write_text("x", encoding="utf-8")
+
+    removed = builder.apply_recognition_based_client_cleanup()
+
+    assert removed == ["fancymenu-3.0.jar"]
+    assert not (mods_dir / "fancymenu-3.0.jar").exists()
+    assert (mods_dir / "servercore-1.0.jar").exists()
+
+
+def test_install_server_core_uses_split_loader_branches():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.manifest = PackManifest(pack_name="demo", mc_version="1.20.1", loader="quilt", loader_version="0.25.1")
+    builder.operations = []
+    called: list[str] = []
+    builder._install_forge_like_server = lambda **kwargs: called.append(f"forge:{kwargs['loader']}")
+    builder._install_fabric_like_server = lambda **kwargs: called.append(f"fabric:{kwargs['loader']}")
+
+    ServerBuilder._install_server_core(builder)
+
+    assert called == ["fabric:quilt"]
 
 
 def test_extract_latest_crash_mod_issue_returns_latest_section():

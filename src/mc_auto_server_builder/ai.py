@@ -155,6 +155,10 @@ class BuilderAIService:
             "mod_conflict",
             "missing_dependency",
             "config_error",
+            "pack_recognition_error",
+            "loader_misclassification",
+            "version_misclassification",
+            "start_command_misclassification",
             "other",
         }
         allowed_action = {
@@ -165,6 +169,7 @@ class BuilderAIService:
             "report_manual_fix",
             "bisect_mods",
             "move_bisect_mods",
+            "switch_recognition_candidate",
         }
 
         final_output = data.get("final_output")
@@ -591,7 +596,7 @@ class BuilderAIService:
             "thought_chain": ["最多 8 条简短推理"],
             "final_output": {
                 "primary_issue": (
-                    "client_mod|memory_allocation|memory_oom|java_version_mismatch|mod_conflict|missing_dependency|config_error|other"
+                    "client_mod|memory_allocation|memory_oom|java_version_mismatch|mod_conflict|missing_dependency|config_error|pack_recognition_error|loader_misclassification|version_misclassification|start_command_misclassification|other"
                 ),
                 "confidence": 0.0,
                 "reason": "技术原因摘要",
@@ -625,6 +630,15 @@ class BuilderAIService:
                     {"type": "move_bisect_mods", "targets": ["libX.jar"], "reason": "当前测试组缺少前置依赖，申请从另一组临时迁移"},
                     {"type": "adjust_memory", "xmx": "6G", "xms": "4G"},
                     {"type": "change_java", "version": 21},
+                    {
+                        "type": "switch_recognition_candidate",
+                        "loader": "forge",
+                        "loader_version": "1.20.1-47.2.0",
+                        "mc_version": "1.20.1",
+                        "start_mode": "argsfile",
+                        "build": "47.2.0",
+                        "reason": "日志反证当前识别错误",
+                    },
                     {
                         "type": "report_manual_fix",
                         "final_reason": "崩溃主因",

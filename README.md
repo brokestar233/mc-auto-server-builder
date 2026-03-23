@@ -170,3 +170,10 @@ CI 流程见 [`CI`](.github/workflows/ci.yml)。
 ## 许可证
 
 本项目使用 GNU GPL v3.0 only，详见 [`LICENSE`](LICENSE)。
+
+---
+
+## 鸣谢
+
+- [`CurseForgeModpackDownloader`](https://github.com/AnzhiZhang/CurseForgeModpackDownloader)：提供了 CurseForge API 使用相关思路与参考。
+- [`auto-mcs`](https://github.com/macarooni-man/auto-mcs)：提供了更宽泛的包识别思路。

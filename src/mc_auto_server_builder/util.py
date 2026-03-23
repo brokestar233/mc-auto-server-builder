@@ -171,7 +171,12 @@ def copy_tree_merge(src: Path, dst: Path) -> tuple[int, int]:
 
 def merge_overrides_into_base(base: Path) -> tuple[int, int, int]:
     override_dirs = sorted(
-        [p for p in base.rglob("*") if p.is_dir() and p.name.lower() == "overrides"],
+        [
+            p
+            for p in base.rglob("*")
+            if p.is_dir()
+            and p.name.lower() in {"overrides", "override", "server-overrides", "server_overrides", "serveroverrides"}
+        ],
         key=lambda p: len(p.parts),
         reverse=True,
     )
@@ -195,10 +200,19 @@ def normalize_client_relative_path(rel_path: str) -> str:
     normalized = rel_path.replace("\\", "/").lstrip("./").strip("/")
     if not normalized:
         return ""
-    if normalized == "overrides":
+    override_prefixes = (
+        "overrides",
+        "override",
+        "server-overrides",
+        "server_overrides",
+        "serveroverrides",
+    )
+    if normalized in override_prefixes:
         return ""
-    if normalized.startswith("overrides/"):
-        return normalized[len("overrides/") :]
+    for prefix in override_prefixes:
+        token = f"{prefix}/"
+        if normalized.startswith(token):
+            return normalized[len(token) :]
     return normalized
 
 
