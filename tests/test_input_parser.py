@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import zipfile
+
 import pytest
 
 from mc_auto_server_builder.input_parser import parse_manifest_from_zip, parse_pack_input
