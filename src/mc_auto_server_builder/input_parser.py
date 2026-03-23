@@ -179,7 +179,10 @@ def parse_manifest_from_zip(zip_path: str | Path) -> PackManifest:
         if _zip_dir_exists(names, ".minecraft"):
             return _from_full_pack_zip(zf, names)
 
-    raise ValueError(f"ZIP 内未找到 manifest.json 或 modrinth.index.json: {zpath}")
+    raise ValueError(
+        "ZIP 既不包含 manifest.json / modrinth.index.json，"
+        f"也不包含 .minecraft 目录: {zpath}"
+    )
 
 
 def _from_curseforge_manifest(data: dict) -> PackManifest:

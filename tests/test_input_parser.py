@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import zipfile
+import pytest
 
 from mc_auto_server_builder.input_parser import parse_manifest_from_zip, parse_pack_input
 
@@ -67,3 +68,12 @@ def test_parse_manifest_from_zip_full_pack_uses_first_version_dir(tmp_path):
         "1.20.1-forge-47.2.0.jar",
         "1.20.1-forge-47.2.0.json",
     ]
+
+
+def test_parse_manifest_from_zip_raises_when_no_manifest_and_no_dot_minecraft(tmp_path):
+    zip_path = tmp_path / "invalid-pack.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("overrides/config/example.txt", "value")
+
+    with pytest.raises(ValueError, match=r"既不包含 manifest\.json / modrinth\.index\.json.*也不包含 \.minecraft 目录"):
+        parse_manifest_from_zip(zip_path)
