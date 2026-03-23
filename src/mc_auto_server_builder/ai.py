@@ -163,6 +163,7 @@ class BuilderAIService:
         }
         allowed_action = {
             "remove_mods",
+            "restore_mods_and_continue",
             "adjust_memory",
             "change_java",
             "stop_and_report",
@@ -542,6 +543,10 @@ class BuilderAIService:
         raw_evidence.extend(self._extract_log_signal_lines(crash_mod_issue, limit=10))
         candidate_fixes = [
             {"type": "remove_mods", "when": "日志或依赖链能明确定位问题 mod"},
+            {
+                "type": "restore_mods_and_continue",
+                "when": "上一轮是带回滚验证的删 mod，且本轮 crash-reports / 崩溃特征已变化，说明应恢复到删前基线再继续分析",
+            },
             {"type": "bisect_mods", "when": "无法直接定位单个问题 mod，但可以对可疑 mod 集合进行受控二分测试"},
             {"type": "adjust_memory", "when": "存在内存分配不足或 OOM 证据"},
             {"type": "change_java", "when": "存在 Java 版本不兼容证据"},
@@ -568,6 +573,16 @@ class BuilderAIService:
                 "current_installed_client_mods": self._normalize_text_list(context.get("current_installed_client_mods", []), limit=120),
                 "known_deleted_client_mods": self._normalize_text_list(context.get("known_deleted_client_mods", []), limit=120),
                 "deleted_mod_evidence": context.get("deleted_mod_evidence", {}),
+            },
+            "rollback_state": {
+                "last_rollback_remove_mods": context.get("last_rollback_remove_mods", {}),
+                "crash_reports_changed_since_last_rollback_remove": bool(
+                    context.get("crash_reports_changed_since_last_rollback_remove", False)
+                ),
+                "last_crash_reports": self._normalize_text_list(context.get("last_crash_reports", []), limit=20),
+                "current_crash_reports": self._normalize_text_list(context.get("current_crash_reports", []), limit=20),
+                "crash_report_delta": self._normalize_text_list(context.get("crash_report_delta", []), limit=20),
+                "last_crash_excerpt_preview": self._truncate_debug_text(context.get("last_crash_excerpt", ""), 1500),
             },
             "bisect_state": {
                 "active": bool(context.get("bisect_active", False)),
@@ -610,6 +625,10 @@ class BuilderAIService:
                 "suggested_manual_steps": ["人工修复步骤"],
                 "actions": [
                     {"type": "remove_mods", "targets": ["modA.jar"], "rollback_on_failure": True},
+                    {
+                        "type": "restore_mods_and_continue",
+                        "reason": "上一轮 rollback_on_failure 删除后，当前 crash-reports 已变化，需要恢复到删前基线后继续分析",
+                    },
                     {
                         "type": "bisect_mods",
                         "bisect_mode": "initial",
@@ -656,15 +675,22 @@ class BuilderAIService:
                 "任务目标：先识别主因，再选择最安全、最可执行的动作。"
                 "证据优先级：异常堆栈/错误关键字 > 已删除客户端mod依赖链 > 最近自动操作 > 其他上下文。\n",
                 "硬规则：1. 若某个 mod 依赖任何已知且已删除的客户端 mod，则该 mod 必须判定为 remove_mods。"
-                "2. 若 remove_mods 存在多个可能候选，默认一次只删除 1 个最有把握的 mod；"
-                "不要一次删除多个候选，因为这类批量删除更容易被系统拦截。"
+                "2. 若证据只能唯一锁定 1 个候选，则 remove_mods 只提交这 1 个最有把握的 mod。"
+                "但若证据已明确表明多个 mod 都是客户端专用 mod，允许一次提交多个 remove_mods targets；"
+                "不过总数绝不能超过系统源码中的安全上限（当前为 3 个）。"
                 "3. 对 remove_mods，若你希望系统在删除后做一次启动验证并在失败时自动回滚，"
                 "则显式输出 rollback_on_failure=true。"
-                "4. 若单个 remove_mods 候选执行后仍不能解决问题，且证据不再足以唯一锁定下一个单一 mod，"
+                "4. 若 rollback_state.last_rollback_remove_mods.triggered=true，且上一轮是 remove_mods + rollback_on_failure=true，"
+                "同时 rollback_state.crash_reports_changed_since_last_rollback_remove=true，"
+                "则允许优先输出 restore_mods_and_continue，用于要求系统恢复到上一轮删前基线并继续后续自动动作；"
+                "此时必须结合 last_crash_reports、current_crash_reports、"
+                "crash_report_delta、last_crash_excerpt_preview 判断崩溃是否真的变了。"
+                "若 crash 没变，则禁止输出 restore_mods_and_continue。"
+                "5. 若单个 remove_mods 候选执行后仍不能解决问题，且证据不再足以唯一锁定下一个单一 mod，"
                 "则优先回到删除前基线并改用受控二分，而不是继续盲目累计删除。"
-                "5. 输出 bisect_mods 时，bisect_mode 只能是 initial|switch_group|continue_failed_group，"
+                "6. 输出 bisect_mods 时，bisect_mode 只能是 initial|switch_group|continue_failed_group，"
                 "且 AI 不得指定 keep_group 或 test_group。"
-                "6. 若最近一次阻止原因为 duplicate_bisect_stage_request 或 "
+                "7. 若最近一次阻止原因为 duplicate_bisect_stage_request 或 "
                 "duplicate_bisect_request_after_previous_round，则禁止再次输出任何 bisect_mods，"
                 "必须改为 report_manual_fix、remove_mods、adjust_memory、change_java 或 stop_and_report。\n",
                 "二分状态机：1. 若 bisect_state.active=true，优先消费 last_feedback、"
@@ -687,14 +713,17 @@ class BuilderAIService:
                 "不要重复输出等价的 client_mod 二分。4. 若 success_guard_history 已显示连续同类 client_mod 判断，"
                 "而证据仍不能收敛到新动作，则必须 report_manual_fix，禁止无意义循环。\n",
                 "动作优先级：1. 证据已唯一命中单个 mod 或明确依赖链时，优先 remove_mods；"
-                "若同时有多个 remove_mods 候选，也应只提交其中最有把握的那 1 个。"
-                "2. 若该单删动作只是高置信试探、删除后可能需要立即验证是否误删，"
+                "若只是多个可疑候选，则仍应只提交最有把握的那 1 个。"
+                "只有在证据明确证明多个 mod 都属于客户端 mod 时，才允许一次提交多个 targets，且最多 3 个。"
+                "2. 若上一轮 remove_mods 已触发自动回滚，且 crash 报告或关键崩溃特征明显变化，优先 restore_mods_and_continue；"
+                "若 crash 报告未变，则不要把 restore_mods_and_continue 当作默认动作。"
+                "3. 若该单删动作只是高置信试探、删除后可能需要立即验证是否误删，"
                 "优先为 remove_mods 增加 rollback_on_failure=true。"
-                "3. 若多个候选都可疑但没有足够把握安全单删，或单删后问题依旧且需要重新缩小范围，"
+                "4. 若多个候选都可疑但没有足够把握安全单删，或单删后问题依旧且需要重新缩小范围，"
                 "则优先回滚该删除思路并给出最小 suspects 集合申请 bisect_mods。"
-                "4. 只有在证据明确表明当前测试组缺少必要依赖，且该依赖位于另一组时，"
-                "才可追加 move_bisect_mods。5. 若系统连续无进展或无法安全自动修复，但能说明原因与修复步骤，"
-                "必须输出 report_manual_fix。6. 只有当无法唯一命中单一 mod、无法构造至少 2 个 mod 的 suspects、"
+                "5. 只有在证据明确表明当前测试组缺少必要依赖，且该依赖位于另一组时，"
+                "才可追加 move_bisect_mods。6. 若系统连续无进展或无法安全自动修复，但能说明原因与修复步骤，"
+                "必须输出 report_manual_fix。7. 只有当无法唯一命中单一 mod、无法构造至少 2 个 mod 的 suspects、"
                 "系统也未开放任何续轮二分动作、且现有证据不足以支持 remove_mods、adjust_memory、change_java "
                 "或 report_manual_fix 时，才允许 stop_and_report。\n",
                 "schema补充：move_bisect_mods 只能跟在一个已准备好的 bisect_mods 之后，"

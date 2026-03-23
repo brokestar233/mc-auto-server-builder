@@ -21,6 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, TextIO
 
+import psutil
 import requests
 
 
@@ -78,6 +79,7 @@ class DownloadTask:
     urls: list[str]
     stage: str = "install.download"
     headers: dict[str, str] | None = None
+    session_factory: Callable[[], requests.Session] | None = None
     expected_hashes: dict[str, str] | None = None
     extract_to: Path | None = None
     task_id: str = ""
@@ -280,21 +282,72 @@ def graceful_stop_process(proc: subprocess.Popen[str], timeout_sec: float = 20.0
     try:
         proc.wait(timeout=timeout_sec)
     except Exception:
-        proc.terminate()
+        terminate_process(proc, timeout_sec=8)
+
+
+def _iter_process_tree(proc: subprocess.Popen[str]) -> list[psutil.Process]:
+    try:
+        root = psutil.Process(proc.pid)
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return []
+
+    try:
+        children = root.children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        children = []
+    return [*children, root]
+
+
+def _wait_process_tree(processes: list[psutil.Process], timeout_sec: float) -> tuple[list[psutil.Process], list[psutil.Process]]:
+    alive: list[psutil.Process] = []
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    for ps_proc in reversed(processes):
+        remaining = max(0.0, deadline - time.monotonic())
         try:
-            proc.wait(timeout=8)
+            ps_proc.wait(timeout=remaining)
+        except psutil.TimeoutExpired:
+            alive.append(ps_proc)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return processes, alive
+
+
+def terminate_process_tree(proc: subprocess.Popen[str], timeout_sec: float = 8.0) -> None:
+    if proc.poll() is not None:
+        return
+
+    processes = _iter_process_tree(proc)
+    if not processes:
+        try:
+            proc.terminate()
+            proc.wait(timeout=timeout_sec)
         except Exception:
-            proc.kill()
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return
+
+    for ps_proc in processes:
+        try:
+            ps_proc.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    _, alive = _wait_process_tree(processes, timeout_sec)
+    for ps_proc in alive:
+        try:
+            ps_proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    _wait_process_tree(alive, min(3.0, timeout_sec))
 
 
 def terminate_process(proc: subprocess.Popen[str], timeout_sec: float = 8.0) -> None:
     if proc.poll() is not None:
         return
-    proc.terminate()
-    try:
-        proc.wait(timeout=timeout_sec)
-    except Exception:
-        proc.kill()
+    terminate_process_tree(proc, timeout_sec=timeout_sec)
 
 
 def threaded_pipe_reader(stream: TextIO, bucket: list[str], cap: int = 800) -> None:
@@ -935,16 +988,18 @@ class Downloader:
         out: Path,
         stage: str = "install.download",
         headers: dict[str, str] | None = None,
+        session_factory: Callable[[], requests.Session] | None = None,
         progress_cb: Callable[[int], None] | None = None,
         total_bytes_cb: Callable[[int | None], None] | None = None,
     ) -> Path:
         ensure_parent_dir(out)
         last_err: Exception | None = None
         for attempt in range(1, self.cfg.max_retries + 1):
+            session = session_factory() if session_factory is not None else requests.Session()
             try:
                 if not (self.logger and self.logger.is_download_ui_active()):
                     self._log(stage, f"开始下载: {url} -> {out}")
-                with requests.get(
+                with session.get(
                     url,
                     stream=True,
                     headers=headers,
@@ -976,6 +1031,8 @@ class Downloader:
                 safe_unlink(out)
                 if attempt < self.cfg.max_retries:
                     time.sleep(self.cfg.retry_backoff_sec * attempt)
+            finally:
+                session.close()
 
         raise DownloadError(f"下载失败: {url} ({type(last_err).__name__ if last_err else 'unknown'})")
 
@@ -994,6 +1051,7 @@ class Downloader:
                     task.out,
                     stage=task.stage,
                     headers=task.headers,
+                    session_factory=task.session_factory,
                     progress_cb=(lambda delta: self.logger.download_ui_task_progress(task_id=task_id, delta_bytes=delta))
                     if self.logger
                     else None,

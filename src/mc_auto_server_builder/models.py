@@ -79,6 +79,8 @@ class StartResult:
     command_probe_detected: bool
     port_open_detected: bool
     process_alive: bool
+    crash_detected: bool
+    forced_termination: bool
     success_source: str
     exit_code: int | None
     log_path: Path
@@ -89,12 +91,15 @@ class StartResult:
     resource_summary: dict[str, float | int | str | None] = field(default_factory=dict)
     stdout_tail: str = ""
     stderr_tail: str = ""
+    crash_reports_snapshot: list[str] = field(default_factory=list)
+    crash_reports_new: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class AIAction:
     type: Literal[
         "remove_mods",
+        "restore_mods_and_continue",
         "adjust_memory",
         "change_java",
         "stop_and_report",

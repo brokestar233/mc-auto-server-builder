@@ -34,7 +34,6 @@
   },
   "server_port": 25565,
   "github_api_key": "",
-  "oracle_download_cookies": "",
   "curseforge_api_key": "",
   "modrinth_api_token": "",
   "modrinth_user_agent": "brokestar233/mc-auto-server-builder",

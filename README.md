@@ -117,7 +117,7 @@ flowchart TD
 ### 3) Java 下载失败
 
 - 网络问题最常见；可重试。
-- Oracle 相关场景可配置 `oracle_download_cookies`。
+- Java 17 的 GraalVM 改为从 GitHub Releases 下载；Java 21/25 仍保留 Oracle 下载链路。
 
 ### 4) 启动未成功
 

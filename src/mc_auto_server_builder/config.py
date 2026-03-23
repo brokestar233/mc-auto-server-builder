@@ -80,7 +80,6 @@ class AppConfig:
     extra_jvm_flags: list[str] = field(default_factory=list)
     user_blacklist_regex: list[str] = field(default_factory=list)
     github_api_key: str = ""
-    oracle_download_cookies: str = ""
     curseforge_api_key: str = ""
     modrinth_api_token: str = ""
     modrinth_user_agent: str = "brokestar233/mc-auto-server-builder"
@@ -125,7 +124,6 @@ class AppConfig:
             extra_jvm_flags=data.get("extra_jvm_flags", []),
             user_blacklist_regex=data.get("user_blacklist_regex", []),
             github_api_key=data.get("github_api_key", "") or "",
-            oracle_download_cookies=data.get("oracle_download_cookies", "") or "",
             curseforge_api_key=data.get("curseforge_api_key", "") or "",
             modrinth_api_token=data.get("modrinth_api_token", "") or "",
             modrinth_user_agent=(

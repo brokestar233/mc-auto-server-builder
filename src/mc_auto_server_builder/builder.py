@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, fields
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+from typing import Callable
 from urllib.parse import urlparse
 
 import psutil
@@ -80,6 +81,8 @@ from .util import (
 )
 from .workspace import create_workdirs
 
+AI_REMOVE_MODS_SAFE_LIMIT = 3
+
 
 class ServerBuilder:
     _ALLOWED_MANIFEST_DOWNLOAD_TYPES = {"mod", "plugin", "datapack"}
@@ -116,6 +119,7 @@ class ServerBuilder:
         self.last_ai_payload: dict[str, object] = {}
         self.last_ai_result: AIResult | None = None
         self.last_ai_manual_report: dict[str, object] = {}
+        self.last_rollback_remove_mods: dict[str, object] = {}
         self.attempt_traces: list[AttemptTrace] = []
         self.bisect_session = BisectSession()
         self.last_bisect_feedback: dict[str, object] = {}
@@ -123,6 +127,7 @@ class ServerBuilder:
         self.attempts_used: int = 0
         self.run_success: bool = False
         self.stop_reason: str = ""
+        self._mods_backup_signatures: dict[str, tuple[str, ...]] = {}
         self.server_jar_name: str = "server.jar"
         self.start_command_mode: str = "jar"
         self.start_command_value: str = self.server_jar_name
@@ -275,7 +280,8 @@ class ServerBuilder:
                 else:
                     self.removed_mods.append(n)
                 self.operations.append(f"remove_mod_by_name:{n}")
-                self._log("install.remove_mod", f"删除mod:{n} 原因:{reason}")
+                if source == "ai":
+                    self._log("install.remove_mod", f"删除mod:{n} 原因:{reason}")
                 self._record_deleted_client_mod(n, source=source, reason=reason or "explicit_name")
                 category = "other"
                 if source == "bisect":
@@ -349,9 +355,24 @@ class ServerBuilder:
 
     def backup_mods(self, tag: str):
         mods_dir = self.workdirs.server / "mods"
-        if mods_dir.exists():
-            backup_directory(mods_dir, self.workdirs.backups, f"mods_{tag}")
-            self.operations.append(f"backup_mods:{tag}")
+        if not mods_dir.exists():
+            return
+
+        signature = tuple(
+            sorted(
+                str(path.relative_to(mods_dir)).replace("\\", "/")
+                for path in mods_dir.rglob("*")
+                if path.is_file()
+            )
+        )
+        previous_signature = self._mods_backup_signatures.get(tag)
+        if previous_signature == signature:
+            self.operations.append(f"backup_mods_skip_unchanged:{tag}")
+            return
+
+        backup_directory(mods_dir, self.workdirs.backups, f"mods_{tag}")
+        self._mods_backup_signatures[tag] = signature
+        self.operations.append(f"backup_mods:{tag}")
 
     def rollback_mods(self, tag: str):
         src = self.workdirs.backups / f"mods_{tag}"
@@ -688,6 +709,14 @@ class ServerBuilder:
         session = self._coerce_bisect_session()
         manifest = self.manifest
         recognition_summary = self._build_recognition_summary() if manifest else {}
+        rollback_state = dict(getattr(self, "last_rollback_remove_mods", {}) or {})
+        current_crash_reports = [str(x) for x in (start_res.get("crash_reports_snapshot") or []) if str(x).strip()]
+        last_crash_reports = [str(x) for x in (rollback_state.get("crash_reports_after_validation") or []) if str(x).strip()]
+        crash_report_delta = sorted(set(current_crash_reports).symmetric_difference(set(last_crash_reports)))
+        crash_reports_changed = bool(rollback_state.get("triggered")) and bool(crash_report_delta)
+        if rollback_state:
+            rollback_state["crash_reports_changed_since_last_context"] = crash_reports_changed
+            self.last_rollback_remove_mods = rollback_state
         return {
             "mc_version": manifest.mc_version if manifest else "unknown",
             "loader": manifest.loader if manifest else "unknown",
@@ -704,6 +733,12 @@ class ServerBuilder:
             "deleted_mod_evidence": self.deleted_mod_evidence,
             "dependency_cleanup_rule_enabled": True,
             "recent_actions": self.operations[-20:],
+            "last_rollback_remove_mods": rollback_state,
+            "crash_reports_changed_since_last_rollback_remove": crash_reports_changed,
+            "last_crash_reports": last_crash_reports,
+            "current_crash_reports": current_crash_reports,
+            "crash_report_delta": crash_report_delta,
+            "last_crash_excerpt": str(rollback_state.get("validation_crash_excerpt") or ""),
             "bisect_active": bool(getattr(session, "active", False)),
             "bisect_next_allowed_requests": list(getattr(session, "next_allowed_requests", []) or []),
             "bisect_feedback": dict(getattr(self, "last_bisect_feedback", {}) or {}),
@@ -1603,6 +1638,31 @@ class ServerBuilder:
     def _assess_action_preflight(self, action: dict) -> ActionPreflight:
         action_type = str(action.get("type") or "unknown")
         details: list[str] = []
+        if action_type == "restore_mods_and_continue":
+            state = dict(getattr(self, "last_rollback_remove_mods", {}) or {})
+            triggered = bool(state.get("triggered", False))
+            snapshot_tag = str(state.get("snapshot_tag") or "").strip()
+            changed = bool(state.get("crash_reports_changed_since_last_context", False))
+            details.append(f"triggered={triggered}")
+            details.append(f"snapshot_tag={snapshot_tag or 'none'}")
+            details.append(f"crash_reports_changed={changed}")
+            if not triggered or not snapshot_tag:
+                return ActionPreflight(
+                    action_type=action_type,
+                    risk="medium",
+                    allowed=False,
+                    reason="no_rollback_remove_mods_context",
+                    details=details,
+                )
+            if not changed:
+                return ActionPreflight(
+                    action_type=action_type,
+                    risk="medium",
+                    allowed=False,
+                    reason="crash_reports_not_changed_after_rollback_remove_mods",
+                    details=details,
+                )
+            return ActionPreflight(action_type=action_type, risk="low", allowed=True, reason="rollback_restore_allowed", details=details)
         if action_type == "bisect_mods":
             bisect_mode = str(action.get("bisect_mode") or "initial").strip() or "initial"
             if bisect_mode not in {"initial", "switch_group", "continue_failed_group"}:
@@ -1736,7 +1796,7 @@ class ServerBuilder:
                     reason="no_installed_targets_resolved",
                     details=details,
                 )
-            if len(resolved) > 3:
+            if len(resolved) > AI_REMOVE_MODS_SAFE_LIMIT:
                 return ActionPreflight(
                     action_type=action_type,
                     risk="high",
@@ -1921,6 +1981,25 @@ class ServerBuilder:
                     )
                     if not validation_success:
                         rollback = self._rollback_action(action_type, snapshot_tag, previous_state)
+                        crash_reports_after_validation = [
+                            str(x) for x in (validation_res.get("crash_reports_snapshot") or []) if str(x).strip()
+                        ]
+                        self.last_rollback_remove_mods = {
+                            "triggered": bool(rollback and rollback.get("performed")),
+                            "snapshot_tag": snapshot_tag,
+                            "action_index": idx,
+                            "removed_targets": list(resolved_names),
+                            "forced_targets": list(forced_targets),
+                            "validation_success": validation_success,
+                            "validation_failure_signals": list(validation_res.get("failure_signals") or []),
+                            "validation_readiness_evidence": list(validation_res.get("readiness_evidence") or []),
+                            "validation_crash_excerpt": str(validation_res.get("stderr_tail") or validation_res.get("reason") or ""),
+                            "crash_reports_after_validation": crash_reports_after_validation,
+                            "crash_reports_new_after_validation": [
+                                str(x) for x in (validation_res.get("crash_reports_new") or []) if str(x).strip()
+                            ],
+                            "crash_reports_changed_since_last_context": False,
+                        }
                         execution.update(
                             {
                                 "status": "rolled_back",
@@ -1938,6 +2017,22 @@ class ServerBuilder:
                             }
                         )
                         return False, execution, rollback
+                else:
+                    self.last_rollback_remove_mods = {}
+            elif action_type == "restore_mods_and_continue":
+                state = dict(getattr(self, "last_rollback_remove_mods", {}) or {})
+                snapshot_to_restore = str(state.get("snapshot_tag") or snapshot_tag).strip()
+                self.rollback_mods(snapshot_to_restore)
+                self.operations.append(f"restore_mods_and_continue:{snapshot_to_restore}")
+                execution.update(
+                    {
+                        "status": "applied",
+                        "restored_snapshot_tag": snapshot_to_restore,
+                        "restored_targets": list(state.get("removed_targets") or []),
+                    }
+                )
+                state["continued"] = True
+                self.last_rollback_remove_mods = state
             elif action_type == "adjust_memory":
                 xmx = action.get("xmx", self.jvm_xmx)
                 xms = action.get("xms", self.jvm_xms)
@@ -2081,20 +2176,33 @@ class ServerBuilder:
         return major
 
     def _detect_log_ready_signal(self, text: str) -> tuple[bool, str]:
-        lower = (text or "").lower()
-        markers = [
-            ("done", "log_done"),
-            ("preparing spawn area", "log_preparing_spawn_area"),
-        ]
-        for marker, source in markers:
-            if marker in lower:
-                return True, source
+        for raw_line in (text or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if re.search(r"\bpreparing spawn area\b", line, flags=re.IGNORECASE):
+                return True, "log_preparing_spawn_area"
+            if re.search(
+                r'(?:^|:\s*)done\s*\([^\n\r)]*\)!?(?:\s*for help, type\s+"?help"?)?\s*$',
+                line,
+                flags=re.IGNORECASE,
+            ):
+                return True, "log_done"
         return False, ""
 
     def _detect_command_probe_ready(self, text: str) -> tuple[bool, str]:
         if re.search(r"there\s+are.*players\s+online", text or "", flags=re.IGNORECASE | re.DOTALL):
             return True, "cmd_probe_list_response"
         return False, ""
+
+    def _snapshot_crash_reports(self, crash_dir: Path) -> tuple[bool, set[str]]:
+        exists = crash_dir.exists() and crash_dir.is_dir()
+        if not exists:
+            return False, set()
+        try:
+            return True, {p.name for p in crash_dir.iterdir() if p.is_file()}
+        except OSError:
+            return exists, set()
 
     # 运行与日志
     def start_server(self, timeout: int = 300) -> dict:
@@ -2104,6 +2212,8 @@ class ServerBuilder:
 
         latest_log = self.workdirs.server / "logs" / "latest.log"
         latest_log.parent.mkdir(parents=True, exist_ok=True)
+        crash_dir = self.workdirs.server / "crash-reports"
+        initial_crash_dir_exists, initial_crash_reports = self._snapshot_crash_reports(crash_dir)
 
         cmd = [str(script)] if os.name != "nt" else ["cmd", "/c", str(script)]
         proc = subprocess.Popen(
@@ -2143,6 +2253,8 @@ class ServerBuilder:
         readiness_evidence: list[str] = []
         resource_samples: list[dict[str, float | int | str | None]] = []
         failure_signals: list[str] = []
+        crash_detected = False
+        forced_termination = False
 
         while True:
             now = time.monotonic()
@@ -2162,6 +2274,42 @@ class ServerBuilder:
                 if signal not in failure_signals:
                     failure_signals.append(signal)
 
+            current_crash_dir_exists, current_crash_reports = self._snapshot_crash_reports(crash_dir)
+            new_crash_reports = sorted(current_crash_reports - initial_crash_reports)
+            crash_dir_created = current_crash_dir_exists and not initial_crash_dir_exists
+            if crash_dir_created and not new_crash_reports:
+                self._log(
+                    "install.crash",
+                    "检测到 crash-reports 目录首次创建，等待 2 秒以便 crash 文件落盘后再分析",
+                    level="INFO",
+                )
+                time.sleep(2.0)
+                current_crash_dir_exists, current_crash_reports = self._snapshot_crash_reports(crash_dir)
+                new_crash_reports = sorted(current_crash_reports - initial_crash_reports)
+                crash_report_preview = ",".join(new_crash_reports[:3]) if new_crash_reports else "none"
+                self._log(
+                    "install.crash",
+                    f"crash-reports 复扫完成，新增 crash 文件 {len(new_crash_reports)} 个：{crash_report_preview}",
+                    level="INFO",
+                )
+            if crash_dir_created or new_crash_reports:
+                crash_detected = True
+                if "crash_report_created" not in failure_signals:
+                    failure_signals.append("crash_report_created")
+                if crash_dir_created and len(initial_crash_reports) == 0 and not new_crash_reports:
+                    readiness_evidence.append("crash_reports_dir_created")
+                elif len(initial_crash_reports) == 0:
+                    readiness_evidence.append(f"crash_reports_first_seen:{','.join(new_crash_reports[:3])}")
+                else:
+                    readiness_evidence.append(f"crash_reports_increased:{','.join(new_crash_reports[:3])}")
+                crash_report_preview = ",".join(new_crash_reports[:3]) if new_crash_reports else "none"
+                self._log(
+                    "install.crash",
+                    f"检测到 crash 证据，目录新建={crash_dir_created}，新增文件={crash_report_preview}，准备进入日志提取与 AI 分析",
+                    level="INFO",
+                )
+                break
+
             if not port_open:
                 try:
                     port_open = is_local_tcp_port_open(port=int(self.config.server_port), host="127.0.0.1", timeout=0.6)
@@ -2169,8 +2317,6 @@ class ServerBuilder:
                     port_open = False
                 if port_open:
                     readiness_evidence.append("port_open")
-                    if not success_source and proc.poll() is None:
-                        success_source = "port_open_alive"
 
             if not done:
                 done_detected, done_source = self._detect_log_ready_signal(merged_tail)
@@ -2196,7 +2342,7 @@ class ServerBuilder:
                     success_source = probe_source
                     readiness_evidence.append(probe_source)
 
-            if cmd_probe_ok or done or (port_open and proc.poll() is None):
+            if cmd_probe_ok or done:
                 break
 
             if proc.poll() is not None:
@@ -2207,21 +2353,26 @@ class ServerBuilder:
 
         process_alive = proc.poll() is None
         if process_alive and not self.config.runtime.keep_running:
-            graceful_stop_process(proc, timeout_sec=20.0, stop_command="stop")
+            if crash_detected or not (cmd_probe_ok or done):
+                terminate_process(proc, timeout_sec=8.0)
+                forced_termination = True
+                readiness_evidence.append("forced_termination")
+            else:
+                graceful_stop_process(proc, timeout_sec=20.0, stop_command="stop")
             process_alive = proc.poll() is None
-        elif (not success_source) and process_alive:
+        elif (not success_source or crash_detected) and process_alive:
             terminate_process(proc, timeout_sec=8.0)
+            forced_termination = True
+            readiness_evidence.append("forced_termination")
             process_alive = proc.poll() is None
 
-        if proc.stdout:
-            proc.stdout.close()
-        if proc.stderr:
-            proc.stderr.close()
+        for t in threads:
+            t.join(timeout=1.0)
 
         exit_code = proc.poll()
         stdout_tail = "\n".join(stdout_lines[-80:])
         stderr_tail = "\n".join(stderr_lines[-80:])
-        success = bool(success_source)
+        success = bool((cmd_probe_ok or done) and not crash_detected)
         peak_rss_mb = max((float(item.get("rss_mb") or 0.0) for item in resource_samples), default=0.0)
         peak_cpu_percent = max((float(item.get("cpu_percent") or 0.0) for item in resource_samples), default=0.0)
         max_process_count = max((int(item.get("process_count") or 0) for item in resource_samples), default=0)
@@ -2232,7 +2383,9 @@ class ServerBuilder:
             command_probe_detected=cmd_probe_ok,
             port_open_detected=port_open,
             process_alive=process_alive,
-            success_source=success_source or "none",
+            crash_detected=crash_detected,
+            forced_termination=forced_termination,
+            success_source=success_source if success else "none",
             readiness_evidence=readiness_evidence[-12:],
             failure_signals=failure_signals[-12:],
             resource_samples=resource_samples[-20:],
@@ -2243,9 +2396,11 @@ class ServerBuilder:
             },
             exit_code=exit_code,
             log_path=latest_log,
-            crash_dir=self.workdirs.server / "crash-reports",
+            crash_dir=crash_dir,
             stdout_tail=stdout_tail,
             stderr_tail=stderr_tail,
+            crash_reports_snapshot=sorted(current_crash_reports if "current_crash_reports" in locals() else initial_crash_reports),
+            crash_reports_new=sorted(new_crash_reports if "new_crash_reports" in locals() else []),
         )
         self.operations.append(
             "start_server:"
@@ -2738,7 +2893,11 @@ class ServerBuilder:
                     break
                 log_info = self.extract_relevant_log(str(start_res["log_path"]), str(start_res["crash_dir"]))
                 ai_context = self._build_ai_context(start_res, log_info)
-                next_plan = self._select_next_recognition_plan(start_res, log_info)
+                next_plan = None
+                if start_res.get("crash_detected"):
+                    self._log("install.ai", "检测到 crash 证据，跳过 runtime recognition fallback，直接进入 AI 分析")
+                else:
+                    next_plan = self._select_next_recognition_plan(start_res, log_info)
                 self._append_attempt_trace(
                     i,
                     "context_prepared",
@@ -3761,11 +3920,7 @@ class ServerBuilder:
 
     def _oracle_download_headers(self) -> dict[str, str]:
         # Oracle 站点对某些自定义请求头较敏感，默认采用最小头策略。
-        headers: dict[str, str] = {}
-        cookies = (self.config.oracle_download_cookies or "").strip()
-        if cookies:
-            headers["Cookie"] = cookies
-        return headers
+        return {}
 
     def _oracle_download_headers_compat(self) -> dict[str, str]:
         # 兼容重试头：用于最小头策略失败后的二次尝试。
@@ -3784,6 +3939,11 @@ class ServerBuilder:
     ) -> tuple[dict | None, str]:
         for profile_name, headers in profiles:
             try:
+                self._log(
+                    stage,
+                    f"{op_prefix} 请求 URL={url} profile={profile_name}",
+                    level="DEBUG",
+                )
                 resp = requests.get(
                     url,
                     headers=headers,
@@ -3833,23 +3993,26 @@ class ServerBuilder:
             except Exception as e:
                 error_message = str(e).strip()
                 self.operations.append(f"{op_prefix}:request_error:{version}:profile={profile_name}:{type(e).__name__}")
+                error_suffix = f" - {error_message}" if error_message else ""
                 self._log(
                     stage,
-                    f"{op_prefix} 请求异常 profile={profile_name}: {type(e).__name__}{f' - {error_message}' if error_message else ''}",
+                    f"{op_prefix} 请求异常 URL={url} profile={profile_name}: {type(e).__name__}{error_suffix}",
+                    level="DEBUG",
+                )
+                self._log(
+                    stage,
+                    f"{op_prefix} 请求异常 profile={profile_name}: {type(e).__name__}{error_suffix}",
                     level="WARN",
                 )
 
         return None, ""
 
     def _download_graalvm_from_oracle(self, version: int) -> bool:
-        if version not in (17, 21, 25):
+        if version not in (21, 25):
             return False
 
         stage = "install.download.oracle_graalvm"
         manual_url = self._oracle_graalvm_manual_page_url()
-        cookies = (self.config.oracle_download_cookies or "").strip()
-        if not cookies:
-            self._log(stage, f"未配置 oracle_download_cookies，若下载受限请手动访问: {manual_url}", level="WARN")
 
         try:
             os_name, arch_name, ext = oracle_platform_triplet()
@@ -3857,8 +4020,8 @@ class ServerBuilder:
             self.operations.append(f"oracle_graalvm_platform_unsupported:{version}:{type(e).__name__}")
             return False
 
-        group_title = "GraalVM Enterprise 21" if version == 17 else "Oracle GraalVM"
-        group_subtitle = "" if version == 17 else ("Oracle GraalVM for JDK 21" if version == 21 else "Oracle GraalVM 25")
+        group_title = "Oracle GraalVM"
+        group_subtitle = "Oracle GraalVM for JDK 21" if version == 21 else "Oracle GraalVM 25"
 
         base_url = "https://www.oracle.com"
         headers = self._oracle_download_headers()
@@ -3920,7 +4083,8 @@ class ServerBuilder:
 
         self.operations.append(f"oracle_graalvm_release_profile_selected:{version}:{release_profile}")
 
-        files = (((release_data or {}).get("Packages") or {}).get("Core") or {}).get("Files") or {}
+        core_package = (((release_data or {}).get("Packages") or {}).get("Core") or {})
+        files = (core_package.get("Files") or {}) if isinstance(core_package, dict) else {}
         picked: dict | None = None
         if isinstance(files, dict):
             token = f"-{os_name}-{arch_name}-{version}".lower()
@@ -3953,7 +4117,14 @@ class ServerBuilder:
         bin_name = "java.exe" if os.name == "nt" else "java"
 
         try:
-            self._download_file(file_url, archive_path, stage=stage, headers=headers)
+            self._log(stage, f"oracle_graalvm_download 请求 URL={file_url}", level="DEBUG")
+            self._download_file(
+                file_url,
+                archive_path,
+                stage=stage,
+                headers=headers,
+                session_factory=None,
+            )
             if expected_hashes and not verify_hashes(archive_path, expected_hashes):
                 safe_unlink(archive_path)
                 self.operations.append(f"oracle_graalvm_hash_mismatch:{version}")
@@ -3981,8 +4152,87 @@ class ServerBuilder:
             self.operations.append(f"oracle_graalvm_download_success:{version}:{os_name}:{arch_name}")
             return True
         except Exception as e:
+            error_message = str(e).strip()
             self.operations.append(f"oracle_graalvm_download_failed:{version}:{type(e).__name__}")
+            self._log(
+                stage,
+                f"oracle_graalvm_download 下载异常 URL={file_url}: {type(e).__name__}{f' - {error_message}' if error_message else ''}",
+                level="DEBUG",
+            )
             self._log(stage, f"Oracle GraalVM 下载失败，手动页面: {manual_url}", level="WARN")
+            return False
+
+    def _download_graalvm17_from_github(self) -> bool:
+        api_url = "https://api.github.com/repos/brokestar233/grallvm17-bin/releases"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if self.config.github_api_key:
+            headers["Authorization"] = f"Bearer {self.config.github_api_key}"
+
+        try:
+            releases = http_get_json(api_url, headers=headers, timeout=60)
+        except Exception as e:
+            self.operations.append(f"graalvm17_release_fetch_failed:{type(e).__name__}")
+            return False
+
+        arch_aliases = self._current_arch_aliases()
+        is_windows = os.name == "nt"
+        asset = None
+        if releases:
+            asset = self._pick_asset_by_arch(
+                releases[0].get("assets") or [],
+                arch_aliases,
+                is_windows=is_windows,
+            )
+        if not asset:
+            for rel in releases if isinstance(releases, list) else []:
+                asset = self._pick_asset_by_arch(
+                    rel.get("assets") or [],
+                    arch_aliases,
+                    is_windows=is_windows,
+                )
+                if asset:
+                    break
+        if not asset:
+            self.operations.append("graalvm17_asset_not_found")
+            return False
+
+        url = str(asset.get("browser_download_url") or "").strip()
+        name = str(asset.get("name") or "").strip()
+        if not url:
+            self.operations.append(f"graalvm17_asset_no_url:{name}")
+            return False
+
+        archive_path = self.workdirs.java_bins / (name or "graalvm17")
+        try:
+            self._download_file(url, archive_path)
+            java_home = self.workdirs.java_bins / "jdk-17"
+            if java_home.exists():
+                shutil.rmtree(java_home)
+            java_home.mkdir(parents=True, exist_ok=True)
+
+            bin_name = "java.exe" if os.name == "nt" else "java"
+            extract_archive(archive_path, java_home)
+            normalized, changed = normalize_java_home_layout(java_home)
+            if changed:
+                self.operations.append("graalvm17_java_home_normalized")
+
+            java_bin = normalized / "bin" / bin_name
+            if not java_bin.exists():
+                self.operations.append(f"graalvm17_java_bin_missing:{name}")
+                return False
+
+            self.current_java_bin = java_bin
+            self.current_java_version = 17
+            if os.name != "nt":
+                java_bin.chmod(0o755)
+            self.java_params_mode_by_version[17] = "graalvm"
+            self.operations.append(f"graalvm17_selected_asset:{name}")
+            return True
+        except Exception as e:
+            self.operations.append(f"graalvm17_download_or_extract_failed:{type(e).__name__}")
             return False
 
     def _ensure_java_installed(self, version: int) -> bool:
@@ -3999,8 +4249,18 @@ class ServerBuilder:
                 return self._java_bin_path(version).exists()
             return False
 
-        # Java 17/21/25：优先 Oracle GraalVM，失败回退 Adoptium（并降级参数为 common_only）
-        if version in (17, 21, 25):
+        # Java 17：优先 GitHub Releases 的 graalvm17，失败回退 Adoptium（并降级参数为 common_only）
+        if version == 17:
+            if self._download_graalvm17_from_github():
+                return self._java_bin_path(version).exists()
+            if self._download_temurin_from_adoptium(version):
+                self.java_params_mode_by_version[version] = "common_only"
+                self.operations.append(f"java_params_mode_fallback_common:{version}")
+                return self._java_bin_path(version).exists()
+            return False
+
+        # Java 21/25：优先 Oracle GraalVM，失败回退 Adoptium（并降级参数为 common_only）
+        if version in (21, 25):
             if self._download_graalvm_from_oracle(version):
                 return self._java_bin_path(version).exists()
             if self._download_temurin_from_adoptium(version):
@@ -4529,8 +4789,9 @@ class ServerBuilder:
         out: Path,
         stage: str = "install.download",
         headers: dict[str, str] | None = None,
+        session_factory: Callable[[], requests.Session] | None = None,
     ) -> Path:
-        task = DownloadTask(out=out, urls=[url], stage=stage, headers=headers)
+        task = DownloadTask(out=out, urls=[url], stage=stage, headers=headers, session_factory=session_factory)
         done, failed = self.downloader.download_files([task])
         if failed:
             raise RuntimeError(f"下载失败: {url} ({failed[0].error})")

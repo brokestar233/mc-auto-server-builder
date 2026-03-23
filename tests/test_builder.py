@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import json
 import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+
+import psutil
 
 from mc_auto_server_builder.ai import BuilderAIService
 from mc_auto_server_builder.builder import ServerBuilder
@@ -16,6 +20,134 @@ from mc_auto_server_builder.models import (
     PackManifest,
 )
 from mc_auto_server_builder.recognition import RecognitionFallbackPlan, choose_latest_lts_java_version
+
+
+def _fake_extract_archive_creating_java(dst: Path, binary_name: str = "java") -> None:
+    bin_dir = dst / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    (bin_dir / binary_name).write_text("java", encoding="utf-8")
+
+
+def test_download_graalvm17_from_github_uses_release_asset(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.config = SimpleNamespace(
+        github_api_key="",
+        download=SimpleNamespace(connect_timeout=3, read_timeout=5),
+    )
+    builder.operations = []
+    builder.workdirs = SimpleNamespace(java_bins=tmp_path / "java")
+    builder.workdirs.java_bins.mkdir(parents=True)
+    builder.java_params_mode_by_version = {}
+    builder._log = lambda *_args, **_kwargs: None
+
+    download_calls: list[tuple[str, dict[str, str] | None, object]] = []
+
+    builder._download_file = lambda url, out, stage="install.download", headers=None, session_factory=None: download_calls.append(
+        (url, headers, session_factory)
+    ) or out.write_bytes(b"zip") or out
+
+    import mc_auto_server_builder.builder as builder_module
+
+    original_http_get_json = builder_module.http_get_json
+    original_extract = builder_module.extract_archive
+    original_normalize = builder_module.normalize_java_home_layout
+    try:
+        builder_module.http_get_json = lambda url, headers=None, timeout=60: [
+            {
+                "tag_name": "v1",
+                "assets": [
+                    {
+                        "name": "grallvm17-windows-x64.zip",
+                        "browser_download_url": "https://github.com/brokestar233/grallvm17-bin/releases/download/v1/grallvm17-windows-x64.zip",
+                    }
+                ],
+            }
+        ]
+        builder_module.extract_archive = lambda src, dst: _fake_extract_archive_creating_java(dst)
+        builder_module.normalize_java_home_layout = lambda java_home: (java_home, False)
+
+        assert ServerBuilder._download_graalvm17_from_github(builder) is True
+    finally:
+        builder_module.http_get_json = original_http_get_json
+        builder_module.extract_archive = original_extract
+        builder_module.normalize_java_home_layout = original_normalize
+
+    assert download_calls == [
+        (
+            "https://github.com/brokestar233/grallvm17-bin/releases/download/v1/grallvm17-windows-x64.zip",
+            None,
+            None,
+        )
+    ]
+    assert "graalvm17_selected_asset:grallvm17-windows-x64.zip" in builder.operations
+
+
+def test_download_graalvm_from_oracle_keeps_regular_cookie_header_for_java_21(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.config = SimpleNamespace(
+        download=SimpleNamespace(connect_timeout=3, read_timeout=5),
+    )
+    builder.operations = []
+    builder.workdirs = SimpleNamespace(java_bins=tmp_path / "java")
+    builder.workdirs.java_bins.mkdir(parents=True)
+    builder.java_params_mode_by_version = {}
+    builder._log = lambda *_args, **_kwargs: None
+
+    builder._oracle_fetch_json_with_diag = lambda **kwargs: (
+        (
+            {
+                "group": {
+                    "Title": "Oracle GraalVM",
+                    "SubTitle": "Oracle GraalVM for JDK 21",
+                    "Releases": {"1": {"JSON File": "/release.json"}},
+                }
+            }
+            if kwargs["op_prefix"] == "oracle_graalvm_index"
+            else {
+                "Packages": {
+                    "Core": {
+                        "Files": {
+                            "oracle-graalvm-linux-x64-21": {
+                                "File": "https://download.oracle.com/otn/utilities_drivers/oracle-labs/graalvm21.tar.gz",
+                                "Hash": [],
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        "minimal",
+    )
+
+    download_calls: list[tuple[str, dict[str, str] | None, object]] = []
+
+    builder._download_file = lambda url, out, stage="install.download", headers=None, session_factory=None: download_calls.append(
+        (url, headers, session_factory)
+    ) or out.write_bytes(b"tar") or out
+
+    import mc_auto_server_builder.builder as builder_module
+
+    original_platform = builder_module.oracle_platform_triplet
+    original_extract = builder_module.extract_archive
+    original_normalize = builder_module.normalize_java_home_layout
+    try:
+        builder_module.oracle_platform_triplet = lambda: ("linux", "x64", "tar.gz")
+        builder_module.extract_archive = lambda src, dst: _fake_extract_archive_creating_java(dst)
+        builder_module.normalize_java_home_layout = lambda java_home: (java_home, False)
+
+        assert ServerBuilder._download_graalvm_from_oracle(builder, 21) is True
+    finally:
+        builder_module.oracle_platform_triplet = original_platform
+        builder_module.extract_archive = original_extract
+        builder_module.normalize_java_home_layout = original_normalize
+
+    assert download_calls == [
+        (
+            "https://download.oracle.com/otn/utilities_drivers/oracle-labs/graalvm21.tar.gz",
+            {},
+            None,
+        )
+    ]
 
 
 def test_detect_command_probe_ready_accepts_player_count_line():
@@ -75,6 +207,825 @@ def test_detect_command_probe_ready_rejects_unrelated_output():
 
     assert ready is False
     assert source == ""
+
+
+def test_detect_log_ready_signal_accepts_standard_done_line():
+    ready, source = ServerBuilder._detect_log_ready_signal(
+        None,
+        '[23Mar2026 21:11:58] [Server thread/INFO] [minecraft/DedicatedServer]: Done (12.345s)! For help, type "help"',
+    )
+
+    assert ready is True
+    assert source == "log_done"
+
+
+def test_detect_log_ready_signal_rejects_plain_done_word_inside_error_log():
+    ready, source = ServerBuilder._detect_log_ready_signal(
+        None,
+        "\n".join(
+            [
+                "[main/ERROR] Failed to create mod instance",
+                "[worker/INFO] task done loading broken dependency metadata",
+                (
+                    "java.lang.RuntimeException: Attempted to load class "
+                    "net/minecraft/client/gui/screens/Screen for invalid dist "
+                    "DEDICATED_SERVER"
+                ),
+            ]
+        ),
+    )
+
+    assert ready is False
+    assert source == ""
+
+
+def test_detect_log_ready_signal_rejects_latest_log_without_standard_ready_line():
+    latest_log = Path("latest.log").read_text(encoding="utf-8", errors="ignore")
+
+    ready, source = ServerBuilder._detect_log_ready_signal(None, latest_log)
+
+    assert ready is False
+    assert source == ""
+
+
+def test_start_server_detects_first_crash_report_and_kills_process(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    server_dir = tmp_path / "server"
+    (server_dir / "logs").mkdir(parents=True)
+    builder.workdirs = SimpleNamespace(server=server_dir)
+    builder.config = SimpleNamespace(
+        runtime=SimpleNamespace(
+            startup_command_probe_enabled=False,
+            startup_probe_interval_sec=0.2,
+            startup_soft_timeout=8,
+            startup_hard_timeout=30,
+            startup_command_probe_initial_delay_sec=1.0,
+            startup_command_probe_retry_sec=1.0,
+            keep_running=False,
+        ),
+        server_port=25565,
+    )
+    builder.operations = []
+    builder._log = lambda *_args, **_kwargs: None
+    builder._start_script_path = lambda: server_dir / "start.sh"
+    builder._write_start_script = lambda: (server_dir / "start.sh").write_text("#!/bin/sh", encoding="utf-8")
+    builder._collect_process_resource_snapshot = lambda _proc: {"rss_mb": 0.0, "cpu_percent": 0.0, "process_count": 1}
+    builder._detect_failure_signals = ServerBuilder._detect_failure_signals.__get__(builder, ServerBuilder)
+    builder._detect_log_ready_signal = ServerBuilder._detect_log_ready_signal.__get__(builder, ServerBuilder)
+    builder._detect_command_probe_ready = ServerBuilder._detect_command_probe_ready.__get__(builder, ServerBuilder)
+    builder._snapshot_crash_reports = ServerBuilder._snapshot_crash_reports.__get__(builder, ServerBuilder)
+
+    import mc_auto_server_builder.builder as builder_module
+
+    class FakePipe:
+        def close(self):
+            return None
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = FakePipe()
+            self.stderr = FakePipe()
+            self.stdin = None
+            self.pid = 123
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    proc = FakeProc()
+    terminate_calls: list[tuple[object, float]] = []
+    original_popen = builder_module.subprocess.Popen
+    original_reader = builder_module.threaded_pipe_reader
+    original_tail = builder_module.read_tail_text
+    original_port = builder_module.is_local_tcp_port_open
+    original_terminate = builder_module.terminate_process
+    original_sleep = builder_module.time.sleep
+    try:
+        builder_module.subprocess.Popen = lambda *args, **kwargs: proc
+        builder_module.threaded_pipe_reader = lambda pipe, out: None
+        state = {"calls": 0}
+
+        def fake_tail(*_args, **_kwargs):
+            state["calls"] += 1
+            if state["calls"] == 2:
+                crash_dir = server_dir / "crash-reports"
+                crash_dir.mkdir(parents=True, exist_ok=True)
+                (crash_dir / "crash-1.txt").write_text("boom", encoding="utf-8")
+            return ""
+
+        builder_module.read_tail_text = fake_tail
+        builder_module.is_local_tcp_port_open = lambda **_kwargs: False
+
+        def fake_terminate(target_proc, timeout_sec=8.0):
+            terminate_calls.append((target_proc, timeout_sec))
+            target_proc.returncode = -9
+
+        builder_module.terminate_process = fake_terminate
+        builder_module.time.sleep = lambda *_args, **_kwargs: None
+
+        result = ServerBuilder.start_server(builder, timeout=30)
+    finally:
+        builder_module.subprocess.Popen = original_popen
+        builder_module.threaded_pipe_reader = original_reader
+        builder_module.read_tail_text = original_tail
+        builder_module.is_local_tcp_port_open = original_port
+        builder_module.terminate_process = original_terminate
+        builder_module.time.sleep = original_sleep
+
+    assert result["success"] is False
+    assert result["crash_detected"] is True
+    assert result["forced_termination"] is True
+    assert "crash_report_created" in result["failure_signals"]
+    assert any(item.startswith("crash_reports_first_seen:") for item in result["readiness_evidence"])
+    assert result["crash_reports_snapshot"] == ["crash-1.txt"]
+    assert result["crash_reports_new"] == ["crash-1.txt"]
+    assert terminate_calls == [(proc, 8.0)]
+
+
+def test_start_server_detects_new_empty_crash_reports_dir_and_kills_process(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    server_dir = tmp_path / "server"
+    (server_dir / "logs").mkdir(parents=True)
+    builder.workdirs = SimpleNamespace(server=server_dir)
+    builder.config = SimpleNamespace(
+        runtime=SimpleNamespace(
+            startup_command_probe_enabled=False,
+            startup_probe_interval_sec=0.2,
+            startup_soft_timeout=8,
+            startup_hard_timeout=30,
+            startup_command_probe_initial_delay_sec=1.0,
+            startup_command_probe_retry_sec=1.0,
+            keep_running=False,
+        ),
+        server_port=25565,
+    )
+    builder.operations = []
+    builder._log = lambda *_args, **_kwargs: None
+    builder._start_script_path = lambda: server_dir / "start.sh"
+    builder._write_start_script = lambda: (server_dir / "start.sh").write_text("#!/bin/sh", encoding="utf-8")
+    builder._collect_process_resource_snapshot = lambda _proc: {"rss_mb": 0.0, "cpu_percent": 0.0, "process_count": 1}
+    builder._detect_failure_signals = ServerBuilder._detect_failure_signals.__get__(builder, ServerBuilder)
+    builder._detect_log_ready_signal = ServerBuilder._detect_log_ready_signal.__get__(builder, ServerBuilder)
+    builder._detect_command_probe_ready = ServerBuilder._detect_command_probe_ready.__get__(builder, ServerBuilder)
+    builder._snapshot_crash_reports = ServerBuilder._snapshot_crash_reports.__get__(builder, ServerBuilder)
+
+    import mc_auto_server_builder.builder as builder_module
+
+    class FakePipe:
+        def close(self):
+            return None
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = FakePipe()
+            self.stderr = FakePipe()
+            self.stdin = None
+            self.pid = 124
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    proc = FakeProc()
+    terminate_calls: list[tuple[object, float]] = []
+    original_popen = builder_module.subprocess.Popen
+    original_reader = builder_module.threaded_pipe_reader
+    original_tail = builder_module.read_tail_text
+    original_port = builder_module.is_local_tcp_port_open
+    original_terminate = builder_module.terminate_process
+    original_sleep = builder_module.time.sleep
+    try:
+        builder_module.subprocess.Popen = lambda *args, **kwargs: proc
+        builder_module.threaded_pipe_reader = lambda pipe, out: None
+        state = {"calls": 0}
+
+        def fake_tail(*_args, **_kwargs):
+            state["calls"] += 1
+            if state["calls"] == 2:
+                (server_dir / "crash-reports").mkdir(parents=True, exist_ok=True)
+            return ""
+
+        builder_module.read_tail_text = fake_tail
+        builder_module.is_local_tcp_port_open = lambda **_kwargs: False
+
+        def fake_terminate(target_proc, timeout_sec=8.0):
+            terminate_calls.append((target_proc, timeout_sec))
+            target_proc.returncode = -9
+
+        builder_module.terminate_process = fake_terminate
+        builder_module.time.sleep = lambda *_args, **_kwargs: None
+
+        result = ServerBuilder.start_server(builder, timeout=30)
+    finally:
+        builder_module.subprocess.Popen = original_popen
+        builder_module.threaded_pipe_reader = original_reader
+        builder_module.read_tail_text = original_tail
+        builder_module.is_local_tcp_port_open = original_port
+        builder_module.terminate_process = original_terminate
+        builder_module.time.sleep = original_sleep
+
+    assert result["success"] is False
+    assert result["crash_detected"] is True
+    assert result["forced_termination"] is True
+    assert "crash_reports_dir_created" in result["readiness_evidence"]
+    assert terminate_calls == [(proc, 8.0)]
+
+
+def test_start_server_waits_for_crash_report_after_crash_reports_dir_created(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    server_dir = tmp_path / "server"
+    server_dir.mkdir(parents=True)
+    latest_log = server_dir / "logs" / "latest.log"
+    latest_log.parent.mkdir(parents=True, exist_ok=True)
+    latest_log.write_text("", encoding="utf-8")
+
+    builder.workdirs = type("Workdirs", (), {"server": server_dir})()
+    builder.config = type(
+        "Cfg",
+        (),
+        {
+            "runtime": type(
+                "Runtime",
+                (),
+                {
+                    "startup_command_probe_enabled": False,
+                    "startup_probe_interval_sec": 0.2,
+                    "startup_soft_timeout": 0.5,
+                    "startup_hard_timeout": 30,
+                    "startup_command_probe_initial_delay_sec": 1.0,
+                    "startup_command_probe_retry_sec": 1.0,
+                    "keep_running": False,
+                },
+            )(),
+            "server_port": 25565,
+        },
+    )()
+    builder.operations = []
+    logs: list[tuple[str, str, str]] = []
+    builder._log = lambda tag, message, level="INFO": logs.append((tag, level, message))
+    builder._start_script_path = lambda: server_dir / "start.sh"
+    builder._write_start_script = lambda: (server_dir / "start.sh").write_text("#!/bin/sh", encoding="utf-8")
+    builder._collect_process_resource_snapshot = lambda _proc: {}
+    builder._detect_failure_signals = lambda _text: []
+    builder._detect_log_ready_signal = lambda _text: (False, "")
+    builder._detect_command_probe_ready = ServerBuilder._detect_command_probe_ready.__get__(builder, ServerBuilder)
+    builder._snapshot_crash_reports = ServerBuilder._snapshot_crash_reports.__get__(builder, ServerBuilder)
+
+    import mc_auto_server_builder.builder as builder_module
+
+    class FakePipe:
+        def close(self):
+            return None
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = FakePipe()
+            self.stderr = FakePipe()
+            self.stdin = None
+            self.pid = 789
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    proc = FakeProc()
+    state = {"calls": 0}
+    terminate_calls: list[tuple[object, float]] = []
+    sleep_calls: list[float] = []
+
+    def fake_sleep(seconds: float):
+        sleep_calls.append(seconds)
+        if seconds == 2.0:
+            crash_dir = server_dir / "crash-reports"
+            crash_dir.mkdir(parents=True, exist_ok=True)
+            crash_file = crash_dir / "crash-2026-03-23_22.18.31-server.txt"
+            crash_file.write_text("crash content", encoding="utf-8")
+
+    def fake_read_tail_text(_path: Path, lines: int = 300):
+        state["calls"] += 1
+        if state["calls"] == 2:
+            crash_dir = server_dir / "crash-reports"
+            crash_dir.mkdir(parents=True, exist_ok=True)
+        return ""
+
+    def fake_terminate_process(target_proc, timeout_sec: float = 8.0):
+        terminate_calls.append((target_proc, timeout_sec))
+        target_proc.returncode = -15
+
+    original_popen = builder_module.subprocess.Popen
+    original_read_tail_text = builder_module.read_tail_text
+    original_terminate_process = builder_module.terminate_process
+    original_is_local_tcp_port_open = builder_module.is_local_tcp_port_open
+    original_sleep = builder_module.time.sleep
+    builder_module.subprocess.Popen = lambda *args, **kwargs: proc
+    builder_module.read_tail_text = fake_read_tail_text
+    builder_module.terminate_process = fake_terminate_process
+    builder_module.is_local_tcp_port_open = lambda *args, **kwargs: False
+    builder_module.time.sleep = fake_sleep
+    try:
+        result = ServerBuilder.start_server(builder, timeout=30)
+    finally:
+        builder_module.subprocess.Popen = original_popen
+        builder_module.read_tail_text = original_read_tail_text
+        builder_module.terminate_process = original_terminate_process
+        builder_module.is_local_tcp_port_open = original_is_local_tcp_port_open
+        builder_module.time.sleep = original_sleep
+
+    assert result["crash_detected"] is True
+    assert any(item.startswith("crash_reports_first_seen:") for item in result["readiness_evidence"])
+    assert 2.0 in sleep_calls
+    assert any(tag == "install.crash" and "等待 2 秒" in message for tag, _level, message in logs)
+    assert any(tag == "install.crash" and "准备进入日志提取与 AI 分析" in message for tag, _level, message in logs)
+    assert terminate_calls == [(proc, 8.0)]
+
+
+def test_start_server_detects_increased_crash_reports(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    server_dir = tmp_path / "server"
+    crash_dir = server_dir / "crash-reports"
+    crash_dir.mkdir(parents=True)
+    (crash_dir / "crash-old.txt").write_text("old", encoding="utf-8")
+    (server_dir / "logs").mkdir(parents=True)
+    builder.workdirs = SimpleNamespace(server=server_dir)
+    builder.config = SimpleNamespace(
+        runtime=SimpleNamespace(
+            startup_command_probe_enabled=False,
+            startup_probe_interval_sec=0.2,
+            startup_soft_timeout=8,
+            startup_hard_timeout=30,
+            startup_command_probe_initial_delay_sec=1.0,
+            startup_command_probe_retry_sec=1.0,
+            keep_running=False,
+        ),
+        server_port=25565,
+    )
+    builder.operations = []
+    builder._log = lambda *_args, **_kwargs: None
+    builder._start_script_path = lambda: server_dir / "start.sh"
+    builder._write_start_script = lambda: (server_dir / "start.sh").write_text("#!/bin/sh", encoding="utf-8")
+    builder._collect_process_resource_snapshot = lambda _proc: {"rss_mb": 0.0, "cpu_percent": 0.0, "process_count": 1}
+    builder._detect_failure_signals = ServerBuilder._detect_failure_signals.__get__(builder, ServerBuilder)
+    builder._detect_log_ready_signal = ServerBuilder._detect_log_ready_signal.__get__(builder, ServerBuilder)
+    builder._detect_command_probe_ready = ServerBuilder._detect_command_probe_ready.__get__(builder, ServerBuilder)
+    builder._snapshot_crash_reports = ServerBuilder._snapshot_crash_reports.__get__(builder, ServerBuilder)
+
+    import mc_auto_server_builder.builder as builder_module
+
+    class FakePipe:
+        def close(self):
+            return None
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = FakePipe()
+            self.stderr = FakePipe()
+            self.stdin = None
+            self.pid = 456
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    proc = FakeProc()
+    original_popen = builder_module.subprocess.Popen
+    original_reader = builder_module.threaded_pipe_reader
+    original_tail = builder_module.read_tail_text
+    original_port = builder_module.is_local_tcp_port_open
+    original_terminate = builder_module.terminate_process
+    original_sleep = builder_module.time.sleep
+    try:
+        builder_module.subprocess.Popen = lambda *args, **kwargs: proc
+        builder_module.threaded_pipe_reader = lambda pipe, out: None
+        state = {"calls": 0}
+
+        def fake_tail(*_args, **_kwargs):
+            state["calls"] += 1
+            if state["calls"] == 2:
+                (crash_dir / "crash-new.txt").write_text("new", encoding="utf-8")
+            return ""
+
+        builder_module.read_tail_text = fake_tail
+        builder_module.is_local_tcp_port_open = lambda **_kwargs: False
+        builder_module.terminate_process = lambda target_proc, timeout_sec=8.0: setattr(target_proc, "returncode", -9)
+        builder_module.time.sleep = lambda *_args, **_kwargs: None
+
+        result = ServerBuilder.start_server(builder, timeout=30)
+    finally:
+        builder_module.subprocess.Popen = original_popen
+        builder_module.threaded_pipe_reader = original_reader
+        builder_module.read_tail_text = original_tail
+        builder_module.is_local_tcp_port_open = original_port
+        builder_module.terminate_process = original_terminate
+        builder_module.time.sleep = original_sleep
+
+    assert result["success"] is False
+    assert result["crash_detected"] is True
+    assert any(item.startswith("crash_reports_increased:") for item in result["readiness_evidence"])
+    assert result["crash_reports_snapshot"] == ["crash-new.txt", "crash-old.txt"]
+    assert result["crash_reports_new"] == ["crash-new.txt"]
+
+
+def test_build_ai_context_exposes_last_rollback_crash_report_comparison():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.manifest = None
+    builder.jvm_xmx = "4G"
+    builder.jvm_xms = "4G"
+    builder.operations = ["remove_mod_by_name:a.jar", "action_rollback:remove_mods:attempt_1_action_1"]
+    builder.known_deleted_client_mods = set()
+    builder.deleted_mod_evidence = {}
+    builder.last_rollback_remove_mods = {
+        "triggered": True,
+        "snapshot_tag": "attempt_1_action_1",
+        "crash_reports_after_validation": ["crash-old.txt"],
+        "validation_crash_excerpt": "old crash",
+        "crash_reports_changed_since_last_context": False,
+    }
+    builder._coerce_bisect_session = lambda: SimpleNamespace(
+        active=False,
+        next_allowed_requests=[],
+        fallback_targets=[],
+        suspects_invalidated=False,
+        phase="initial",
+        stagnant_rounds=0,
+        last_preflight_block_reason="",
+        last_preflight_block_details=[],
+        success_ready=False,
+        success_guard_reason="",
+        success_guard_history=[],
+        consecutive_same_issue_on_success=0,
+    )
+    builder._build_recognition_summary = lambda: {}
+    builder.get_system_memory = lambda: 16.0
+    builder.list_mods = lambda: ["a.jar", "b.jar"]
+    builder.list_current_installed_client_mods = lambda: []
+
+    context = ServerBuilder._build_ai_context(
+        builder,
+        {"stdout_tail": "", "stderr_tail": "", "crash_reports_snapshot": ["crash-new.txt"]},
+        {"key_exception": "RuntimeException", "refined_log": "", "crash_mod_issue": ""},
+    )
+
+    assert context["last_crash_reports"] == ["crash-old.txt"]
+    assert context["current_crash_reports"] == ["crash-new.txt"]
+    assert context["crash_report_delta"] == ["crash-new.txt", "crash-old.txt"]
+    assert context["crash_reports_changed_since_last_rollback_remove"] is True
+    assert builder.last_rollback_remove_mods["crash_reports_changed_since_last_context"] is True
+
+
+def test_preflight_blocks_restore_when_crash_reports_unchanged():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.last_rollback_remove_mods = {
+        "triggered": True,
+        "snapshot_tag": "attempt_1_action_1",
+        "crash_reports_changed_since_last_context": False,
+    }
+
+    preflight = ServerBuilder._assess_action_preflight(builder, {"type": "restore_mods_and_continue"})
+
+    assert preflight.allowed is False
+    assert preflight.reason == "crash_reports_not_changed_after_rollback_remove_mods"
+
+
+def test_execute_restore_mods_and_continue_rolls_back_snapshot():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.last_rollback_remove_mods = {
+        "triggered": True,
+        "snapshot_tag": "attempt_1_action_1",
+        "removed_targets": ["bad.jar"],
+        "crash_reports_changed_since_last_context": True,
+    }
+    builder.rollback_mods = lambda tag: builder.__dict__.setdefault("rollback_calls", []).append(tag)
+    builder.operations = []
+    builder.jvm_xmx = "4G"
+    builder.jvm_xms = "4G"
+    builder.extra_jvm_flags = []
+    builder.current_java_version = 21
+    builder.current_java_bin = None
+
+    stop, execution, rollback = ServerBuilder._execute_action_with_safeguards(
+        builder,
+        1,
+        {"type": "restore_mods_and_continue"},
+        ActionPreflight(action_type="restore_mods_and_continue", risk="low", allowed=True, reason="rollback_restore_allowed"),
+        "attempt_2_action_1",
+    )
+
+    assert stop is False
+    assert rollback is None
+    assert execution["status"] == "applied"
+    assert execution["restored_snapshot_tag"] == "attempt_1_action_1"
+    assert builder.rollback_calls == ["attempt_1_action_1"]
+    assert "restore_mods_and_continue:attempt_1_action_1" in builder.operations
+
+
+def test_start_server_terminates_hanging_process_without_success(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    server_dir = tmp_path / "server"
+    (server_dir / "logs").mkdir(parents=True)
+    builder.workdirs = SimpleNamespace(server=server_dir)
+    builder.config = SimpleNamespace(
+        runtime=SimpleNamespace(
+            startup_command_probe_enabled=False,
+            startup_probe_interval_sec=0.2,
+            startup_soft_timeout=8,
+            startup_hard_timeout=1,
+            startup_command_probe_initial_delay_sec=1.0,
+            startup_command_probe_retry_sec=1.0,
+            keep_running=False,
+        ),
+        server_port=25565,
+    )
+    builder.operations = []
+    builder._start_script_path = lambda: server_dir / "start.sh"
+    builder._write_start_script = lambda: (server_dir / "start.sh").write_text("#!/bin/sh", encoding="utf-8")
+    builder._collect_process_resource_snapshot = lambda _proc: {"rss_mb": 0.0, "cpu_percent": 0.0, "process_count": 1}
+    builder._detect_failure_signals = ServerBuilder._detect_failure_signals.__get__(builder, ServerBuilder)
+    builder._detect_log_ready_signal = ServerBuilder._detect_log_ready_signal.__get__(builder, ServerBuilder)
+    builder._detect_command_probe_ready = ServerBuilder._detect_command_probe_ready.__get__(builder, ServerBuilder)
+    builder._snapshot_crash_reports = ServerBuilder._snapshot_crash_reports.__get__(builder, ServerBuilder)
+
+    import mc_auto_server_builder.builder as builder_module
+
+    class FakePipe:
+        def close(self):
+            return None
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = FakePipe()
+            self.stderr = FakePipe()
+            self.stdin = None
+            self.pid = 789
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    proc = FakeProc()
+    terminate_calls: list[tuple[object, float]] = []
+    original_popen = builder_module.subprocess.Popen
+    original_reader = builder_module.threaded_pipe_reader
+    original_tail = builder_module.read_tail_text
+    original_port = builder_module.is_local_tcp_port_open
+    original_terminate = builder_module.terminate_process
+    original_monotonic = builder_module.time.monotonic
+    original_sleep = builder_module.time.sleep
+    try:
+        builder_module.subprocess.Popen = lambda *args, **kwargs: proc
+        builder_module.threaded_pipe_reader = lambda pipe, out: None
+        builder_module.read_tail_text = lambda *_args, **_kwargs: ""
+        builder_module.is_local_tcp_port_open = lambda **_kwargs: False
+
+        def fake_terminate(target_proc, timeout_sec=8.0):
+            terminate_calls.append((target_proc, timeout_sec))
+            target_proc.returncode = -15
+
+        builder_module.terminate_process = fake_terminate
+        ticks = iter([0.0, 0.4, 0.8, 1.2])
+        builder_module.time.monotonic = lambda: next(ticks)
+        builder_module.time.sleep = lambda *_args, **_kwargs: None
+
+        result = ServerBuilder.start_server(builder, timeout=1)
+    finally:
+        builder_module.subprocess.Popen = original_popen
+        builder_module.threaded_pipe_reader = original_reader
+        builder_module.read_tail_text = original_tail
+        builder_module.is_local_tcp_port_open = original_port
+        builder_module.terminate_process = original_terminate
+        builder_module.time.monotonic = original_monotonic
+        builder_module.time.sleep = original_sleep
+
+    assert result["success"] is False
+    assert result["forced_termination"] is True
+    assert "hard_timeout_reached" in result["readiness_evidence"]
+    assert "forced_termination" in result["readiness_evidence"]
+    assert terminate_calls == [(proc, 8.0)]
+
+
+def test_start_server_requires_log_or_command_probe_success(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    server_dir = tmp_path / "server"
+    (server_dir / "logs").mkdir(parents=True)
+    builder.workdirs = SimpleNamespace(server=server_dir)
+    builder.config = SimpleNamespace(
+        runtime=SimpleNamespace(
+            startup_command_probe_enabled=False,
+            startup_probe_interval_sec=0.2,
+            startup_soft_timeout=8,
+            startup_hard_timeout=30,
+            startup_command_probe_initial_delay_sec=1.0,
+            startup_command_probe_retry_sec=1.0,
+            keep_running=False,
+        ),
+        server_port=25565,
+    )
+    builder.operations = []
+    builder._start_script_path = lambda: server_dir / "start.sh"
+    builder._write_start_script = lambda: (server_dir / "start.sh").write_text("#!/bin/sh", encoding="utf-8")
+    builder._collect_process_resource_snapshot = lambda _proc: {"rss_mb": 0.0, "cpu_percent": 0.0, "process_count": 1}
+    builder._detect_failure_signals = ServerBuilder._detect_failure_signals.__get__(builder, ServerBuilder)
+    builder._detect_log_ready_signal = ServerBuilder._detect_log_ready_signal.__get__(builder, ServerBuilder)
+    builder._detect_command_probe_ready = ServerBuilder._detect_command_probe_ready.__get__(builder, ServerBuilder)
+    builder._snapshot_crash_reports = ServerBuilder._snapshot_crash_reports.__get__(builder, ServerBuilder)
+
+    import mc_auto_server_builder.builder as builder_module
+
+    class FakePipe:
+        def close(self):
+            return None
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = FakePipe()
+            self.stderr = FakePipe()
+            self.stdin = None
+            self.pid = 321
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    proc = FakeProc()
+    graceful_calls: list[tuple[object, float, str]] = []
+    original_popen = builder_module.subprocess.Popen
+    original_reader = builder_module.threaded_pipe_reader
+    original_tail = builder_module.read_tail_text
+    original_port = builder_module.is_local_tcp_port_open
+    original_graceful = builder_module.graceful_stop_process
+    original_sleep = builder_module.time.sleep
+    try:
+        builder_module.subprocess.Popen = lambda *args, **kwargs: proc
+        builder_module.threaded_pipe_reader = lambda pipe, out: None
+        builder_module.read_tail_text = lambda *_args, **_kwargs: 'Done (12.345s)! For help, type "help"'
+        builder_module.is_local_tcp_port_open = lambda **_kwargs: True
+
+        def fake_graceful(target_proc, timeout_sec=20.0, stop_command="stop"):
+            graceful_calls.append((target_proc, timeout_sec, stop_command))
+            target_proc.returncode = 0
+
+        builder_module.graceful_stop_process = fake_graceful
+        builder_module.time.sleep = lambda *_args, **_kwargs: None
+
+        result = ServerBuilder.start_server(builder, timeout=30)
+    finally:
+        builder_module.subprocess.Popen = original_popen
+        builder_module.threaded_pipe_reader = original_reader
+        builder_module.read_tail_text = original_tail
+        builder_module.is_local_tcp_port_open = original_port
+        builder_module.graceful_stop_process = original_graceful
+        builder_module.time.sleep = original_sleep
+
+    assert result["success"] is True
+    assert result["crash_detected"] is False
+    assert result["forced_termination"] is False
+    assert result["success_source"] == "log_done"
+
+
+def test_terminate_process_kills_process_tree(monkeypatch):
+    from mc_auto_server_builder import util as util_module
+
+    class FakePsProc:
+        def __init__(self, pid, children=None, wait_outcomes=None):
+            self.pid = pid
+            self._children = children or []
+            self._wait_outcomes = list(wait_outcomes or [])
+            self.terminated = 0
+            self.killed = 0
+
+        def children(self, recursive=True):
+            return list(self._children)
+
+        def terminate(self):
+            self.terminated += 1
+
+        def kill(self):
+            self.killed += 1
+
+        def wait(self, timeout=None):
+            if self._wait_outcomes:
+                outcome = self._wait_outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+            return 0
+
+    class FakePopen:
+        pid = 100
+
+        def poll(self):
+            return None
+
+    child = FakePsProc(101, wait_outcomes=[psutil.TimeoutExpired(1, 0), 0])
+    root = FakePsProc(100, children=[child], wait_outcomes=[0])
+    monkeypatch.setattr(util_module.psutil, "Process", lambda pid: root)
+
+    util_module.terminate_process(FakePopen(), timeout_sec=1.0)
+
+    assert child.terminated == 1
+    assert root.terminated == 1
+    assert child.killed == 1
+    assert root.killed == 0
+
+
+def test_start_server_does_not_close_blocking_pipes(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    server_dir = tmp_path / "server"
+    (server_dir / "logs").mkdir(parents=True)
+    builder.workdirs = SimpleNamespace(server=server_dir)
+    builder.config = SimpleNamespace(
+        runtime=SimpleNamespace(
+            startup_command_probe_enabled=False,
+            startup_probe_interval_sec=0.2,
+            startup_soft_timeout=8,
+            startup_hard_timeout=30,
+            startup_command_probe_initial_delay_sec=1.0,
+            startup_command_probe_retry_sec=1.0,
+            keep_running=False,
+        ),
+        server_port=25565,
+    )
+    builder.operations = []
+    builder._start_script_path = lambda: server_dir / "start.sh"
+    builder._write_start_script = lambda: (server_dir / "start.sh").write_text("#!/bin/sh", encoding="utf-8")
+    builder._collect_process_resource_snapshot = lambda _proc: {"rss_mb": 0.0, "cpu_percent": 0.0, "process_count": 1}
+    builder._detect_failure_signals = ServerBuilder._detect_failure_signals.__get__(builder, ServerBuilder)
+    builder._detect_log_ready_signal = ServerBuilder._detect_log_ready_signal.__get__(builder, ServerBuilder)
+    builder._detect_command_probe_ready = ServerBuilder._detect_command_probe_ready.__get__(builder, ServerBuilder)
+    builder._snapshot_crash_reports = ServerBuilder._snapshot_crash_reports.__get__(builder, ServerBuilder)
+
+    import mc_auto_server_builder.builder as builder_module
+
+    class FakePipe:
+        def close(self):
+            raise AssertionError("close should not be called")
+
+    class FakeThread:
+        def __init__(self, target=None, args=(), daemon=None):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+            self.join_calls = []
+
+        def start(self):
+            return None
+
+        def join(self, timeout=None):
+            self.join_calls.append(timeout)
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = FakePipe()
+            self.stderr = FakePipe()
+            self.stdin = None
+            self.pid = 321
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    proc = FakeProc()
+    terminate_calls: list[tuple[object, float]] = []
+    thread_instances: list[FakeThread] = []
+    original_popen = builder_module.subprocess.Popen
+    original_reader = builder_module.threaded_pipe_reader
+    original_tail = builder_module.read_tail_text
+    original_port = builder_module.is_local_tcp_port_open
+    original_terminate = builder_module.terminate_process
+    original_sleep = builder_module.time.sleep
+    original_thread = builder_module.threading.Thread
+    try:
+        builder_module.subprocess.Popen = lambda *args, **kwargs: proc
+        builder_module.threaded_pipe_reader = lambda pipe, out: None
+        builder_module.read_tail_text = lambda *_args, **_kwargs: ""
+        builder_module.is_local_tcp_port_open = lambda **_kwargs: False
+
+        def fake_terminate(target_proc, timeout_sec=8.0):
+            terminate_calls.append((target_proc, timeout_sec))
+            target_proc.returncode = -9
+
+        def fake_thread(*args, **kwargs):
+            inst = FakeThread(*args, **kwargs)
+            thread_instances.append(inst)
+            return inst
+
+        builder_module.terminate_process = fake_terminate
+        builder_module.time.sleep = lambda *_args, **_kwargs: None
+        builder_module.threading.Thread = fake_thread
+
+        result = ServerBuilder.start_server(builder, timeout=1)
+    finally:
+        builder_module.subprocess.Popen = original_popen
+        builder_module.threaded_pipe_reader = original_reader
+        builder_module.read_tail_text = original_tail
+        builder_module.is_local_tcp_port_open = original_port
+        builder_module.terminate_process = original_terminate
+        builder_module.time.sleep = original_sleep
+        builder_module.threading.Thread = original_thread
+
+    assert result["success"] is False
+    assert result["forced_termination"] is True
+    assert terminate_calls == [(proc, 8.0)]
+    assert len(thread_instances) == 2
+    assert all(item.join_calls == [1.0] for item in thread_instances)
 
 
 def test_detect_failure_signals_matches_common_runtime_errors():
@@ -1573,6 +2524,163 @@ def test_successful_start_with_invalidated_suspects_auto_resumes_full_bisect_wit
     assert applied_actions[0]["request_source"] == "system_auto_resume"
     assert success is True
     assert builder.stop_reason == "server_ready:log_done"
+
+
+def test_remove_mods_preflight_allows_multiple_targets_within_safe_limit():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.bisect_session = None
+    builder.current_java_version = 17
+    builder.get_system_memory = lambda: 16
+    builder._resolve_mod_names_to_installed = lambda names: [name for name in names if name in {"a.jar", "b.jar", "c.jar"}]
+
+    preflight = ServerBuilder._assess_action_preflight(
+        builder,
+        {"type": "remove_mods", "targets": ["a.jar", "b.jar", "c.jar"]},
+    )
+
+    assert preflight.allowed is True
+    assert preflight.reason == "resolved_low_volume_mod_removal"
+
+
+def test_remove_mods_preflight_rejects_targets_above_safe_limit():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.bisect_session = None
+    builder.current_java_version = 17
+    builder.get_system_memory = lambda: 16
+    builder._resolve_mod_names_to_installed = lambda names: list(names)
+
+    preflight = ServerBuilder._assess_action_preflight(
+        builder,
+        {"type": "remove_mods", "targets": ["a.jar", "b.jar", "c.jar", "d.jar"]},
+    )
+
+    assert preflight.allowed is False
+    assert preflight.reason == "too_many_mod_targets"
+
+
+def test_failed_start_with_crash_detected_skips_recognition_fallback_and_runs_ai():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.config = type("Cfg", (), {"runtime": type("Runtime", (), {"max_attempts": 1, "start_timeout": 5})()})()
+    builder.manifest = None
+    builder.jvm_xmx = "4G"
+    builder.jvm_xms = "4G"
+    builder.operations = []
+    builder.removed_mods = []
+    builder.known_deleted_client_mods = set()
+    builder.deleted_mod_evidence = {}
+    builder.attempts_used = 0
+    builder.run_success = False
+    builder.stop_reason = ""
+    logs: list[tuple[str, str, str]] = []
+    builder._log = lambda tag, message, level="INFO": logs.append((tag, level, message))
+    builder._ai_debug = lambda *_args, **_kwargs: None
+    builder.backup_mods = lambda _tag: None
+    builder._ensure_server_meta_files = lambda: None
+    builder.generate_report = lambda: "report"
+    builder.package_server = lambda: "package"
+    builder._summarize_ai_context = lambda context: context
+    builder._append_attempt_trace = lambda *args, **kwargs: None
+    builder._select_next_recognition_plan = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not select fallback"))
+    builder._apply_actions = lambda actions, attempt=0: True
+    builder.extract_relevant_log = lambda *_args, **_kwargs: {
+        "log_tail": "",
+        "crash_excerpt": "fml crash",
+        "crash_mod_issue": "",
+        "conflicts_or_exceptions": [],
+    }
+    builder._build_ai_context = lambda start_res, log_info: {"start_res": start_res, "log_info": log_info}
+    builder.start_server = lambda timeout=300: {
+        "success": False,
+        "crash_detected": True,
+        "stdout_tail": "",
+        "stderr_tail": "fml crash",
+        "log_path": "latest.log",
+        "crash_dir": "crash-reports",
+        "failure_signals": ["crash_report_created"],
+    }
+
+    ai_calls: list[dict] = []
+    builder.analyze_with_ai = lambda context: ai_calls.append(context) or {
+        "primary_issue": "mod_conflict",
+        "confidence": 0.9,
+        "actions": [{"type": "stop_and_report", "final_reason": "crash analyzed"}],
+    }
+
+    success = False
+    for i in range(1, builder.config.runtime.max_attempts + 1):
+        builder.attempts_used = i
+        builder._log("install.attempt", f"启动尝试 {i}/{builder.config.runtime.max_attempts}")
+        builder.backup_mods(f"attempt_{i}")
+        start_res = builder.start_server(timeout=builder.config.runtime.start_timeout)
+        if start_res["success"]:
+            success = True
+            break
+        log_info = builder.extract_relevant_log(str(start_res["log_path"]), str(start_res["crash_dir"]))
+        ai_context = builder._build_ai_context(start_res, log_info)
+        next_plan = None
+        if start_res.get("crash_detected"):
+            builder._log("install.ai", "检测到 crash 证据，跳过 runtime recognition fallback，直接进入 AI 分析")
+        else:
+            next_plan = builder._select_next_recognition_plan(start_res, log_info)
+        if next_plan:
+            raise AssertionError("recognition fallback should be skipped")
+        ai = builder.analyze_with_ai(ai_context)
+        should_stop = builder._apply_actions(ai.get("actions", []), attempt=i)
+        if should_stop:
+            builder.stop_reason = "crash analyzed"
+            break
+
+    assert success is False
+    assert len(ai_calls) == 1
+    assert ai_calls[0]["start_res"]["crash_detected"] is True
+    assert any("跳过 runtime recognition fallback" in message for tag, _level, message in logs if tag == "install.ai")
+
+
+def test_backup_mods_skips_repeated_snapshot_when_mods_unchanged(tmp_path: Path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    mods_dir = tmp_path / "server" / "mods"
+    backups_dir = tmp_path / "backups"
+    mods_dir.mkdir(parents=True)
+    backups_dir.mkdir(parents=True)
+    (mods_dir / "a.jar").write_text("a", encoding="utf-8")
+    (mods_dir / "b.jar").write_text("b", encoding="utf-8")
+
+    builder.workdirs = type("WorkDirs", (), {"server": tmp_path / "server", "backups": backups_dir})()
+    builder.operations = []
+    builder._mods_backup_signatures = {}
+    builder.backup_mods = ServerBuilder.backup_mods.__get__(builder, ServerBuilder)
+
+    builder.backup_mods("attempt_1")
+    first_mtime = (backups_dir / "mods_attempt_1").stat().st_mtime_ns
+
+    builder.backup_mods("attempt_1")
+    second_mtime = (backups_dir / "mods_attempt_1").stat().st_mtime_ns
+
+    assert first_mtime == second_mtime
+    assert builder.operations == ["backup_mods:attempt_1", "backup_mods_skip_unchanged:attempt_1"]
+
+
+def test_backup_mods_recreates_snapshot_when_mods_changed(tmp_path: Path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    mods_dir = tmp_path / "server" / "mods"
+    backups_dir = tmp_path / "backups"
+    mods_dir.mkdir(parents=True)
+    backups_dir.mkdir(parents=True)
+    (mods_dir / "a.jar").write_text("a", encoding="utf-8")
+
+    builder.workdirs = type("WorkDirs", (), {"server": tmp_path / "server", "backups": backups_dir})()
+    builder.operations = []
+    builder._mods_backup_signatures = {}
+    builder.backup_mods = ServerBuilder.backup_mods.__get__(builder, ServerBuilder)
+
+    builder.backup_mods("attempt_1")
+    (mods_dir / "b.jar").write_text("b", encoding="utf-8")
+
+    builder.backup_mods("attempt_1")
+
+    backup_files = sorted(path.name for path in (backups_dir / "mods_attempt_1").iterdir())
+    assert backup_files == ["a.jar", "b.jar"]
+    assert builder.operations == ["backup_mods:attempt_1", "backup_mods:attempt_1"]
 
 
 def test_mark_bisect_success_ready_clears_followups_and_sets_guard_state():
