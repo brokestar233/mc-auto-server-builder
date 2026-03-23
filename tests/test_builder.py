@@ -664,27 +664,34 @@ def test_build_ai_context_exposes_last_rollback_crash_report_comparison():
 
 def test_preflight_blocks_restore_when_crash_reports_unchanged():
     builder = ServerBuilder.__new__(ServerBuilder)
-    builder.last_rollback_remove_mods = {
-        "triggered": True,
-        "snapshot_tag": "attempt_1_action_1",
-        "crash_reports_changed_since_last_context": False,
+    builder.remove_validation_state = {
+        "continue_allowed": True,
+        "rollback_snapshot_tag": "attempt_1_action_1",
+        "post_remove_active_mods": ["good.jar"],
+        "problem_changed": False,
+        "continued": False,
     }
 
-    preflight = ServerBuilder._assess_action_preflight(builder, {"type": "restore_mods_and_continue"})
+    preflight = ServerBuilder._assess_action_preflight(builder, {"type": "continue_after_restore_mods"})
 
     assert preflight.allowed is False
-    assert preflight.reason == "crash_reports_not_changed_after_rollback_remove_mods"
+    assert preflight.reason == "remove_validation_problem_not_changed"
 
 
-def test_execute_restore_mods_and_continue_rolls_back_snapshot():
+def test_execute_continue_after_restore_mods_rolls_back_snapshot():
     builder = ServerBuilder.__new__(ServerBuilder)
-    builder.last_rollback_remove_mods = {
-        "triggered": True,
-        "snapshot_tag": "attempt_1_action_1",
+    builder.remove_validation_state = {
+        "continue_allowed": True,
+        "rollback_snapshot_tag": "attempt_1_action_1",
+        "post_remove_active_mods": ["good.jar"],
         "removed_targets": ["bad.jar"],
-        "crash_reports_changed_since_last_context": True,
+        "problem_changed": True,
+        "continued": False,
     }
     builder.rollback_mods = lambda tag: builder.__dict__.setdefault("rollback_calls", []).append(tag)
+    builder._set_active_mods = lambda active_mods, snapshot_tag, reason: builder.__dict__.setdefault("set_active_calls", []).append(
+        (list(active_mods), snapshot_tag, reason)
+    ) or list(active_mods)
     builder.operations = []
     builder.jvm_xmx = "4G"
     builder.jvm_xms = "4G"
@@ -695,8 +702,8 @@ def test_execute_restore_mods_and_continue_rolls_back_snapshot():
     stop, execution, rollback = ServerBuilder._execute_action_with_safeguards(
         builder,
         1,
-        {"type": "restore_mods_and_continue"},
-        ActionPreflight(action_type="restore_mods_and_continue", risk="low", allowed=True, reason="rollback_restore_allowed"),
+        {"type": "continue_after_restore_mods"},
+        ActionPreflight(action_type="continue_after_restore_mods", risk="low", allowed=True, reason="remove_validation_continue_allowed"),
         "attempt_2_action_1",
     )
 
@@ -704,8 +711,11 @@ def test_execute_restore_mods_and_continue_rolls_back_snapshot():
     assert rollback is None
     assert execution["status"] == "applied"
     assert execution["restored_snapshot_tag"] == "attempt_1_action_1"
-    assert builder.rollback_calls == ["attempt_1_action_1"]
-    assert "restore_mods_and_continue:attempt_1_action_1" in builder.operations
+    assert execution["restored_active_mods"] == ["good.jar"]
+    assert not hasattr(builder, "rollback_calls")
+    assert builder.set_active_calls == [(["good.jar"], "attempt_1_action_1", "continue_after_restore_mods")]
+    assert "continue_after_restore_mods:attempt_1_action_1" in builder.operations
+    assert builder.remove_validation_state["continued"] is True
 
 
 def test_start_server_terminates_hanging_process_without_success(tmp_path):
@@ -1352,6 +1362,75 @@ def test_execute_remove_mods_with_rollback_on_failure_restores_snapshot():
 
     assert stop is False
     assert execution["status"] == "rolled_back"
+    assert builder.remove_validation_state["continue_allowed"] is False
+
+
+def test_execute_remove_mods_with_rollback_on_failure_records_changed_problem_context():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.config = type("Cfg", (), {"runtime": type("Runtime", (), {"start_timeout": 5})()})()
+    builder.operations = []
+    builder.removed_mods = []
+    builder._log = lambda *_args, **_kwargs: None
+    builder._ai_debug = lambda *_args, **_kwargs: None
+    builder._resolve_mod_names_to_installed = ServerBuilder._resolve_mod_names_to_installed.__get__(builder, ServerBuilder)
+    builder._normalize_mod_token = ServerBuilder._normalize_mod_token.__get__(builder, ServerBuilder)
+    builder._resolve_dependency_cleanup_targets = lambda *_args, **_kwargs: ([], [], [])
+    builder._extract_log_signal_lines = ServerBuilder._extract_log_signal_lines.__get__(builder, ServerBuilder)
+    builder.ai_service = BuilderAIService(builder)
+    builder.last_ai_result = AIResult(primary_issue="mod_conflict", confidence=0.9, reason="test")
+    builder.last_rollback_remove_mods = {
+        "crash_reports_after_validation": ["old-crash.txt"],
+        "validation_crash_excerpt": "old crash",
+    }
+
+    state = {"mods": ["bad.jar", "good.jar"], "snapshot": ["bad.jar", "good.jar"]}
+
+    def list_mods():
+        return list(state["mods"])
+
+    def backup_mods(_tag: str):
+        state["snapshot"] = list(state["mods"])
+
+    def rollback_mods(_tag: str):
+        state["mods"] = list(state["snapshot"])
+
+    def remove_mods_by_name(names: list[str], source: str = "manual", reason: str = ""):
+        state["mods"] = [m for m in state["mods"] if m not in names]
+
+    def start_server(timeout: int = 300):
+        return {
+            "success": False,
+            "reason": "new dependency chain",
+            "stdout": "",
+            "stderr": "Different crash",
+            "crash_reports_snapshot": ["new-crash.txt"],
+            "failure_signals": ["missing dependency"],
+            "readiness_evidence": [],
+        }
+
+    builder.list_mods = list_mods
+    builder.backup_mods = backup_mods
+    builder.rollback_mods = rollback_mods
+    builder.remove_mods_by_name = remove_mods_by_name
+    builder.start_server = start_server
+
+    preflight = ActionPreflight(action_type="remove_mods", risk="medium", allowed=True, reason="resolved_low_volume_mod_removal")
+    stop, execution, rollback = ServerBuilder._execute_action_with_safeguards(
+        builder,
+        1,
+        {"type": "remove_mods", "targets": ["bad.jar"], "rollback_on_failure": True},
+        preflight,
+        snapshot_tag="attempt_1_action_1",
+    )
+
+    assert stop is False
+    assert execution["validation_problem_changed"] is True
+    assert rollback is not None and rollback["performed"] is True
+    assert builder.remove_validation_state["continue_allowed"] is True
+    assert builder.remove_validation_state["problem_changed"] is True
+    assert builder.remove_validation_state["rollback_snapshot_tag"] == "attempt_1_action_1"
+    assert builder.remove_validation_state["post_remove_active_mods"] == ["good.jar"]
+    assert builder.remove_validation_state["crash_report_delta"] == ["new-crash.txt", "old-crash.txt"]
 
 
 def test_select_java_version_for_manifest_uses_loader_and_version_bias():

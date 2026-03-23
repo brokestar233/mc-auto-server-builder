@@ -163,7 +163,7 @@ class BuilderAIService:
         }
         allowed_action = {
             "remove_mods",
-            "restore_mods_and_continue",
+            "continue_after_restore_mods",
             "adjust_memory",
             "change_java",
             "stop_and_report",
@@ -544,8 +544,8 @@ class BuilderAIService:
         candidate_fixes = [
             {"type": "remove_mods", "when": "日志或依赖链能明确定位问题 mod"},
             {
-                "type": "restore_mods_and_continue",
-                "when": "上一轮是带回滚验证的删 mod，且本轮 crash-reports / 崩溃特征已变化，说明应恢复到删前基线再继续分析",
+                "type": "continue_after_restore_mods",
+                "when": "专项删除验证已确认故障形态变化，说明应恢复到删前基线并基于该轮新证据继续常规分析",
             },
             {"type": "bisect_mods", "when": "无法直接定位单个问题 mod，但可以对可疑 mod 集合进行受控二分测试"},
             {"type": "adjust_memory", "when": "存在内存分配不足或 OOM 证据"},
@@ -606,6 +606,87 @@ class BuilderAIService:
             },
         }
 
+    def build_remove_validation_context_payload(self, context: dict) -> dict[str, object]:
+        validation_state = dict(context.get("remove_validation_state") or {})
+        return {
+            "validation_target": {
+                "attempt": self.builder.attempts_used,
+                "action_index": validation_state.get("action_index"),
+                "removed_targets": self._normalize_text_list(validation_state.get("removed_targets", []), limit=20),
+                "forced_targets": self._normalize_text_list(validation_state.get("forced_targets", []), limit=20),
+            },
+            "failure_comparison": {
+                "previous_crash_reports": self._normalize_text_list(validation_state.get("previous_crash_reports", []), limit=20),
+                "validation_crash_reports": self._normalize_text_list(validation_state.get("validation_crash_reports", []), limit=20),
+                "crash_report_delta": self._normalize_text_list(validation_state.get("crash_report_delta", []), limit=20),
+                "previous_excerpt_preview": self._truncate_debug_text(validation_state.get("previous_excerpt", ""), 1200),
+                "validation_excerpt_preview": self._truncate_debug_text(validation_state.get("validation_excerpt", ""), 1200),
+                "failure_signals": self._normalize_text_list(validation_state.get("failure_signals", []), limit=20),
+                "readiness_evidence": self._normalize_text_list(validation_state.get("readiness_evidence", []), limit=20),
+                "problem_changed": bool(validation_state.get("problem_changed", False)),
+            },
+            "allowed_actions": [
+                {
+                    "type": "continue_after_restore_mods",
+                    "when": (
+                        "删除验证后故障形态发生变化，说明删除命中了问题方向；"
+                        "系统会在上一轮结束时先恢复删前基线，随后本轮再恢复到删除后的工作集继续阶段二"
+                    ),
+                },
+                {"type": "stop_and_report", "when": "删除验证没有提供足够的新信息，不应继续消费自动动作"},
+                {
+                    "type": "report_manual_fix",
+                    "when": "删除验证已能明确说明原因，但自动动作仍不安全，改为输出人工处理建议",
+                },
+            ],
+        }
+
+    def build_remove_validation_prompt(self, context: dict) -> str:
+        schema = {
+            "thought_chain": ["最多 6 条简短推理"],
+            "final_output": {
+                "primary_issue": "mod_conflict|missing_dependency|client_mod|other",
+                "confidence": 0.0,
+                "reason": "删除验证结论",
+                "input_summary": "验证输入摘要",
+                "user_summary": "给用户看的结论",
+                "evidence": ["关键证据"],
+                "suggested_manual_steps": ["人工步骤"],
+                "actions": [
+                    {
+                        "type": "continue_after_restore_mods",
+                        "reason": "删除后故障形态变化，说明这次删除命中了问题方向；请恢复到删除后的工作集并继续一次后续动作",
+                    },
+                    {"type": "report_manual_fix", "final_reason": "需要人工处理", "manual_steps": ["步骤1"], "evidence": ["证据1"]},
+                    {"type": "stop_and_report", "final_reason": "删除验证未提供可继续的新信息"},
+                ],
+            },
+        }
+        return "".join(
+            [
+                "你是 Minecraft 服务器自动修复流程中的删除验证裁决器。\n",
+                (
+                    "你的任务不是做完整日志分析，而是只根据一次 remove_mods + rollback_on_failure 的验证结果，"
+                    "判断这次删除是否命中了问题方向，以及系统是否应该在下一轮恢复到删除后的工作集后继续执行一次后续动作。\n"
+                ),
+                "硬规则：1. 只能输出 continue_after_restore_mods、report_manual_fix、stop_and_report 三类动作。",
+                (
+                    "2. 当 validation_target.removed_targets 删除后，"
+                    "failure_comparison.problem_changed=true，且差异证据足以说明故障形态改变时，"
+                    "优先输出 continue_after_restore_mods。"
+                ),
+                (
+                    "3. continue_after_restore_mods 的语义是：上一轮结束时系统已自动恢复删前基线；"
+                    "当前轮再恢复到删除后的工作集，并保留本轮删除验证日志与差异证据，再进入下一次常规分析。"
+                ),
+                "4. 若故障没有变化，或变化不足以支持继续自动动作，禁止输出 continue_after_restore_mods。",
+                "5. 不要输出 remove_mods、bisect_mods、adjust_memory、change_java 等常规动作；那些动作会在下一阶段由常规分析器决定。\n",
+                "输出必须是严格 JSON，不要包含 markdown 代码块，不要输出额外解释。\n",
+                f"结构化上下文: {json.dumps(context, ensure_ascii=False)[:8000]}\n",
+                f"返回 JSON Schema 示例: {json.dumps(schema, ensure_ascii=False)}",
+            ]
+        )
+
     def build_prompt(self, context: dict) -> str:
         schema = {
             "thought_chain": ["最多 8 条简短推理"],
@@ -626,8 +707,8 @@ class BuilderAIService:
                 "actions": [
                     {"type": "remove_mods", "targets": ["modA.jar"], "rollback_on_failure": True},
                     {
-                        "type": "restore_mods_and_continue",
-                        "reason": "上一轮 rollback_on_failure 删除后，当前 crash-reports 已变化，需要恢复到删前基线后继续分析",
+                        "type": "continue_after_restore_mods",
+                        "reason": "专项删除验证确认故障形态变化，需要恢复到删除后的工作集并继续一次常规分析",
                     },
                     {
                         "type": "bisect_mods",
@@ -680,12 +761,7 @@ class BuilderAIService:
                 "不过总数绝不能超过系统源码中的安全上限（当前为 3 个）。"
                 "3. 对 remove_mods，若你希望系统在删除后做一次启动验证并在失败时自动回滚，"
                 "则显式输出 rollback_on_failure=true。"
-                "4. 若 rollback_state.last_rollback_remove_mods.triggered=true，且上一轮是 remove_mods + rollback_on_failure=true，"
-                "同时 rollback_state.crash_reports_changed_since_last_rollback_remove=true，"
-                "则允许优先输出 restore_mods_and_continue，用于要求系统恢复到上一轮删前基线并继续后续自动动作；"
-                "此时必须结合 last_crash_reports、current_crash_reports、"
-                "crash_report_delta、last_crash_excerpt_preview 判断崩溃是否真的变了。"
-                "若 crash 没变，则禁止输出 restore_mods_and_continue。"
+                "4. continue_after_restore_mods 只应由专项删除验证阶段产出；常规分析阶段不要主动把它当作候选策略。"
                 "5. 若单个 remove_mods 候选执行后仍不能解决问题，且证据不再足以唯一锁定下一个单一 mod，"
                 "则优先回到删除前基线并改用受控二分，而不是继续盲目累计删除。"
                 "6. 输出 bisect_mods 时，bisect_mode 只能是 initial|switch_group|continue_failed_group，"
@@ -715,8 +791,7 @@ class BuilderAIService:
                 "动作优先级：1. 证据已唯一命中单个 mod 或明确依赖链时，优先 remove_mods；"
                 "若只是多个可疑候选，则仍应只提交最有把握的那 1 个。"
                 "只有在证据明确证明多个 mod 都属于客户端 mod 时，才允许一次提交多个 targets，且最多 3 个。"
-                "2. 若上一轮 remove_mods 已触发自动回滚，且 crash 报告或关键崩溃特征明显变化，优先 restore_mods_and_continue；"
-                "若 crash 报告未变，则不要把 restore_mods_and_continue 当作默认动作。"
+                "2. 若专项删除验证已经确认问题形态变化，系统会单独处理 continue_after_restore_mods；常规分析阶段无需重复判断该动作。"
                 "3. 若该单删动作只是高置信试探、删除后可能需要立即验证是否误删，"
                 "优先为 remove_mods 增加 rollback_on_failure=true。"
                 "4. 若多个候选都可疑但没有足够把握安全单删，或单删后问题依旧且需要重新缩小范围，"
@@ -815,6 +890,59 @@ class BuilderAIService:
             f"issue={result.primary_issue}, confidence={result.confidence:.2f}, reason={result.reason}, "
             f"actions={json.dumps([self._serialize_ai_action(a) for a in result.actions], ensure_ascii=False)}"
         )
+        return {
+            "primary_issue": result.primary_issue,
+            "confidence": result.confidence,
+            "reason": result.reason,
+            "thought_chain": list(result.thought_chain),
+            "input_summary": result.input_summary,
+            "hit_deleted_mods": list(result.hit_deleted_mods),
+            "dependency_chains": [list(x) for x in result.dependency_chains],
+            "deletion_rationale": list(result.deletion_rationale),
+            "conflicts_or_exceptions": list(result.conflicts_or_exceptions),
+            "user_summary": result.user_summary,
+            "suggested_manual_steps": list(result.suggested_manual_steps),
+            "evidence": list(result.evidence),
+            "actions": [self._serialize_ai_action(a) for a in result.actions],
+        }
+
+    def analyze_remove_validation(self, context: dict) -> dict:
+        if not self.builder.config.ai.enabled:
+            result = AIResult(
+                primary_issue="other",
+                confidence=0.2,
+                reason="AI未启用，删除验证阶段返回保守策略",
+                actions=[AIAction(type="stop_and_report", final_reason="AI disabled")],
+            )
+            return {
+                "primary_issue": result.primary_issue,
+                "confidence": result.confidence,
+                "reason": result.reason,
+                "thought_chain": [],
+                "input_summary": "",
+                "hit_deleted_mods": [],
+                "dependency_chains": [],
+                "deletion_rationale": [],
+                "conflicts_or_exceptions": [],
+                "user_summary": "",
+                "suggested_manual_steps": [],
+                "evidence": [],
+                "actions": [self._serialize_ai_action(a) for a in result.actions],
+            }
+
+        normalized_context = self.build_remove_validation_context_payload(context)
+        prompt = self.build_remove_validation_prompt(normalized_context)
+        try:
+            text = self._call_ai_provider(prompt)
+            parsed = self._extract_json_object(str(text))
+            if not isinstance(parsed, dict):
+                retry_text = self._call_ai_provider(prompt)
+                parsed = self._extract_json_object(str(retry_text))
+                if not isinstance(parsed, dict):
+                    raise ValueError("ai_remove_validation_invalid_json")
+            result = self._normalize_ai_result(parsed)
+        except Exception as e:
+            result = self._safe_ai_result(reason=f"AI 删除验证分析失败: {type(e).__name__}:{e}", confidence=0.05)
         return {
             "primary_issue": result.primary_issue,
             "confidence": result.confidence,

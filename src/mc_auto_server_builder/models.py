@@ -99,7 +99,7 @@ class StartResult:
 class AIAction:
     type: Literal[
         "remove_mods",
-        "restore_mods_and_continue",
+        "continue_after_restore_mods",
         "adjust_memory",
         "change_java",
         "stop_and_report",

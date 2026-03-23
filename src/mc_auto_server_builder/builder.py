@@ -120,6 +120,7 @@ class ServerBuilder:
         self.last_ai_result: AIResult | None = None
         self.last_ai_manual_report: dict[str, object] = {}
         self.last_rollback_remove_mods: dict[str, object] = {}
+        self.remove_validation_state: dict[str, object] = {}
         self.attempt_traces: list[AttemptTrace] = []
         self.bisect_session = BisectSession()
         self.last_bisect_feedback: dict[str, object] = {}
@@ -710,6 +711,7 @@ class ServerBuilder:
         manifest = self.manifest
         recognition_summary = self._build_recognition_summary() if manifest else {}
         rollback_state = dict(getattr(self, "last_rollback_remove_mods", {}) or {})
+        remove_validation_state = dict(getattr(self, "remove_validation_state", {}) or {})
         current_crash_reports = [str(x) for x in (start_res.get("crash_reports_snapshot") or []) if str(x).strip()]
         last_crash_reports = [str(x) for x in (rollback_state.get("crash_reports_after_validation") or []) if str(x).strip()]
         crash_report_delta = sorted(set(current_crash_reports).symmetric_difference(set(last_crash_reports)))
@@ -734,6 +736,7 @@ class ServerBuilder:
             "dependency_cleanup_rule_enabled": True,
             "recent_actions": self.operations[-20:],
             "last_rollback_remove_mods": rollback_state,
+            "remove_validation_state": remove_validation_state,
             "crash_reports_changed_since_last_rollback_remove": crash_reports_changed,
             "last_crash_reports": last_crash_reports,
             "current_crash_reports": current_crash_reports,
@@ -1638,31 +1641,50 @@ class ServerBuilder:
     def _assess_action_preflight(self, action: dict) -> ActionPreflight:
         action_type = str(action.get("type") or "unknown")
         details: list[str] = []
-        if action_type == "restore_mods_and_continue":
-            state = dict(getattr(self, "last_rollback_remove_mods", {}) or {})
-            triggered = bool(state.get("triggered", False))
-            snapshot_tag = str(state.get("snapshot_tag") or "").strip()
-            changed = bool(state.get("crash_reports_changed_since_last_context", False))
-            details.append(f"triggered={triggered}")
-            details.append(f"snapshot_tag={snapshot_tag or 'none'}")
-            details.append(f"crash_reports_changed={changed}")
-            if not triggered or not snapshot_tag:
+        if action_type == "continue_after_restore_mods":
+            state = dict(getattr(self, "remove_validation_state", {}) or {})
+            can_continue = bool(state.get("continue_allowed", False))
+            post_remove_active_mods = [str(x).strip() for x in (state.get("post_remove_active_mods") or []) if str(x).strip()]
+            snapshot_tag = str(state.get("rollback_snapshot_tag") or "").strip()
+            consumed = bool(state.get("continued", False))
+            problem_changed = bool(state.get("problem_changed", False))
+            details.append(f"continue_allowed={can_continue}")
+            details.append(f"rollback_snapshot_tag={snapshot_tag or 'none'}")
+            if post_remove_active_mods:
+                details.append(f"post_remove_active_mods={json.dumps(post_remove_active_mods, ensure_ascii=False)}")
+            details.append(f"problem_changed={problem_changed}")
+            details.append(f"continued={consumed}")
+            if not can_continue or not snapshot_tag or not post_remove_active_mods:
                 return ActionPreflight(
                     action_type=action_type,
                     risk="medium",
                     allowed=False,
-                    reason="no_rollback_remove_mods_context",
+                    reason="no_remove_validation_context",
                     details=details,
                 )
-            if not changed:
+            if consumed:
                 return ActionPreflight(
                     action_type=action_type,
                     risk="medium",
                     allowed=False,
-                    reason="crash_reports_not_changed_after_rollback_remove_mods",
+                    reason="remove_validation_continue_already_consumed",
                     details=details,
                 )
-            return ActionPreflight(action_type=action_type, risk="low", allowed=True, reason="rollback_restore_allowed", details=details)
+            if not problem_changed:
+                return ActionPreflight(
+                    action_type=action_type,
+                    risk="medium",
+                    allowed=False,
+                    reason="remove_validation_problem_not_changed",
+                    details=details,
+                )
+            return ActionPreflight(
+                action_type=action_type,
+                risk="low",
+                allowed=True,
+                reason="remove_validation_continue_allowed",
+                details=details,
+            )
         if action_type == "bisect_mods":
             bisect_mode = str(action.get("bisect_mode") or "initial").strip() or "initial"
             if bisect_mode not in {"initial", "switch_group", "continue_failed_group"}:
@@ -1941,6 +1963,10 @@ class ServerBuilder:
                 rollback_on_failure = bool(action.get("rollback_on_failure", False))
                 names = [x for x in targets if not str(x).startswith("regex:")]
                 resolved_names = self._resolve_mod_names_to_installed([str(x) for x in names])
+                previous_crash_reports = list(
+                    getattr(self, "last_rollback_remove_mods", {}).get("crash_reports_after_validation", []) or []
+                )
+                previous_excerpt = str(getattr(self, "last_rollback_remove_mods", {}).get("validation_crash_excerpt", "") or "")
                 if resolved_names:
                     self.remove_mods_by_name(
                         resolved_names,
@@ -1969,21 +1995,28 @@ class ServerBuilder:
                         reason="depend_on_known_deleted_client_mod",
                     )
                     self.operations.append(f"dependency_cleanup_forced_remove:targets={json.dumps(forced_targets, ensure_ascii=False)}")
+                post_remove_active_mods = list(self.list_mods())
                 if rollback_on_failure:
                     validation_res = self.start_server(timeout=self.config.runtime.start_timeout)
                     validation_success = bool(validation_res.get("success"))
+                    crash_reports_after_validation = [
+                        str(x) for x in (validation_res.get("crash_reports_snapshot") or []) if str(x).strip()
+                    ]
+                    validation_excerpt = str(validation_res.get("stderr_tail") or validation_res.get("reason") or "")
+                    crash_report_delta = sorted(
+                        set(crash_reports_after_validation).symmetric_difference(set(previous_crash_reports))
+                    )
+                    problem_changed = bool(crash_report_delta)
                     execution.update(
                         {
                             "validation_start_performed": True,
                             "validation_success": validation_success,
                             "validation_success_source": validation_res.get("success_source"),
+                            "validation_problem_changed": problem_changed,
                         }
                     )
                     if not validation_success:
                         rollback = self._rollback_action(action_type, snapshot_tag, previous_state)
-                        crash_reports_after_validation = [
-                            str(x) for x in (validation_res.get("crash_reports_snapshot") or []) if str(x).strip()
-                        ]
                         self.last_rollback_remove_mods = {
                             "triggered": bool(rollback and rollback.get("performed")),
                             "snapshot_tag": snapshot_tag,
@@ -1993,12 +2026,30 @@ class ServerBuilder:
                             "validation_success": validation_success,
                             "validation_failure_signals": list(validation_res.get("failure_signals") or []),
                             "validation_readiness_evidence": list(validation_res.get("readiness_evidence") or []),
-                            "validation_crash_excerpt": str(validation_res.get("stderr_tail") or validation_res.get("reason") or ""),
+                            "validation_crash_excerpt": validation_excerpt,
                             "crash_reports_after_validation": crash_reports_after_validation,
                             "crash_reports_new_after_validation": [
                                 str(x) for x in (validation_res.get("crash_reports_new") or []) if str(x).strip()
                             ],
                             "crash_reports_changed_since_last_context": False,
+                        }
+                        self.remove_validation_state = {
+                            "triggered": bool(rollback and rollback.get("performed")),
+                            "continue_allowed": problem_changed,
+                            "continued": False,
+                            "rollback_snapshot_tag": snapshot_tag,
+                            "action_index": idx,
+                            "removed_targets": list(resolved_names),
+                            "forced_targets": list(forced_targets),
+                            "post_remove_active_mods": post_remove_active_mods,
+                            "previous_crash_reports": previous_crash_reports,
+                            "validation_crash_reports": crash_reports_after_validation,
+                            "crash_report_delta": crash_report_delta,
+                            "previous_excerpt": previous_excerpt,
+                            "validation_excerpt": validation_excerpt,
+                            "failure_signals": list(validation_res.get("failure_signals") or []),
+                            "readiness_evidence": list(validation_res.get("readiness_evidence") or []),
+                            "problem_changed": problem_changed,
                         }
                         execution.update(
                             {
@@ -2019,20 +2070,26 @@ class ServerBuilder:
                         return False, execution, rollback
                 else:
                     self.last_rollback_remove_mods = {}
-            elif action_type == "restore_mods_and_continue":
-                state = dict(getattr(self, "last_rollback_remove_mods", {}) or {})
-                snapshot_to_restore = str(state.get("snapshot_tag") or snapshot_tag).strip()
-                self.rollback_mods(snapshot_to_restore)
-                self.operations.append(f"restore_mods_and_continue:{snapshot_to_restore}")
+                    self.remove_validation_state = {}
+            elif action_type == "continue_after_restore_mods":
+                state = dict(getattr(self, "remove_validation_state", {}) or {})
+                rollback_snapshot_tag = str(state.get("rollback_snapshot_tag") or snapshot_tag).strip()
+                restored_active = self._set_active_mods(
+                    [str(x) for x in (state.get("post_remove_active_mods") or []) if str(x).strip()],
+                    rollback_snapshot_tag,
+                    reason="continue_after_restore_mods",
+                )
+                self.operations.append(f"continue_after_restore_mods:{rollback_snapshot_tag}")
                 execution.update(
                     {
                         "status": "applied",
-                        "restored_snapshot_tag": snapshot_to_restore,
+                        "restored_snapshot_tag": rollback_snapshot_tag,
+                        "restored_active_mods": restored_active,
                         "restored_targets": list(state.get("removed_targets") or []),
                     }
                 )
                 state["continued"] = True
-                self.last_rollback_remove_mods = state
+                self.remove_validation_state = state
             elif action_type == "adjust_memory":
                 xmx = action.get("xmx", self.jvm_xmx)
                 xms = action.get("xms", self.jvm_xms)
@@ -2617,6 +2674,9 @@ class ServerBuilder:
 
     def analyze_with_ai(self, context: dict) -> dict:
         return self.ai_service.analyze(context)
+
+    def analyze_remove_validation_with_ai(self, context: dict) -> dict:
+        return self.ai_service.analyze_remove_validation(context)
 
     # 输出
     def generate_report(self) -> str:
