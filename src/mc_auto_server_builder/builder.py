@@ -2678,6 +2678,76 @@ class ServerBuilder:
     def analyze_remove_validation_with_ai(self, context: dict) -> dict:
         return self.ai_service.analyze_remove_validation(context)
 
+    def _consume_remove_validation_followup(self, attempt: int, start_res: dict, log_info: dict) -> bool | None:
+        state = dict(getattr(self, "remove_validation_state", {}) or {})
+        if not state or not bool(state.get("continue_allowed", False)) or bool(state.get("continued", False)):
+            return None
+
+        validation_context = self._build_ai_context(start_res, log_info)
+        validation_context["remove_validation_state"] = state
+        self._append_attempt_trace(
+            attempt,
+            "remove_validation_context_prepared",
+            "ok",
+            context_summary=self._summarize_ai_context(validation_context),
+        )
+        ai = self.analyze_remove_validation_with_ai(validation_context)
+        self._append_attempt_trace(
+            attempt,
+            "remove_validation_ai_analysis",
+            "ok",
+            context_summary=self._summarize_ai_context(validation_context),
+            ai_result=dict(ai),
+            action_plan=[dict(x) for x in ai.get("actions", []) if isinstance(x, dict)],
+        )
+        self._log(
+            "install.ai",
+            f"AI 删除验证阶段完成，issue={ai.get('primary_issue')} confidence={ai.get('confidence')}",
+        )
+        should_stop = self._apply_actions(ai.get("actions", []), attempt=attempt)
+        self._ai_debug(
+            "remove_validation.loop.decision "
+            f"attempt={attempt}, should_stop={should_stop}, stop_reason={self.stop_reason or 'none'}, "
+            f"actions={json.dumps(ai.get('actions', []), ensure_ascii=False)}"
+        )
+        if should_stop:
+            self._log("install.stop", f"AI 决策停止，reason={self.stop_reason}", level="WARN")
+            return True
+
+        post_state = dict(getattr(self, "remove_validation_state", {}) or {})
+        if bool(post_state.get("continued", False)):
+            phase2_context = self._build_ai_context(start_res, log_info)
+            phase2_context["remove_validation_state"] = post_state
+            self._append_attempt_trace(
+                attempt,
+                "remove_validation_phase2_context_prepared",
+                "ok",
+                context_summary=self._summarize_ai_context(phase2_context),
+            )
+            ai = self.analyze_with_ai(phase2_context)
+            self._append_attempt_trace(
+                attempt,
+                "remove_validation_phase2_ai_analysis",
+                "ok",
+                context_summary=self._summarize_ai_context(phase2_context),
+                ai_result=dict(ai),
+                action_plan=[dict(x) for x in ai.get("actions", []) if isinstance(x, dict)],
+            )
+            self._log(
+                "install.ai",
+                f"AI 删除验证接力后阶段二完成，issue={ai.get('primary_issue')} confidence={ai.get('confidence')}",
+            )
+            should_stop = self._apply_actions(ai.get("actions", []), attempt=attempt)
+            self._ai_debug(
+                "remove_validation.phase2.loop.decision "
+                f"attempt={attempt}, should_stop={should_stop}, stop_reason={self.stop_reason or 'none'}, "
+                f"actions={json.dumps(ai.get('actions', []), ensure_ascii=False)}"
+            )
+            if should_stop:
+                self._log("install.stop", f"AI 决策停止，reason={self.stop_reason}", level="WARN")
+                return True
+        return False
+
     # 输出
     def generate_report(self) -> str:
         report_path = self.workdirs.root / "report.txt"
@@ -3003,6 +3073,11 @@ class ServerBuilder:
                             "preflight": self._preflight_recognition_plan(next_plan),
                         },
                     )
+                    continue
+                remove_validation_stop = self._consume_remove_validation_followup(i, start_res, log_info)
+                if remove_validation_stop is True:
+                    break
+                if remove_validation_stop is False:
                     continue
                 ai = self.analyze_with_ai(ai_context)
                 self._append_attempt_trace(

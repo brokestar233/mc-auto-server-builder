@@ -1433,6 +1433,72 @@ def test_execute_remove_mods_with_rollback_on_failure_records_changed_problem_co
     assert builder.remove_validation_state["crash_report_delta"] == ["new-crash.txt", "old-crash.txt"]
 
 
+def test_consume_remove_validation_followup_runs_special_stage_before_main_ai():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.remove_validation_state = {
+        "continue_allowed": True,
+        "continued": False,
+        "rollback_snapshot_tag": "attempt_1_action_1",
+        "post_remove_active_mods": ["good.jar"],
+        "problem_changed": True,
+    }
+    builder.stop_reason = ""
+    builder.operations = []
+    builder._log = lambda *_args, **_kwargs: None
+    builder._ai_debug = lambda *_args, **_kwargs: None
+    builder._append_attempt_trace = lambda *_args, **_kwargs: None
+    builder._summarize_ai_context = lambda context: {"mods": context.get("mod_state", {}).get("current_installed_mods", [])}
+    builder._build_ai_context = lambda start_res, log_info: {
+        "mod_state": {"current_installed_mods": ["bad.jar", "good.jar"]},
+        "raw_evidence": {"log_tail_preview": log_info.get("log_tail", "")},
+    }
+    calls: list[str] = []
+
+    def analyze_remove_validation_with_ai(context: dict):
+        calls.append(f"rv:{context.get('remove_validation_state', {}).get('post_remove_active_mods')}")
+        return {
+            "primary_issue": "mod_conflict",
+            "confidence": 0.9,
+            "actions": [{"type": "continue_after_restore_mods"}],
+        }
+
+    def apply_actions(actions: list[dict], attempt: int = 0):
+        if actions and actions[0].get("type") == "continue_after_restore_mods":
+            builder.remove_validation_state["continued"] = True
+        return False
+
+    def analyze_with_ai(context: dict):
+        calls.append(f"main:{context.get('remove_validation_state', {}).get('continued')}")
+        return {
+            "primary_issue": "other",
+            "confidence": 0.5,
+            "actions": [],
+        }
+
+    builder.analyze_remove_validation_with_ai = analyze_remove_validation_with_ai
+    builder._apply_actions = apply_actions
+    builder.analyze_with_ai = analyze_with_ai
+
+    result = ServerBuilder._consume_remove_validation_followup(
+        builder,
+        2,
+        {"success": False},
+        {"log_tail": "changed crash"},
+    )
+
+    assert result is False
+    assert calls == ["rv:['good.jar']", "main:True"]
+
+
+def test_consume_remove_validation_followup_skips_when_state_not_pending():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.remove_validation_state = {"continue_allowed": True, "continued": True}
+
+    result = ServerBuilder._consume_remove_validation_followup(builder, 1, {"success": False}, {"log_tail": "x"})
+
+    assert result is None
+
+
 def test_select_java_version_for_manifest_uses_loader_and_version_bias():
     builder = ServerBuilder.__new__(ServerBuilder)
     builder.manifest = PackManifest(pack_name="pack", mc_version="1.21.1", loader="neoforge")

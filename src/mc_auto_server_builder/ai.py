@@ -545,7 +545,7 @@ class BuilderAIService:
             {"type": "remove_mods", "when": "日志或依赖链能明确定位问题 mod"},
             {
                 "type": "continue_after_restore_mods",
-                "when": "专项删除验证已确认故障形态变化，说明应恢复到删前基线并基于该轮新证据继续常规分析",
+                "when": "专项删除验证已确认故障形态变化，说明应恢复到删除后的工作集并基于该轮新证据继续常规分析",
             },
             {"type": "bisect_mods", "when": "无法直接定位单个问题 mod，但可以对可疑 mod 集合进行受控二分测试"},
             {"type": "adjust_memory", "when": "存在内存分配不足或 OOM 证据"},
