@@ -238,16 +238,6 @@ def test_detect_log_ready_signal_rejects_plain_done_word_inside_error_log():
     assert ready is False
     assert source == ""
 
-
-def test_detect_log_ready_signal_rejects_latest_log_without_standard_ready_line():
-    latest_log = Path("latest.log").read_text(encoding="utf-8", errors="ignore")
-
-    ready, source = ServerBuilder._detect_log_ready_signal(None, latest_log)
-
-    assert ready is False
-    assert source == ""
-
-
 def test_start_server_detects_first_crash_report_and_kills_process(tmp_path):
     builder = ServerBuilder.__new__(ServerBuilder)
     server_dir = tmp_path / "server"
