@@ -80,6 +80,8 @@ def test_download_graalvm17_from_github_uses_release_asset(tmp_path):
         )
     ]
     assert "graalvm17_selected_asset:grallvm17-windows-x64.zip" in builder.operations
+    assert not (builder.workdirs.java_bins / "grallvm17-windows-x64.zip").exists()
+    assert not (builder.workdirs.java_bins / "graalvm17-windows-x64.zip").exists()
 
 
 def test_download_graalvm_from_oracle_keeps_regular_cookie_header_for_java_21(tmp_path):
@@ -148,6 +150,7 @@ def test_download_graalvm_from_oracle_keeps_regular_cookie_header_for_java_21(tm
             None,
         )
     ]
+    assert not (builder.workdirs.java_bins / "oracle-graalvm-21.tar.gz").exists()
 
 
 def test_detect_command_probe_ready_accepts_player_count_line():
@@ -1666,6 +1669,57 @@ def test_package_server_embeds_build_meta_json(tmp_path):
         assert payload["manifest_summary"]["loader"] == "forge"
         assert "server.jar" in names
         assert "java_bins/java" in names
+
+
+def test_package_server_excludes_runtime_directories(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.workdirs = type("WorkDirs", (), {"root": tmp_path, "server": tmp_path / "server", "java_bins": tmp_path / "java_bins"})()
+    builder.workdirs.server.mkdir()
+    builder.workdirs.java_bins.mkdir()
+    (builder.workdirs.server / "server.jar").write_text("jar", encoding="utf-8")
+    (builder.workdirs.server / "logs").mkdir()
+    (builder.workdirs.server / "logs" / "latest.log").write_text("log", encoding="utf-8")
+    (builder.workdirs.server / "crash-reports").mkdir()
+    (builder.workdirs.server / "crash-reports" / "crash-1.txt").write_text("crash", encoding="utf-8")
+    (builder.workdirs.server / "world").mkdir()
+    (builder.workdirs.server / "world" / "level.dat").write_text("world", encoding="utf-8")
+    (builder.workdirs.server / "world_nether").mkdir()
+    (builder.workdirs.server / "world_nether" / "level.dat").write_text("nether", encoding="utf-8")
+    (builder.workdirs.server / "world_the_end").mkdir()
+    (builder.workdirs.server / "world_the_end" / "level.dat").write_text("end", encoding="utf-8")
+    (builder.workdirs.java_bins / "java").write_text("bin", encoding="utf-8")
+    builder._build_meta_payload = ServerBuilder._build_meta_payload.__get__(builder, ServerBuilder)
+    builder._build_recognition_summary = lambda: {"active_loader": "forge", "confidence": 0.9}
+    builder.detect_current_java_version = lambda: 21
+    builder.pack_input = type("PackInput", (), {"input_type": "local_zip", "source": "pack.zip", "file_id": None})()
+    builder.manifest = PackManifest(pack_name="Pack", mc_version="1.20.1", loader="forge")
+    builder.current_java_version = 21
+    builder.jvm_xmx = "4G"
+    builder.jvm_xms = "2G"
+    builder.extra_jvm_flags = []
+    builder.start_command_mode = "jar"
+    builder.start_command_value = "server.jar"
+    builder.removed_mods = []
+    builder.bisect_removed_mods = []
+    builder.deleted_mod_evidence = {}
+    builder.last_ai_result = None
+    builder.last_ai_manual_report = {}
+    builder.attempts_used = 0
+    builder.run_success = False
+    builder.stop_reason = ""
+    builder.recognition_attempts = []
+    builder.operations = []
+
+    out = ServerBuilder.package_server(builder)
+
+    with zipfile.ZipFile(out, "r") as zf:
+        names = set(zf.namelist())
+        assert "server.jar" in names
+        assert "logs/latest.log" not in names
+        assert "crash-reports/crash-1.txt" not in names
+        assert "world/level.dat" not in names
+        assert "world_nether/level.dat" not in names
+        assert "world_the_end/level.dat" not in names
 
 
 def test_select_next_recognition_plan_uses_runtime_feedback(tmp_path):

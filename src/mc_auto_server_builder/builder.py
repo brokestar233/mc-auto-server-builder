@@ -2907,10 +2907,17 @@ class ServerBuilder:
 
     def package_server(self) -> str:
         out = self.workdirs.root / "server_pack.zip"
+        excluded_runtime_dirs = {
+            "crash-reports",
+            "logs",
+            "world",
+            "world_nether",
+            "world_the_end",
+        }
         with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("build_meta.json", json.dumps(self._build_meta_payload(), ensure_ascii=False, indent=2))
             for p in self.workdirs.server.rglob("*"):
-                if p.is_file():
+                if p.is_file() and not any(part in excluded_runtime_dirs for part in p.relative_to(self.workdirs.server).parts):
                     zf.write(p, p.relative_to(self.workdirs.server))
             for p in self.workdirs.java_bins.rglob("*"):
                 if p.is_file():
@@ -4270,6 +4277,7 @@ class ServerBuilder:
             java_home.mkdir(parents=True, exist_ok=True)
 
             extract_archive(archive_path, java_home)
+            safe_unlink(archive_path)
             normalized, changed = normalize_java_home_layout(java_home)
             if changed:
                 self.operations.append(f"oracle_graalvm_java_home_normalized:{version}")
@@ -4350,6 +4358,7 @@ class ServerBuilder:
 
             bin_name = "java.exe" if os.name == "nt" else "java"
             extract_archive(archive_path, java_home)
+            safe_unlink(archive_path)
             normalized, changed = normalize_java_home_layout(java_home)
             if changed:
                 self.operations.append("graalvm17_java_home_normalized")
@@ -4426,6 +4435,7 @@ class ServerBuilder:
             java_home.mkdir(parents=True, exist_ok=True)
 
             extract_archive(archive_path, java_home)
+            safe_unlink(archive_path)
             normalized, changed = normalize_java_home_layout(java_home)
             if changed:
                 self.operations.append(f"temurin_java_home_normalized:{version}")
@@ -4484,6 +4494,7 @@ class ServerBuilder:
 
             bin_name = "java.exe" if os.name == "nt" else "java"
             extract_archive(archive_path, java_home)
+            safe_unlink(archive_path)
             normalized, changed = normalize_java_home_layout(java_home)
             if changed:
                 self.operations.append(f"dragonwell_java_home_normalized:{repo}:{name}")
