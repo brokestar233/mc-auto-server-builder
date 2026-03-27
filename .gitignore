@@ -45,3 +45,4 @@ logs/
 tmp/
 *.log
 .autogen_traces/events.jsonl
+.worktrees/
