@@ -44,3 +44,4 @@ id_ed25519
 logs/
 tmp/
 *.log
+.autogen_traces/events.jsonl

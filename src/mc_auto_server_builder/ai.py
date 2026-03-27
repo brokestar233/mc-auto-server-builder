@@ -5,11 +5,18 @@ import re
 import time
 import traceback
 from dataclasses import asdict, fields, is_dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import requests
 
 from .models import AIAction, AIResult
+from .util import (
+    ExternalDataError,
+    ExternalRequestError,
+    ExternalResponseError,
+    ExternalServiceError,
+    configure_requests_session,
+)
 
 if TYPE_CHECKING:
     from .builder import ServerBuilder
@@ -49,15 +56,15 @@ class BuilderAIService:
         if isinstance(action, dict):
             return dict(action)
 
-        if is_dataclass(action):
+        if is_dataclass(action) and not isinstance(action, type):
             return asdict(action)
 
         if hasattr(action, "model_dump") and callable(getattr(action, "model_dump")):
-            dumped = action.model_dump()  # type: ignore[attr-defined]
+            dumped = cast(Any, action).model_dump()
             return dumped if isinstance(dumped, dict) else {"type": str(action)}
 
         if hasattr(action, "dict") and callable(getattr(action, "dict")):
-            dumped = action.dict()  # type: ignore[attr-defined]
+            dumped = cast(Any, action).dict()
             return dumped if isinstance(dumped, dict) else {"type": str(action)}
 
         if isinstance(action, AIAction):
@@ -172,6 +179,17 @@ class BuilderAIService:
             "move_bisect_mods",
             "switch_recognition_candidate",
         }
+        action_literal_map: dict[str, Literal[
+            "remove_mods",
+            "continue_after_restore_mods",
+            "adjust_memory",
+            "change_java",
+            "stop_and_report",
+            "report_manual_fix",
+            "bisect_mods",
+            "move_bisect_mods",
+            "switch_recognition_candidate",
+        ]] = {name: cast(Any, name) for name in allowed_action}
 
         final_output = data.get("final_output")
         final_output = final_output if isinstance(final_output, dict) else {}
@@ -188,7 +206,7 @@ class BuilderAIService:
 
         confidence_raw = _pick("confidence", 0.0)
         try:
-            confidence = float(confidence_raw)
+            confidence = float(cast(Any, confidence_raw))
         except (TypeError, ValueError):
             self._ai_debug(f"normalize.confidence.invalid value={confidence_raw!r}, fallback=0.0")
             confidence = 0.0
@@ -247,7 +265,7 @@ class BuilderAIService:
                 self._ai_debug(f"normalize.actions[{idx}].accept type={action_type!r}")
             except TypeError:
                 self._ai_debug(f"normalize.actions[{idx}].fallback reason=payload_mismatch type={action_type!r}")
-                action_models.append(AIAction(type=action_type))
+                action_models.append(AIAction(type=action_literal_map[action_type]))
 
         if not action_models:
             if suggested_manual_steps or evidence or user_summary:
@@ -316,7 +334,8 @@ class BuilderAIService:
         if not isinstance(choices, list) or not choices:
             return ""
         first = choices[0] if isinstance(choices[0], dict) else {}
-        message = first.get("message") if isinstance(first.get("message"), dict) else {}
+        message_obj = first.get("message")
+        message = message_obj if isinstance(message_obj, dict) else {}
         content = message.get("content")
         if isinstance(content, str):
             return content
@@ -357,7 +376,8 @@ class BuilderAIService:
             if not isinstance(choices, list) or not choices:
                 continue
             first = choices[0] if isinstance(choices[0], dict) else {}
-            delta = first.get("delta") if isinstance(first.get("delta"), dict) else {}
+            delta_obj = first.get("delta")
+            delta = delta_obj if isinstance(delta_obj, dict) else {}
             piece = delta.get("content")
             if isinstance(piece, str):
                 chunks.append(piece)
@@ -391,6 +411,37 @@ class BuilderAIService:
             return "AI 请求被拒绝(403)，请检查账号权限或网关策略"
         return f"AI HTTP错误({status_code}) body={self._truncate_debug_text(body_preview, 180)}"
 
+    def _raise_ai_request_error(self, provider: str, exc: requests.RequestException) -> None:
+        raise ExternalRequestError(f"AI 请求失败({provider}): {type(exc).__name__}:{exc}") from exc
+
+    def _raise_ai_http_error(self, provider: str, resp: requests.Response) -> None:
+        raise ExternalResponseError(
+            f"AI 服务返回非成功状态({provider}): {self._map_ai_http_error(resp.status_code, body_preview=resp.text)}"
+        )
+
+    def _is_retryable_ai_error(self, exc: Exception) -> bool:
+        if isinstance(exc, (requests.Timeout, requests.ConnectionError, ExternalRequestError)):
+            return True
+        if isinstance(exc, ExternalResponseError):
+            message = str(exc)
+            return "(429)" in message or "AI 服务端异常(" in message
+        return False
+
+    def _log_ai_retry(self, provider: str, attempt: int, max_attempts: int, retryable: bool, exc: Exception) -> None:
+        self._ai_debug(
+            f"{provider}.retry attempt={attempt}/{max_attempts} retryable={retryable} "
+            f"err={type(exc).__name__}:{exc}"
+        )
+
+    def _parse_json_body(self, provider: str, resp: requests.Response) -> dict:
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise ExternalDataError(f"AI 响应解析失败({provider}): invalid_json") from exc
+        if not isinstance(body, dict):
+            raise ExternalDataError(f"AI 响应解析失败({provider}): response_not_dict")
+        return body
+
     def _call_ollama_generate(self, prompt: str) -> str:
         payload = {"model": self.builder.config.ai.model, "prompt": prompt, "stream": False}
         timeout_sec = max(5, int(self.builder.config.ai.timeout_sec or 300))
@@ -399,12 +450,18 @@ class BuilderAIService:
         last_error: Exception | None = None
         for attempt in range(1, max_retries + 2):
             try:
-                resp = requests.post(self.builder.config.ai.endpoint, json=payload, timeout=timeout_sec)
+                try:
+                    with configure_requests_session(
+                        requests.Session(),
+                        proxies=self.builder.config.proxy.to_requests_proxies(),
+                        trust_env=self.builder.config.proxy.trust_env,
+                    ) as session:
+                        resp = session.post(self.builder.config.ai.endpoint, json=payload, timeout=timeout_sec)
+                except requests.RequestException as exc:
+                    self._raise_ai_request_error("ollama", exc)
                 if resp.status_code >= 400:
-                    raise RuntimeError(self._map_ai_http_error(resp.status_code, body_preview=resp.text))
-                body = resp.json()
-                if not isinstance(body, dict):
-                    raise ValueError("ollama_response_not_dict")
+                    self._raise_ai_http_error("ollama", resp)
+                body = self._parse_json_body("ollama", resp)
                 text = body.get("response", "")
                 if not isinstance(text, str):
                     text = str(text)
@@ -428,12 +485,10 @@ class BuilderAIService:
                     f"{json.dumps(self._truncate_debug_text(text, 1200), ensure_ascii=False)}"
                 )
                 return text
-            except Exception as e:
+            except (ExternalRequestError, ExternalResponseError, ExternalDataError) as e:
                 last_error = e
-                retryable = isinstance(e, (requests.Timeout, requests.ConnectionError))
-                if not retryable and isinstance(e, RuntimeError):
-                    retryable = "(429)" in str(e) or "AI 服务端异常(" in str(e)
-                self._ai_debug(f"ollama.retry attempt={attempt}/{max_retries + 1} retryable={retryable} err={type(e).__name__}:{e}")
+                retryable = self._is_retryable_ai_error(e)
+                self._log_ai_retry("ollama", attempt, max_retries + 1, retryable, e)
                 if (not retryable) or attempt >= max_retries + 1:
                     break
                 time.sleep(backoff * attempt)
@@ -467,9 +522,17 @@ class BuilderAIService:
         for attempt in range(1, max_retries + 2):
             try:
                 if stream:
-                    with requests.post(endpoint, headers=headers, json=payload, timeout=timeout_sec, stream=True) as resp:
+                    try:
+                        request_ctx = configure_requests_session(
+                            requests.Session(),
+                            proxies=self.builder.config.proxy.to_requests_proxies(),
+                            trust_env=self.builder.config.proxy.trust_env,
+                        ).post(endpoint, headers=headers, json=payload, timeout=timeout_sec, stream=True)
+                    except requests.RequestException as exc:
+                        self._raise_ai_request_error("openai_compatible", exc)
+                    with request_ctx as resp:
                         if resp.status_code >= 400:
-                            raise RuntimeError(self._map_ai_http_error(resp.status_code, body_preview=resp.text))
+                            self._raise_ai_http_error("openai_compatible", resp)
                         text = self._extract_openai_text_from_stream(resp)
                         self._ai_debug(
                             "openai.response.stream "
@@ -477,12 +540,18 @@ class BuilderAIService:
                             f"{json.dumps(self._truncate_debug_text(text, 1200), ensure_ascii=False)}"
                         )
                         return text
-                resp = requests.post(endpoint, headers=headers, json=payload, timeout=timeout_sec)
+                try:
+                    with configure_requests_session(
+                        requests.Session(),
+                        proxies=self.builder.config.proxy.to_requests_proxies(),
+                        trust_env=self.builder.config.proxy.trust_env,
+                    ) as session:
+                        resp = session.post(endpoint, headers=headers, json=payload, timeout=timeout_sec)
+                except requests.RequestException as exc:
+                    self._raise_ai_request_error("openai_compatible", exc)
                 if resp.status_code >= 400:
-                    raise RuntimeError(self._map_ai_http_error(resp.status_code, body_preview=resp.text))
-                body = resp.json()
-                if not isinstance(body, dict):
-                    raise ValueError("openai_response_not_dict")
+                    self._raise_ai_http_error("openai_compatible", resp)
+                body = self._parse_json_body("openai_compatible", resp)
                 text = self._extract_openai_text_from_non_stream(body)
                 self._ai_debug(
                     "openai.response "
@@ -490,12 +559,10 @@ class BuilderAIService:
                     f"{json.dumps(self._truncate_debug_text(text, 1200), ensure_ascii=False)}"
                 )
                 return text
-            except Exception as e:
+            except (ExternalRequestError, ExternalResponseError, ExternalDataError) as e:
                 last_error = e
-                retryable = isinstance(e, (requests.Timeout, requests.ConnectionError))
-                if not retryable and isinstance(e, RuntimeError):
-                    retryable = "(429)" in str(e) or "AI 服务端异常(" in str(e)
-                self._ai_debug(f"openai.retry attempt={attempt}/{max_retries + 1} retryable={retryable} err={type(e).__name__}:{e}")
+                retryable = self._is_retryable_ai_error(e)
+                self._log_ai_retry("openai", attempt, max_retries + 1, retryable, e)
                 if (not retryable) or attempt >= max_retries + 1:
                     break
                 time.sleep(backoff * attempt)
@@ -860,6 +927,13 @@ class BuilderAIService:
             self._ai_debug(f"response.parse success parsed={json.dumps(parsed, ensure_ascii=False)[:2000]}")
             self.builder.last_ai_payload = parsed
             result = self._normalize_ai_result(parsed)
+        except ExternalServiceError as e:
+            err = f"AI 分析失败: {type(e).__name__}:{e}"
+            self.builder.operations.append(f"analyze_with_ai_failed:{type(e).__name__}")
+            self.builder._log("install.ai", err, level="WARN")
+            self._ai_debug(f"request.exception detail={self._truncate_debug_text(traceback.format_exc(), 2000)}")
+            self.builder.last_ai_payload = {}
+            result = self._safe_ai_result(reason=err, confidence=0.05)
         except Exception as e:
             err = f"AI 分析失败: {type(e).__name__}:{e}"
             self.builder.operations.append(f"analyze_with_ai_failed:{type(e).__name__}")
@@ -941,6 +1015,8 @@ class BuilderAIService:
                 if not isinstance(parsed, dict):
                     raise ValueError("ai_remove_validation_invalid_json")
             result = self._normalize_ai_result(parsed)
+        except ExternalServiceError as e:
+            result = self._safe_ai_result(reason=f"AI 删除验证分析失败: {type(e).__name__}:{e}", confidence=0.05)
         except Exception as e:
             result = self._safe_ai_result(reason=f"AI 删除验证分析失败: {type(e).__name__}:{e}", confidence=0.05)
         return {

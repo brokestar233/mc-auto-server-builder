@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypedDict
 from zipfile import ZipFile
 
 from .models import (
@@ -100,7 +100,57 @@ def _infer_loader_from_text(text: str, default: LoaderType = "forge") -> LoaderT
         return "quilt"
     if best_loader == "forge" and matches["neoforge"] > matches["forge"]:
         return "neoforge"
-    return cast(LoaderType, best_loader)
+    if best_loader == "forge":
+        return "forge"
+    if best_loader == "fabric":
+        return "fabric"
+    if best_loader == "neoforge":
+        return "neoforge"
+    if best_loader == "quilt":
+        return "quilt"
+    return default
+
+
+def _normalize_loader_type(raw_loader: str | None, default: LoaderType = "unknown") -> LoaderType:
+    normalized = normalize_loader_name(raw_loader or "")
+    if normalized == "forge":
+        return "forge"
+    if normalized == "neoforge":
+        return "neoforge"
+    if normalized == "fabric":
+        return "fabric"
+    if normalized == "quilt":
+        return "quilt"
+    return default
+
+
+def _normalize_start_mode(raw_mode: str | None, default: StartMode = "unknown") -> StartMode:
+    normalized = (raw_mode or "").strip().lower()
+    if normalized == "jar":
+        return "jar"
+    if normalized == "args_file":
+        return "args_file"
+    if normalized == "script":
+        return "script"
+    if normalized == "unknown":
+        return "unknown"
+    return default
+
+
+class DetectionState(TypedDict, total=False):
+    loader_bucket: dict[str, list[DetectionEvidence]]
+    mc_bucket: dict[str, list[DetectionEvidence]]
+    loader_ver_bucket: dict[str, list[DetectionEvidence]]
+    build_bucket: dict[str, list[DetectionEvidence]]
+    start_bucket: dict[str, list[DetectionEvidence]]
+    evidence: list[DetectionEvidence]
+    warnings: list[str]
+    script_variables: dict[str, str]
+    phase_hits: list[str]
+    phase_details: dict[str, list[str]]
+    server_pack_hint_names: list[str]
+    additional_resource_urls: list[str]
+    pack_name: str
 
 
 def _make_evidence(
@@ -168,7 +218,7 @@ def _candidate_value(candidates: list[DetectionCandidate], default: str | None =
 def _candidate_loader(candidates: list[DetectionCandidate], default: LoaderType = "unknown") -> LoaderType:
     if not candidates:
         return default
-    return cast(LoaderType, normalize_loader_name(candidates[0].value))
+    return _normalize_loader_type(candidates[0].value, default)
 
 
 def _manifest_from_detection(
@@ -188,7 +238,7 @@ def _manifest_from_detection(
     mc_version = _candidate_value(mc_version_candidates, "unknown") or "unknown"
     loader_version = _candidate_value(loader_version_candidates)
     build = _candidate_value(build_candidates) or _extract_build_from_loader_version(loader, loader_version)
-    start_mode = cast(StartMode, _candidate_value(start_mode_candidates, "unknown") or "unknown")
+    start_mode = _normalize_start_mode(_candidate_value(start_mode_candidates, "unknown"), "unknown")
     top = [*loader_candidates[:1], *mc_version_candidates[:1], *start_mode_candidates[:1]]
     confidence = _normalize_confidence(sum(item.confidence for item in top) / len(top)) if top else 0.0
     return PackManifest(
@@ -442,7 +492,10 @@ def parse_pack_input(value: str) -> PackInput:
         if cf_project or cf_slug:
             file_match = CURSEFORGE_DOWNLOAD_RE.search(value) or CURSEFORGE_FILES_RE.search(value)
             file_id = file_match.group(1) if file_match else None
-            source = cf_project.group(1) if cf_project else cf_slug.group(1)
+            source_match = cf_project if cf_project is not None else cf_slug
+            if source_match is None:
+                raise ValueError("无法从 CurseForge URL 提取项目标识")
+            source = source_match.group(1)
             return PackInput(input_type="curseforge", source=source, file_id=file_id)
         mr_version = MODRINTH_VERSION_RE.search(value)
         if mr_version:
@@ -487,7 +540,7 @@ def parse_manifest_from_zip(zip_path: str | Path) -> PackManifest:
         return _detect_manifest_from_generic_zip(zf, names, zpath)
 
 
-def _new_detection_state() -> dict[str, object]:
+def _new_detection_state() -> DetectionState:
     return {
         "loader_bucket": {},
         "mc_bucket": {},
@@ -504,9 +557,9 @@ def _new_detection_state() -> dict[str, object]:
     }
 
 
-def _record_phase_hit(state: dict[str, object], phase: str, detail: str) -> None:
-    phase_hits = cast(list[str], state["phase_hits"])
-    phase_details = cast(dict[str, list[str]], state["phase_details"])
+def _record_phase_hit(state: DetectionState, phase: str, detail: str) -> None:
+    phase_hits = state["phase_hits"]
+    phase_details = state["phase_details"]
     if phase not in phase_hits:
         phase_hits.append(phase)
     phase_details.setdefault(phase, [])
@@ -514,13 +567,13 @@ def _record_phase_hit(state: dict[str, object], phase: str, detail: str) -> None
         phase_details[phase].append(detail)
 
 
-def _scan_explicit_metadata_phase(zf: ZipFile, top_names: list[str], state: dict[str, object]) -> None:
-    loader_bucket = cast(dict[str, list[DetectionEvidence]], state["loader_bucket"])
-    mc_bucket = cast(dict[str, list[DetectionEvidence]], state["mc_bucket"])
-    loader_ver_bucket = cast(dict[str, list[DetectionEvidence]], state["loader_ver_bucket"])
-    build_bucket = cast(dict[str, list[DetectionEvidence]], state["build_bucket"])
-    start_bucket = cast(dict[str, list[DetectionEvidence]], state["start_bucket"])
-    evidence = cast(list[DetectionEvidence], state["evidence"])
+def _scan_explicit_metadata_phase(zf: ZipFile, top_names: list[str], state: DetectionState) -> None:
+    loader_bucket = state["loader_bucket"]
+    mc_bucket = state["mc_bucket"]
+    loader_ver_bucket = state["loader_ver_bucket"]
+    build_bucket = state["build_bucket"]
+    start_bucket = state["start_bucket"]
+    evidence = state["evidence"]
     pack_name = str(state["pack_name"] or "")
 
     server_pack_hint_names = [
@@ -598,7 +651,7 @@ def _scan_explicit_metadata_phase(zf: ZipFile, top_names: list[str], state: dict
                             "ServerStarter install.modpackUrl 可作为二级资源线索",
                         )
                         evidence.append(item)
-                        additional_urls = cast(list[str], state.setdefault("additional_resource_urls", []))
+                        additional_urls = state.setdefault("additional_resource_urls", [])
                         if modpack_url not in additional_urls:
                             additional_urls.append(modpack_url)
                 if isinstance(launch, dict) and str(launch.get("javaArgs") or "").strip():
@@ -617,23 +670,23 @@ def _scan_explicit_metadata_phase(zf: ZipFile, top_names: list[str], state: dict
         if lower.endswith("variables.txt"):
             raw = zf.read(name).decode("utf-8", errors="ignore")
             variables = _parse_key_value_lines(raw)
-            mc_version = variables.get("minecraft_version")
-            loader = normalize_loader_name(variables.get("modloader", "unknown"))
-            loader_version = variables.get("modloader_version")
+            detected_mc_version = variables.get("minecraft_version")
+            loader = _normalize_loader_type(variables.get("modloader"))
+            detected_loader_version = variables.get("modloader_version")
             java_args = variables.get("java_args")
-            if mc_version:
-                item = _make_evidence("variables", "key_value", name, mc_version, 0.97, "variables.txt minecraft_version")
+            if detected_mc_version:
+                item = _make_evidence("variables", "key_value", name, detected_mc_version, 0.97, "variables.txt minecraft_version")
                 evidence.append(item)
-                _append_candidate(mc_bucket, mc_version, item)
+                _append_candidate(mc_bucket, detected_mc_version, item)
             if loader and loader != "unknown":
                 item = _make_evidence("variables", "key_value", name, loader, 0.97, "variables.txt modloader")
                 evidence.append(item)
                 _append_candidate(loader_bucket, loader, item)
-            if loader_version:
-                item = _make_evidence("variables", "key_value", name, loader_version, 0.95, "variables.txt modloader_version")
+            if detected_loader_version:
+                item = _make_evidence("variables", "key_value", name, detected_loader_version, 0.95, "variables.txt modloader_version")
                 evidence.append(item)
-                _append_candidate(loader_ver_bucket, loader_version, item)
-            build = _extract_build_from_loader_version(cast(LoaderType, loader), loader_version)
+                _append_candidate(loader_ver_bucket, detected_loader_version, item)
+            build = _extract_build_from_loader_version(loader, detected_loader_version)
             if build:
                 item = _make_evidence("variables", "derived_build", name, build, 0.85, "由 variables.txt loader_version 推导 build")
                 evidence.append(item)
@@ -654,14 +707,14 @@ def _detect_manifest_from_generic_zip(zf: ZipFile, names: set[str], zpath: Path)
     state["pack_name"] = zpath.stem
     _scan_explicit_metadata_phase(zf, top_names, state)
 
-    loader_bucket = cast(dict[str, list[DetectionEvidence]], state["loader_bucket"])
-    mc_bucket = cast(dict[str, list[DetectionEvidence]], state["mc_bucket"])
-    loader_ver_bucket = cast(dict[str, list[DetectionEvidence]], state["loader_ver_bucket"])
-    build_bucket = cast(dict[str, list[DetectionEvidence]], state["build_bucket"])
-    start_bucket = cast(dict[str, list[DetectionEvidence]], state["start_bucket"])
-    evidence = cast(list[DetectionEvidence], state["evidence"])
-    warnings = cast(list[str], state["warnings"])
-    script_variables = cast(dict[str, str], state["script_variables"])
+    loader_bucket = state["loader_bucket"]
+    mc_bucket = state["mc_bucket"]
+    loader_ver_bucket = state["loader_ver_bucket"]
+    build_bucket = state["build_bucket"]
+    start_bucket = state["start_bucket"]
+    evidence = state["evidence"]
+    warnings = state["warnings"]
+    script_variables = state["script_variables"]
 
     for name in top_names:
         lower = name.lower()
@@ -1020,8 +1073,8 @@ def _detect_manifest_from_generic_zip(zf: ZipFile, names: set[str], zpath: Path)
             "pack_type": "generic_detected",
             "archive_name": zpath.name,
             "scanned_entries": len(top_names),
-            "server_pack_hints": list(cast(list[str], state["server_pack_hint_names"])),
-            "additional_resource_urls": list(cast(list[str], state.get("additional_resource_urls", []))),
+            "server_pack_hints": list(state["server_pack_hint_names"]),
+            "additional_resource_urls": list(state.get("additional_resource_urls", [])),
             "script_variables": dict(sorted(script_variables.items())),
             "recognition_pipeline": [
                 "explicit_metadata",
@@ -1031,8 +1084,8 @@ def _detect_manifest_from_generic_zip(zf: ZipFile, names: set[str], zpath: Path)
                 "text_heuristic",
                 "runtime_feedback",
             ],
-            "recognition_phase_hits": list(cast(list[str], state["phase_hits"])),
-            "recognition_phase_details": dict(cast(dict[str, list[str]], state["phase_details"])),
+            "recognition_phase_hits": list(state["phase_hits"]),
+            "recognition_phase_details": dict(state["phase_details"]),
             "warnings": warnings,
         },
         loader_candidates=loader_candidates,
@@ -1063,7 +1116,7 @@ def _from_curseforge_manifest(data: dict) -> PackManifest:
     loaders = minecraft.get("modLoaders", [])
     loader_id = loaders[0].get("id", "unknown") if loaders else "unknown"
 
-    loader = cast(LoaderType, normalize_loader_name(loader_id))
+    loader = _normalize_loader_type(loader_id)
     loader_version = None
     if "-" in loader_id:
         loader_version = loader_id.split("-", 1)[1]
@@ -1084,6 +1137,7 @@ def _from_curseforge_manifest(data: dict) -> PackManifest:
         if loader_version
         else None
     )
+    build = _extract_build_from_loader_version(loader, loader_version)
     return _manifest_from_detection(
         pack_name=data.get("name", "curseforge-pack"),
         mc_version_candidates=[DetectionCandidate(value=str(version), confidence=1.0, evidence=[version_evidence], reason="manifest.json")],
@@ -1095,13 +1149,13 @@ def _from_curseforge_manifest(data: dict) -> PackManifest:
         else [],
         build_candidates=[
             DetectionCandidate(
-                value=_extract_build_from_loader_version(loader, loader_version),
+                value=build,
                 confidence=0.94,
                 evidence=[loader_version_evidence],
                 reason="由 manifest loader_version 推导 build",
             )
         ]
-        if loader_version and loader_version_evidence and _extract_build_from_loader_version(loader, loader_version)
+        if loader_version and loader_version_evidence and build
         else [],
         start_mode_candidates=[
             DetectionCandidate(
@@ -1125,7 +1179,7 @@ def _from_modrinth_manifest(data: dict) -> PackManifest:
 
     for key in ("neoforge", "forge", "fabric-loader", "quilt-loader"):
         if key in deps:
-            loader = cast(LoaderType, normalize_loader_name(key))
+            loader = _normalize_loader_type(key)
             loader_version = str(deps.get(key))
             break
 
@@ -1147,6 +1201,7 @@ def _from_modrinth_manifest(data: dict) -> PackManifest:
                 "manifest", "modrinth_index", "modrinth.index.json", str(loader_version), 0.98, "Modrinth dependencies loader_version"
             )
         )
+    build = _extract_build_from_loader_version(loader, loader_version)
     return _manifest_from_detection(
         pack_name=data.get("name", "modrinth-pack"),
         mc_version_candidates=[
@@ -1162,13 +1217,13 @@ def _from_modrinth_manifest(data: dict) -> PackManifest:
         else [],
         build_candidates=[
             DetectionCandidate(
-                value=_extract_build_from_loader_version(cast(LoaderType, loader), str(loader_version)),
+                value=build,
                 confidence=0.9,
                 evidence=[evidence[-1]],
                 reason="由 modrinth loader_version 推导 build",
             )
         ]
-        if loader_version and _extract_build_from_loader_version(cast(LoaderType, loader), str(loader_version))
+        if loader_version and build
         else [],
         start_mode_candidates=[
             DetectionCandidate(

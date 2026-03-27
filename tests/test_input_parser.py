@@ -36,6 +36,14 @@ def test_parse_pack_input_modrinth_version_url():
     assert result.file_id == "abc12345"
 
 
+def test_parse_pack_input_curseforge_slug_url_without_project_id():
+    result = parse_pack_input("https://www.curseforge.com/minecraft/modpacks/all-the-mods-9/files/1234567")
+
+    assert result.input_type == "curseforge"
+    assert result.source == "all-the-mods-9"
+    assert result.file_id == "1234567"
+
+
 def test_parse_manifest_from_zip_full_pack_uses_first_version_dir(tmp_path):
     zip_path = tmp_path / "full-pack.zip"
     with zipfile.ZipFile(zip_path, "w") as zf:
@@ -192,6 +200,30 @@ def test_parse_manifest_from_zip_supports_colon_style_variables_txt(tmp_path):
     assert manifest.start_mode == "script"
 
 
+def test_parse_manifest_from_zip_variables_unknown_loader_does_not_emit_build_candidate(tmp_path):
+    zip_path = tmp_path / "variables-unknown-loader.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr(
+            "variables.txt",
+            "\n".join(
+                [
+                    "minecraft_version=1.20.1",
+                    "modloader=vanilla",
+                    "modloader_version=1.20.1-47.2.0",
+                ]
+            ),
+        )
+        zf.writestr("start.sh", "java -jar fabric-server-launch.jar nogui")
+
+    manifest = parse_manifest_from_zip(zip_path)
+
+    assert manifest.mc_version == "1.20.1"
+    assert manifest.loader in {"fabric", "unknown"}
+    assert all(candidate.value for candidate in manifest.loader_candidates)
+    assert manifest.build is None
+    assert manifest.build_candidates == []
+
+
 def test_parse_manifest_from_zip_records_multistage_pipeline_details(tmp_path):
     zip_path = tmp_path / "pipeline-pack.zip"
     with zipfile.ZipFile(zip_path, "w") as zf:
@@ -250,6 +282,52 @@ def test_parse_manifest_from_zip_resolves_variable_based_start_script(tmp_path):
     assert manifest.build == "47.2.0"
     assert manifest.start_mode == "args_file"
     assert manifest.raw["script_variables"]["forge_path"] == "libraries/net/minecraftforge/forge/1.20.1-47.2.0/unix_args.txt"
+
+
+def test_parse_manifest_from_zip_resolves_nested_script_variables(tmp_path):
+    zip_path = tmp_path / "nested-variable-script-pack.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr(
+            "start.sh",
+            "\n".join(
+                [
+                    'MC_VERSION="1.20.1"',
+                    'FORGE_VERSION="${MC_VERSION}-47.2.0"',
+                    'FORGE_PATH="libraries/net/minecraftforge/forge/${FORGE_VERSION}/unix_args.txt"',
+                    'java @${FORGE_PATH} nogui',
+                ]
+            ),
+        )
+
+    manifest = parse_manifest_from_zip(zip_path)
+
+    assert manifest.loader == "forge"
+    assert manifest.mc_version == "1.20.1"
+    assert manifest.loader_version == "1.20.1-47.2.0"
+    assert manifest.build == "47.2.0"
+    assert manifest.start_mode == "args_file"
+
+
+def test_parse_manifest_from_zip_empty_variable_match_falls_back_to_default_start_mode(tmp_path):
+    zip_path = tmp_path / "empty-variable-script-pack.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr(
+            "start.sh",
+            "\n".join(
+                [
+                    'FORGE_PATH="${MISSING_VAR}"',
+                    'java @${FORGE_PATH} nogui',
+                ]
+            ),
+        )
+        zf.writestr("readme.txt", "Minecraft 1.20.1 server package")
+
+    manifest = parse_manifest_from_zip(zip_path)
+
+    assert manifest.mc_version == "1.20.1"
+    assert manifest.loader == "unknown"
+    assert manifest.start_mode == "script"
+    assert manifest.loader_candidates == []
 
 
 def test_parse_manifest_from_zip_marks_server_pack_hints(tmp_path):

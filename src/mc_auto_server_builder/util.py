@@ -14,6 +14,7 @@ import time
 import unicodedata
 import zipfile
 from collections import OrderedDict
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -24,12 +25,42 @@ from typing import Any, Callable, Iterable, TextIO
 import psutil
 import requests
 
+from .config import ProxyConfig
+
+# `requests` 的类型信息在部分环境下依赖额外桩包；当前项目的 [tool.mypy](pyproject.toml) 已通过
+# [ignore_missing_imports](pyproject.toml:58) 降噪，因此这里维持运行时导入，后续若要彻底收敛可在开发依赖补充
+# `types-requests` 而无需改动主逻辑。
+
 
 class UtilError(RuntimeError):
     pass
 
 
 class DownloadError(UtilError):
+    pass
+
+
+class ConfigReadError(UtilError):
+    pass
+
+
+class ExternalServiceError(UtilError):
+    pass
+
+
+class ExternalRequestError(ExternalServiceError):
+    pass
+
+
+class ExternalResponseError(ExternalServiceError):
+    pass
+
+
+class ExternalDataError(ExternalServiceError):
+    pass
+
+
+class DownloadTaskProcessingError(DownloadError):
     pass
 
 
@@ -71,6 +102,26 @@ class DownloadConfig:
     max_retries: int = 3
     retry_backoff_sec: float = 1.0
     chunk_size: int = 1024 * 256
+    proxies: dict[str, str] | None = None
+    trust_env: bool = True
+
+
+def configure_requests_session(
+    session: requests.Session,
+    proxy: ProxyConfig | None = None,
+    *,
+    proxies: Mapping[str, str] | None = None,
+    trust_env: bool | None = None,
+) -> requests.Session:
+    if proxy is not None:
+        session.proxies = proxy.to_requests_proxies() or {}
+        session.trust_env = proxy.trust_env
+        return session
+    if proxies is not None:
+        session.proxies = {str(key): str(value) for key, value in proxies.items() if str(value).strip()}
+    if trust_env is not None:
+        session.trust_env = trust_env
+    return session
 
 
 @dataclass(slots=True)
@@ -89,6 +140,32 @@ class DownloadTask:
 class DownloadFailure:
     task: DownloadTask
     error: str
+    category: str = ""
+    stage: str = ""
+    exc_type: str = ""
+    message: str = ""
+
+
+def _classify_download_failure(task: DownloadTask, exc: BaseException) -> DownloadFailure:
+    message = str(exc).strip()
+    category = "download"
+    if isinstance(exc, DownloadError):
+        if "hash_mismatch:" in message:
+            category = "hash_mismatch"
+        elif "缺少可用URL" in message:
+            category = "no_url"
+    elif isinstance(exc, (zipfile.BadZipFile, tarfile.TarError, ValueError)):
+        category = "extract"
+    elif isinstance(exc, OSError):
+        category = "filesystem"
+    return DownloadFailure(
+        task=task,
+        error=f"{type(exc).__name__}:{exc}",
+        category=category,
+        stage=task.stage,
+        exc_type=type(exc).__name__,
+        message=message,
+    )
 
 
 @dataclass(slots=True)
@@ -245,11 +322,26 @@ def http_get_json(
     headers: dict[str, str] | None = None,
     params: dict[str, Any] | None = None,
     timeout: float | tuple[float, float] = 60,
+    proxies: Mapping[str, str] | None = None,
+    trust_env: bool = True,
 ) -> Any:
-    """统一 GET + JSON 解析流程，保持 requests 原始异常语义。"""
-    resp = requests.get(url, headers=headers, params=params or None, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
+    """统一 GET + JSON 解析流程，并补充稳定的异常分类。"""
+    session = configure_requests_session(requests.Session(), proxies=proxies, trust_env=trust_env)
+    try:
+        resp = session.get(url, headers=headers, params=params or None, timeout=timeout)
+    except requests.RequestException as exc:
+        raise ExternalRequestError(f"请求失败: {url} ({type(exc).__name__})") from exc
+    finally:
+        session.close()
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        status = getattr(resp, "status_code", "unknown")
+        raise ExternalResponseError(f"请求返回非成功状态: {url} (HTTP {status})") from exc
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise ExternalDataError(f"响应不是合法 JSON: {url}") from exc
 
 
 def read_tail_text(path: Path, lines: int = 300) -> str:
@@ -996,6 +1088,7 @@ class Downloader:
         last_err: Exception | None = None
         for attempt in range(1, self.cfg.max_retries + 1):
             session = session_factory() if session_factory is not None else requests.Session()
+            configure_requests_session(session, proxies=self.cfg.proxies, trust_env=self.cfg.trust_env)
             try:
                 if not (self.logger and self.logger.is_download_ui_active()):
                     self._log(stage, f"开始下载: {url} -> {out}")
@@ -1021,7 +1114,7 @@ class Downloader:
                 if not (self.logger and self.logger.is_download_ui_active()):
                     self._log(stage, f"下载完成: {out.name} ({total} bytes)")
                 return out
-            except Exception as e:
+            except requests.RequestException as e:
                 last_err = e
                 self._log(
                     stage,
@@ -1031,10 +1124,15 @@ class Downloader:
                 safe_unlink(out)
                 if attempt < self.cfg.max_retries:
                     time.sleep(self.cfg.retry_backoff_sec * attempt)
+            except OSError as e:
+                last_err = e
+                self._log(stage, f"下载写入失败: {url} ({type(e).__name__})", level=LogLevel.ERROR)
+                safe_unlink(out)
+                break
             finally:
                 session.close()
 
-        raise DownloadError(f"下载失败: {url} ({type(last_err).__name__ if last_err else 'unknown'})")
+        raise DownloadError(f"下载失败: {url} ({type(last_err).__name__ if last_err else 'unknown'})") from last_err
 
     def download_task(self, task: DownloadTask) -> Path:
         if not task.urls:
@@ -1042,6 +1140,7 @@ class Downloader:
         task_id = str(task.task_id or str(task.out))
         if self.logger:
             self.logger.download_ui_task_started(task_id=task_id, task_label=task.out.name)
+        logger = self.logger
 
         last_err: Exception | None = None
         for url in task.urls:
@@ -1052,11 +1151,11 @@ class Downloader:
                     stage=task.stage,
                     headers=task.headers,
                     session_factory=task.session_factory,
-                    progress_cb=(lambda delta: self.logger.download_ui_task_progress(task_id=task_id, delta_bytes=delta))
-                    if self.logger
+                    progress_cb=(lambda delta: logger.download_ui_task_progress(task_id=task_id, delta_bytes=delta))
+                    if logger
                     else None,
-                    total_bytes_cb=(lambda total: self.logger.download_ui_task_total(task_id=task_id, total_bytes=total))
-                    if self.logger
+                    total_bytes_cb=(lambda total: logger.download_ui_task_total(task_id=task_id, total_bytes=total))
+                    if logger
                     else None,
                 )
                 if not verify_hashes(out, task.expected_hashes):
@@ -1067,8 +1166,9 @@ class Downloader:
                 if self.logger:
                     self.logger.download_ui_task_finished(task_id=task_id, success=True)
                 return out
-            except Exception as e:
+            except (DownloadError, OSError, zipfile.BadZipFile, tarfile.TarError, ValueError) as e:
                 last_err = e
+                self._log(task.stage, f"下载任务候选源失败: {url} ({type(e).__name__})", level=LogLevel.WARN)
                 safe_unlink(task.out)
                 continue
         if self.logger:
@@ -1099,8 +1199,8 @@ class Downloader:
                     task = future_map[fut]
                     try:
                         done.append(fut.result())
-                    except Exception as e:
-                        failed.append(DownloadFailure(task=task, error=f"{type(e).__name__}:{e}"))
+                    except DownloadError as e:
+                        failed.append(_classify_download_failure(task, e))
                         self._log(task.stage, f"下载失败: {task.out} ({type(e).__name__})", level=LogLevel.ERROR)
         finally:
             if self.logger:

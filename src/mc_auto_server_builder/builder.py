@@ -6,21 +6,54 @@ import platform
 import re
 import shutil
 import subprocess
+import tarfile
 import threading
 import time
 import traceback
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, fields
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Callable
+from typing import Any, Callable, Mapping, TypedDict, cast
 from urllib.parse import urlparse
 
 import psutil
 import requests
 
+from .action_executor import (
+    build_initial_execution_result,
+    build_previous_action_state,
+    execute_adjust_memory_action,
+    execute_change_java_action,
+    execute_continue_after_restore_mods_action,
+    execute_remove_mods_action,
+)
+from .action_preflight import (
+    BisectPreflightInput,
+    ContinueAfterRestoreModsState,
+    assess_adjust_memory,
+    assess_bisect_mods,
+    assess_change_java,
+    assess_continue_after_restore_mods,
+    assess_non_mutating_action,
+    assess_remove_mods,
+    assess_unknown_action,
+)
 from .ai import BuilderAIService
+from .bisect_runtime import (
+    build_bisect_feedback_payload,
+    build_bisect_move_records,
+    build_bisect_round_record,
+    derive_bisect_followups,
+    make_bisect_progress_token,
+    prepare_bisect_round_plan,
+    prepare_bisect_session_round_update,
+    store_pending_bisect_round_plan,
+    summarize_bisect_round_outcome,
+    update_bisect_session_after_round,
+    update_bisect_session_fields,
+)
 from .config import AppConfig
 from .defaults import (
     SUPPORTED_JAVA_VERSIONS,
@@ -40,23 +73,42 @@ from .models import (
     StartResult,
     WorkDirs,
 )
-from .recognition import (
-    RecognitionFallbackPlan,
-    choose_java_version,
-    choose_latest_lts_java_version,
-    infer_java_from_runtime_feedback,
-    top_candidate_values,
+from .recognition import RecognitionFallbackPlan, choose_java_version, choose_latest_lts_java_version
+from .recognition_runtime import (
+    build_ai_context,
+    build_recognition_candidates,
+    preflight_recognition_plan,
+    recognition_confidence_level,
+    recognition_runtime_feedback,
+    select_next_recognition_plan,
+)
+from .reporting import (
+    append_attempt_trace,
+    attempt_trace_path,
+    build_meta_payload,
+    build_recognition_summary,
+    generate_report,
+    package_server,
+    serialize_detection_candidates,
+    summarize_ai_context,
+    summarize_remote_failure_events,
 )
 from .rule_db import RuleDB
 from .util import (
     ColorPolicy,
     DownloadConfig,
     Downloader,
+    DownloadError,
     DownloadFailure,
     DownloadTask,
+    ExternalDataError,
+    ExternalRequestError,
+    ExternalResponseError,
+    ExternalServiceError,
     StructuredLogger,
     adoptium_platform_triplet,
     backup_directory,
+    configure_requests_session,
     extract_archive,
     extract_archive_payload_into,
     extract_start_command_from_line,
@@ -82,6 +134,308 @@ from .util import (
 from .workspace import create_workdirs
 
 AI_REMOVE_MODS_SAFE_LIMIT = 3
+
+
+class PreviousActionState(TypedDict):
+    jvm_xmx: str
+    jvm_xms: str
+    extra_jvm_flags: list[str]
+    current_java_version: int
+    current_java_bin: str
+
+
+class RollbackResult(TypedDict, total=False):
+    action_type: str
+    snapshot_tag: str
+    performed: bool
+    error: str
+
+
+class ActionExecutionResult(TypedDict, total=False):
+    index: int
+    action_type: str
+    status: str
+    snapshot_tag: str
+    risk: str
+    resolved_targets: list[str]
+    rollback_on_failure: bool
+    forced_targets: list[str]
+    forced_rationale: list[str]
+    matched_dependency_chains: list[object]
+    validation_start_performed: bool
+    validation_success: bool
+    validation_success_source: object
+    validation_problem_changed: bool
+    rollback_reason: str
+    validation_failure_excerpt: list[str]
+    restored_snapshot_tag: str
+    restored_active_mods: list[str]
+    restored_targets: list[str]
+    xmx: str
+    xms: str
+    version: int
+    stop_reason: str
+    manual_steps: list[str]
+    evidence: list[str]
+    reason: str
+    error: str
+
+
+class CurseForgeFilePayload(TypedDict, total=False):
+    id: int
+    modId: int
+    fileName: str
+    downloadUrl: str | None
+
+
+class PreparedBisectSessionRoundUpdate(TypedDict):
+    session: BisectSession
+    source_mods: list[str]
+    final_suspects: list[str]
+    round_record: BisectRoundRecord
+    feedback: dict[str, object]
+    pending_group: list[str]
+    continuation_targets: list[str]
+    next_allowed_requests: list[str]
+    completed_requests: list[str]
+    fallback_targets: list[str]
+    suspects_invalidated: bool
+    progress_token: str
+    stagnant_rounds: int
+
+
+class CurseForgeManifestEntry(TypedDict):
+    projectID: object
+    fileID: object
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteFailureDetail:
+    stage: str
+    category: str
+    exc_type: str = ""
+    message: str = ""
+
+    def operation_token(self) -> str:
+        parts = [self.stage, self.category]
+        if self.exc_type:
+            parts.append(self.exc_type)
+        return ":".join(parts)
+
+    def log_message(self, label: str) -> str:
+        detail = f"{label} 失败，阶段={self.stage}，分类={self.category}"
+        if self.exc_type:
+            detail += f"，异常={self.exc_type}"
+        if self.message:
+            detail += f"，原因={self.message}"
+        return detail
+
+    def to_event_payload(self) -> dict[str, str]:
+        return {
+            "stage": self.stage,
+            "category": self.category,
+            "exc_type": self.exc_type,
+            "message": self.message,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CurseForgeManifestPairResolution:
+    pair: tuple[int, int]
+    data: CurseForgeFilePayload | None
+
+
+@dataclass(frozen=True, slots=True)
+class CurseForgeBatchResolution:
+    resolved: dict[tuple[int, int], CurseForgeFilePayload]
+    unresolved: list[tuple[int, int]]
+
+
+@dataclass(slots=True)
+class RemoveValidationStatePayload:
+    triggered: bool = False
+    continue_allowed: bool = False
+    continued: bool = False
+    rollback_snapshot_tag: str = ""
+    action_index: int = 0
+    removed_targets: list[str] | None = None
+    forced_targets: list[str] | None = None
+    post_remove_active_mods: list[str] | None = None
+    previous_crash_reports: list[str] | None = None
+    validation_crash_reports: list[str] | None = None
+    crash_report_delta: list[str] | None = None
+    previous_excerpt: str = ""
+    validation_excerpt: str = ""
+    failure_signals: list[str] | None = None
+    readiness_evidence: list[str] | None = None
+    problem_changed: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        payload = asdict(self)
+        for key in (
+            "removed_targets",
+            "forced_targets",
+            "post_remove_active_mods",
+            "previous_crash_reports",
+            "validation_crash_reports",
+            "crash_report_delta",
+            "failure_signals",
+            "readiness_evidence",
+        ):
+            payload[key] = list(payload.get(key) or [])
+        return payload
+
+    @classmethod
+    def from_mapping(cls, state: object) -> "RemoveValidationStatePayload":
+        raw = cast(dict[str, object], state if isinstance(state, dict) else {})
+        action_index_raw = raw.get("action_index")
+        return cls(
+            triggered=bool(raw.get("triggered", False)),
+            continue_allowed=bool(raw.get("continue_allowed", False)),
+            continued=bool(raw.get("continued", False)),
+            rollback_snapshot_tag=str(raw.get("rollback_snapshot_tag") or "").strip(),
+            action_index=int(action_index_raw) if isinstance(action_index_raw, (int, str)) else 0,
+            removed_targets=_normalize_object_list(raw.get("removed_targets")),
+            forced_targets=_normalize_object_list(raw.get("forced_targets")),
+            post_remove_active_mods=_normalize_object_list(raw.get("post_remove_active_mods")),
+            previous_crash_reports=_normalize_object_list(raw.get("previous_crash_reports")),
+            validation_crash_reports=_normalize_object_list(raw.get("validation_crash_reports")),
+            crash_report_delta=_normalize_object_list(raw.get("crash_report_delta")),
+            previous_excerpt=str(raw.get("previous_excerpt") or ""),
+            validation_excerpt=str(raw.get("validation_excerpt") or ""),
+            failure_signals=_normalize_object_list(raw.get("failure_signals")),
+            readiness_evidence=_normalize_object_list(raw.get("readiness_evidence")),
+            problem_changed=bool(raw.get("problem_changed", False)),
+        )
+
+
+def _normalize_start_server_result(payload: object) -> dict[str, object]:
+    raw = cast(dict[str, object], payload if isinstance(payload, dict) else {})
+    return {
+        "success": bool(raw.get("success", False)),
+        "success_source": raw.get("success_source"),
+        "reason": str(raw.get("reason") or ""),
+        "stdout": str(raw.get("stdout") or ""),
+        "stderr": str(raw.get("stderr") or ""),
+        "stderr_tail": str(raw.get("stderr_tail") or ""),
+        "crash_reports_snapshot": _normalize_object_list(raw.get("crash_reports_snapshot")),
+        "crash_reports_new": _normalize_object_list(raw.get("crash_reports_new")),
+        "failure_signals": _normalize_object_list(raw.get("failure_signals")),
+        "readiness_evidence": _normalize_object_list(raw.get("readiness_evidence")),
+    }
+
+
+def _normalize_curseforge_file_payload(payload: object) -> CurseForgeFilePayload | None:
+    if not isinstance(payload, dict) or not payload:
+        return None
+
+    normalized: dict[str, object] = {}
+    file_id = payload.get("id")
+    mod_id = payload.get("modId")
+    file_name = payload.get("fileName")
+    download_url = payload.get("downloadUrl")
+
+    if isinstance(file_id, int):
+        normalized["id"] = file_id
+    if isinstance(mod_id, int):
+        normalized["modId"] = mod_id
+    if isinstance(file_name, str) and file_name:
+        normalized["fileName"] = file_name
+    if download_url is None or isinstance(download_url, str):
+        normalized["downloadUrl"] = download_url
+
+    for key, value in payload.items():
+        if key not in normalized:
+            normalized[key] = value
+
+    return cast(CurseForgeFilePayload, normalized)
+
+
+def _normalize_curseforge_manifest_entry(payload: object) -> CurseForgeManifestEntry | None:
+    if not isinstance(payload, dict):
+        return None
+    if "projectID" not in payload or "fileID" not in payload:
+        return None
+    return {
+        "projectID": payload.get("projectID"),
+        "fileID": payload.get("fileID"),
+    }
+
+
+def _normalize_object_list(values: object) -> list[str]:
+    normalized: list[str] = []
+    for value in cast(list[object], values or []):
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            normalized.append(text)
+    return normalized
+
+
+def _object_to_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            try:
+                return int(text)
+            except ValueError:
+                return default
+    return default
+
+
+def _object_to_str_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [text for item in value if (text := str(item).strip())]
+
+
+def _object_to_dict(value: object) -> dict[str, object]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _build_remote_failure_detail(
+    stage: str,
+    exc: BaseException | None = None,
+    *,
+    category: str | None = None,
+    message: str = "",
+) -> RemoteFailureDetail:
+    if category is None:
+        if isinstance(exc, ExternalRequestError):
+            category = "request"
+        elif isinstance(exc, ExternalResponseError):
+            category = "response"
+        elif isinstance(exc, ExternalDataError):
+            category = "data"
+        elif isinstance(exc, DownloadError):
+            category = "download"
+        elif isinstance(exc, (zipfile.BadZipFile, tarfile.TarError, ValueError)):
+            category = "extract"
+        elif isinstance(exc, (FileNotFoundError, OSError)):
+            category = "filesystem"
+        else:
+            category = "unknown"
+    exc_type = type(exc).__name__ if exc is not None else ""
+    text = message.strip() if message.strip() else (str(exc).strip() if exc is not None else "")
+    return RemoteFailureDetail(stage=stage, category=category, exc_type=exc_type, message=text)
+
+
+def _build_download_failure_detail(item: DownloadFailure) -> RemoteFailureDetail:
+    category = str(getattr(item, "category", "") or "download").strip() or "download"
+    stage = str(getattr(item, "stage", "") or item.task.stage or "download_task").strip()
+    exc_type = str(getattr(item, "exc_type", "") or "").strip()
+    message = str(getattr(item, "message", "") or getattr(item, "error", "") or "").strip()
+    if not exc_type and ":" in message:
+        exc_type, _, remainder = message.partition(":")
+        exc_type = exc_type.strip()
+        if remainder.strip():
+            message = remainder.strip()
+    return RemoteFailureDetail(stage=stage, category=category, exc_type=exc_type, message=message)
 
 
 class ServerBuilder:
@@ -112,6 +466,7 @@ class ServerBuilder:
             )
         )
         self.operations: list[str] = []
+        self.remote_failure_events: list[dict[str, object]] = []
         self.removed_mods: list[str] = []
         self.bisect_removed_mods: list[str] = []
         self.known_deleted_client_mods: set[str] = set()
@@ -155,8 +510,23 @@ class ServerBuilder:
                 max_retries=self.config.download.max_retries,
                 retry_backoff_sec=self.config.download.retry_backoff_sec,
                 chunk_size=self.config.download.chunk_size,
+                proxies=self.config.proxy.to_requests_proxies(),
+                trust_env=self.config.proxy.trust_env,
             ),
             logger=self.logger,
+        )
+
+    def _request_proxies(self) -> dict[str, str] | None:
+        return self.config.proxy.to_requests_proxies()
+
+    def _request_trust_env(self) -> bool:
+        return self.config.proxy.trust_env
+
+    def _create_request_session(self) -> requests.Session:
+        return configure_requests_session(
+            requests.Session(),
+            proxies=self._request_proxies(),
+            trust_env=self._request_trust_env(),
         )
 
     def _log(self, stage: str, message: str, level: str = "INFO") -> None:
@@ -241,7 +611,7 @@ class ServerBuilder:
                 pick = lower_map[val.lower()]
             else:
                 t = self._normalize_mod_token(val)
-                pick = token_map.get(t)
+                pick = token_map.get(t) or ""
                 if not pick and t:
                     for tk, mod_name in token_map.items():
                         if t in tk or tk in t:
@@ -434,30 +804,24 @@ class ServerBuilder:
         fallback_targets: list[str],
         suspects_invalidated: bool,
     ) -> dict[str, object]:
-        return {
-            "already_bisected": True,
-            "requested_targets": list(suspects),
-            "bisect_mode": bisect_mode,
-            "tested_side": tested_side,
-            "split_strategy": "stable_sorted_halves",
-            "keep_group": list(keep_group),
-            "test_group": list(test_group),
-            "moved_mods": list(moved_mods),
-            "result": round_result,
-            "startup_success": startup_success,
-            "failure_kind": failure_kind,
-            "failure_detail": failure_detail,
-            "reason": reason,
-            "pending_group": list(pending_group),
-            "continuation_targets": list(continuation_targets),
-            "next_allowed_requests": list(next_allowed_requests),
-            "fallback_targets": list(fallback_targets),
-            "suspects_invalidated": bool(suspects_invalidated),
-            "grouping_explanation": (
-                f"系统先按文件名稳定排序，再平分为 keep_group({len(keep_group)}) 和 test_group({len(test_group)})；"
-                f"本轮实际验证侧={tested_side}。"
-            ),
-        }
+        return build_bisect_feedback_payload(
+            suspects=suspects,
+            bisect_mode=bisect_mode,
+            tested_side=tested_side,
+            keep_group=keep_group,
+            test_group=test_group,
+            moved_mods=moved_mods,
+            round_result=round_result,
+            startup_success=startup_success,
+            failure_kind=failure_kind,
+            failure_detail=failure_detail,
+            reason=reason,
+            pending_group=pending_group,
+            continuation_targets=continuation_targets,
+            next_allowed_requests=next_allowed_requests,
+            fallback_targets=fallback_targets,
+            suspects_invalidated=suspects_invalidated,
+        )
 
     def _make_bisect_progress_token(
         self,
@@ -469,15 +833,14 @@ class ServerBuilder:
         final_suspects: list[str],
         next_allowed_requests: list[str],
     ) -> str:
-        payload = {
-            "suspects": list(suspects),
-            "bisect_mode": bisect_mode,
-            "tested_side": tested_side,
-            "round_result": round_result,
-            "final_suspects": list(final_suspects),
-            "next_allowed_requests": list(next_allowed_requests),
-        }
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return make_bisect_progress_token(
+            suspects=suspects,
+            bisect_mode=bisect_mode,
+            tested_side=tested_side,
+            round_result=round_result,
+            final_suspects=final_suspects,
+            next_allowed_requests=next_allowed_requests,
+        )
 
     def _log_bisect_event(self, stage: str, payload: dict[str, object]) -> None:
         self._log(stage, json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -523,7 +886,9 @@ class ServerBuilder:
             "suspects_invalidated": bool(payload.get("suspects_invalidated", False)),
             "notes": list(payload.get("notes") or []),
         }
-        return BisectRoundRecord(**{key: value for key, value in normalized_payload.items() if key in allowed_fields})
+        return BisectRoundRecord(
+            **cast(dict[str, Any], {key: value for key, value in normalized_payload.items() if key in allowed_fields})
+        )
 
     def _coerce_bisect_session(self, session: object | None = None) -> BisectSession:
         source = session if session is not None else getattr(self, "bisect_session", BisectSession())
@@ -568,7 +933,7 @@ class ServerBuilder:
             "success_guard_history": list(payload.get("success_guard_history") or []),
             "consecutive_same_issue_on_success": int(payload.get("consecutive_same_issue_on_success", 0) or 0),
         }
-        return BisectSession(**{key: value for key, value in normalized_payload.items() if key in allowed_fields})
+        return BisectSession(**cast(dict[str, Any], {key: value for key, value in normalized_payload.items() if key in allowed_fields}))
 
     def _format_bisect_tree_lines(self) -> list[str]:
         session = self._coerce_bisect_session()
@@ -641,19 +1006,17 @@ class ServerBuilder:
     def _mark_bisect_success_ready(self, reason: str) -> None:
         session = self._coerce_bisect_session()
         history = [*list(getattr(session, "success_guard_history", []) or []), str(reason or "ready")][-8:]
-        self.bisect_session = BisectSession(
-            **{
-                **asdict(session),
-                "active": False,
-                "success_ready": True,
-                "success_guard_reason": str(reason or "ready"),
-                "success_guard_history": history,
-                "pending_group": [],
-                "continuation_targets": [],
-                "next_allowed_requests": [],
-                "fallback_targets": [],
-                "suspects_invalidated": False,
-            }
+        self.bisect_session = update_bisect_session_fields(
+            session,
+            active=False,
+            success_ready=True,
+            success_guard_reason=str(reason or "ready"),
+            success_guard_history=history,
+            pending_group=[],
+            continuation_targets=[],
+            next_allowed_requests=[],
+            fallback_targets=[],
+            suspects_invalidated=False,
         )
 
     def _record_success_guard_observation(self, issue: str, confidence: object) -> int:
@@ -667,13 +1030,11 @@ class ServerBuilder:
             count += 1
         else:
             count = 0
-        self.bisect_session = BisectSession(
-            **{
-                **asdict(session),
-                "success_guard_history": history,
-                "consecutive_same_issue_on_success": count,
-                "success_guard_reason": marker,
-            }
+        self.bisect_session = update_bisect_session_fields(
+            session,
+            success_guard_history=history,
+            consecutive_same_issue_on_success=count,
+            success_guard_reason=marker,
         )
         return count
 
@@ -707,61 +1068,7 @@ class ServerBuilder:
         }
 
     def _build_ai_context(self, start_res: dict[str, object], log_info: dict[str, object]) -> dict[str, object]:
-        session = self._coerce_bisect_session()
-        manifest = self.manifest
-        recognition_summary = self._build_recognition_summary() if manifest else {}
-        rollback_state = dict(getattr(self, "last_rollback_remove_mods", {}) or {})
-        remove_validation_state = dict(getattr(self, "remove_validation_state", {}) or {})
-        current_crash_reports = [str(x) for x in (start_res.get("crash_reports_snapshot") or []) if str(x).strip()]
-        last_crash_reports = [str(x) for x in (rollback_state.get("crash_reports_after_validation") or []) if str(x).strip()]
-        crash_report_delta = sorted(set(current_crash_reports).symmetric_difference(set(last_crash_reports)))
-        crash_reports_changed = bool(rollback_state.get("triggered")) and bool(crash_report_delta)
-        if rollback_state:
-            rollback_state["crash_reports_changed_since_last_context"] = crash_reports_changed
-            self.last_rollback_remove_mods = rollback_state
-        return {
-            "mc_version": manifest.mc_version if manifest else "unknown",
-            "loader": manifest.loader if manifest else "unknown",
-            "loader_version": getattr(manifest, "loader_version", None) if manifest else None,
-            "build": getattr(manifest, "build", None) if manifest else None,
-            "start_mode": getattr(manifest, "start_mode", "unknown") if manifest else "unknown",
-            "recognition_summary": recognition_summary,
-            "jvm_args": f"Xmx={self.jvm_xmx} Xms={self.jvm_xms}",
-            "available_ram": self.get_system_memory(),
-            "mod_count": len(self.list_mods()),
-            "current_installed_mods": self.list_mods(),
-            "current_installed_client_mods": self.list_current_installed_client_mods(),
-            "known_deleted_client_mods": sorted(self.known_deleted_client_mods),
-            "deleted_mod_evidence": self.deleted_mod_evidence,
-            "dependency_cleanup_rule_enabled": True,
-            "recent_actions": self.operations[-20:],
-            "last_rollback_remove_mods": rollback_state,
-            "remove_validation_state": remove_validation_state,
-            "crash_reports_changed_since_last_rollback_remove": crash_reports_changed,
-            "last_crash_reports": last_crash_reports,
-            "current_crash_reports": current_crash_reports,
-            "crash_report_delta": crash_report_delta,
-            "last_crash_excerpt": str(rollback_state.get("validation_crash_excerpt") or ""),
-            "bisect_active": bool(getattr(session, "active", False)),
-            "bisect_next_allowed_requests": list(getattr(session, "next_allowed_requests", []) or []),
-            "bisect_feedback": dict(getattr(self, "last_bisect_feedback", {}) or {}),
-            "bisect_fallback_targets": list(getattr(session, "fallback_targets", []) or []),
-            "bisect_suspects_invalidated": bool(getattr(session, "suspects_invalidated", False)),
-            "bisect_phase": str(getattr(session, "phase", "initial") or "initial"),
-            "bisect_stagnant_rounds": int(getattr(session, "stagnant_rounds", 0) or 0),
-            "bisect_last_preflight_block_reason": str(getattr(session, "last_preflight_block_reason", "") or ""),
-            "bisect_last_preflight_block_details": list(getattr(session, "last_preflight_block_details", []) or []),
-            "bisect_success_ready": bool(getattr(session, "success_ready", False)),
-            "bisect_success_guard_reason": str(getattr(session, "success_guard_reason", "") or ""),
-            "bisect_success_guard_history": list(getattr(session, "success_guard_history", []) or []),
-            "bisect_consecutive_same_issue_on_success": int(getattr(session, "consecutive_same_issue_on_success", 0) or 0),
-            "done_detected": bool(start_res.get("done_detected", False)),
-            "command_probe_detected": bool(start_res.get("command_probe_detected", False)),
-            "port_open_detected": bool(start_res.get("port_open_detected", False)),
-            "stdout_tail": str(start_res.get("stdout_tail") or ""),
-            "stderr_tail": str(start_res.get("stderr_tail") or ""),
-            **log_info,
-        }
+        return build_ai_context(self, start_res, log_info)
 
     def _consume_bisect_targets(self, action: dict) -> tuple[str, list[str]]:
         bisect_mode = str(action.get("bisect_mode") or "initial").strip() or "initial"
@@ -795,34 +1102,17 @@ class ServerBuilder:
         suspects: list[str],
         source_mods: list[str],
     ) -> tuple[list[str], list[str], list[str], list[str], list[str], bool]:
-        pending_group: list[str] = []
-        continuation_targets: list[str] = []
-        next_allowed_requests: list[str] = []
-        final_suspects: list[str] = []
-        fallback_targets: list[str] = []
-        suspects_invalidated = False
-        other_group = list(test_group if tested_side == "keep" else keep_group)
-        tested_group_actual = list(active_after_setup)
-
-        if round_result == "pass":
-            final_suspects = list(other_group)
-            if bisect_mode == "initial" and tested_side == "keep" and set(suspects) != set(source_mods):
-                fallback_targets = list(source_mods)
-                next_allowed_requests.append("initial")
-                suspects_invalidated = True
-                final_suspects = list(source_mods)
-            elif other_group and bisect_mode in {"initial", "continue_failed_group"}:
-                pending_group = list(other_group)
-                next_allowed_requests.append("switch_group")
-        else:
-            final_suspects = list(tested_group_actual)
-            if len(tested_group_actual) > 1:
-                continuation_targets = list(tested_group_actual)
-                next_allowed_requests.append("continue_failed_group")
-            if failure_kind == "dependency_failure":
-                next_allowed_requests.append("dependency_move_exception")
-
-        return final_suspects, pending_group, continuation_targets, next_allowed_requests, fallback_targets, suspects_invalidated
+        return derive_bisect_followups(
+            bisect_mode=bisect_mode,
+            tested_side=tested_side,
+            round_result=round_result,
+            failure_kind=failure_kind,
+            keep_group=keep_group,
+            test_group=test_group,
+            active_after_setup=active_after_setup,
+            suspects=suspects,
+            source_mods=source_mods,
+        )
 
     def _set_active_mods(self, active_mods: list[str], snapshot_tag: str, reason: str) -> list[str]:
         self.rollback_mods(snapshot_tag)
@@ -835,7 +1125,7 @@ class ServerBuilder:
         return resolved_active
 
     def _build_bisect_move_records(self, moved_mods: list[str], from_group: str, to_group: str, reason: str) -> list[BisectMoveRecord]:
-        return [BisectMoveRecord(mod_name=mod_name, from_group=from_group, to_group=to_group, reason=reason) for mod_name in moved_mods]
+        return build_bisect_move_records(moved_mods, from_group=from_group, to_group=to_group, reason=reason)
 
     def _prepare_bisect_round_plan(self, idx: int, action: dict, snapshot_tag: str) -> tuple[dict[str, object], dict[str, object]]:
         bisect_mode, suspects = self._consume_bisect_targets(action)
@@ -846,34 +1136,17 @@ class ServerBuilder:
             if fallback_seed:
                 source_mods = self._resolve_mod_names_to_installed(fallback_seed)
         keep_group, test_group = self._split_mods_for_bisect(suspects)
-        tested_side = "test" if bisect_mode == "switch_group" else "keep"
-        active_group = list(test_group if tested_side == "test" else keep_group)
-        plan = {
-            "index": idx,
-            "snapshot_tag": snapshot_tag,
-            "bisect_mode": bisect_mode,
-            "suspects": list(suspects),
-            "source_mods": list(source_mods),
-            "keep_group": list(keep_group),
-            "test_group": list(test_group),
-            "tested_side": tested_side,
-            "active_group": list(active_group),
-            "moved_mods": [],
-            "notes": [],
-            "bisect_reason": str(action.get("bisect_reason") or action.get("reason") or "").strip(),
-            "round_index": max(1, len(session.rounds) + 1),
-        }
-        execution = {
-            "index": idx,
-            "action_type": "bisect_mods",
-            "status": "prepared",
-            "snapshot_tag": snapshot_tag,
-            "bisect_mode": bisect_mode,
-            "tested_side": tested_side,
-            "keep_group": keep_group,
-            "test_group": test_group,
-            "suspects": suspects,
-        }
+        plan, execution = prepare_bisect_round_plan(
+            idx=idx,
+            snapshot_tag=snapshot_tag,
+            action=action,
+            bisect_mode=bisect_mode,
+            suspects=suspects,
+            session=session,
+            source_mods=source_mods,
+            keep_group=keep_group,
+            test_group=test_group,
+        )
         self._log_bisect_event(
             "install.bisect.start",
             {"round_index": plan["round_index"], "bisect_mode": bisect_mode, "suspects": suspects, "snapshot_tag": snapshot_tag},
@@ -883,20 +1156,20 @@ class ServerBuilder:
 
     def _store_pending_bisect_round_plan(self, plan: dict[str, object]) -> None:
         session = self._coerce_bisect_session()
-        self.bisect_session = BisectSession(**{**asdict(session), "pending_round_plan": dict(plan)})
+        self.bisect_session = store_pending_bisect_round_plan(session, plan)
 
     def _execute_pending_bisect_round(self, plan: dict[str, object]) -> tuple[bool, dict[str, object], dict[str, object] | None]:
-        idx = int(plan.get("index") or 0)
+        idx = _object_to_int(plan.get("index"), 0)
         snapshot_tag = str(plan.get("snapshot_tag") or "")
         bisect_mode = str(plan.get("bisect_mode") or "initial")
         tested_side = str(plan.get("tested_side") or "keep")
-        keep_group = list(plan.get("keep_group") or [])
-        test_group = list(plan.get("test_group") or [])
-        suspects = list(plan.get("suspects") or [])
-        source_mods = list(plan.get("source_mods") or self.list_mods())
-        active_group = list(plan.get("active_group") or [])
-        moved_mods = list(plan.get("moved_mods") or [])
-        notes = list(plan.get("notes") or [])
+        keep_group = _object_to_str_list(plan.get("keep_group"))
+        test_group = _object_to_str_list(plan.get("test_group"))
+        suspects = _object_to_str_list(plan.get("suspects"))
+        source_mods = _object_to_str_list(plan.get("source_mods")) or self.list_mods()
+        active_group = _object_to_str_list(plan.get("active_group"))
+        moved_mods = _object_to_str_list(plan.get("moved_mods"))
+        notes = _object_to_str_list(plan.get("notes"))
         bisect_reason = str(plan.get("bisect_reason") or "")
         session = self._coerce_bisect_session()
 
@@ -918,28 +1191,25 @@ class ServerBuilder:
                 source_mods=source_mods,
             )
         )
-        move_records = self._build_bisect_move_records(
-            moved_mods, from_group="test" if tested_side == "keep" else "keep", to_group=tested_side, reason="startup_dependency_probe"
-        )
-        round_record = BisectRoundRecord(
-            round_index=int(plan.get("round_index") or max(1, len(session.rounds) + 1)),
-            requested_targets=list(suspects),
+        round_record = build_bisect_round_record(
+            session=session,
+            plan={**plan, "bisect_reason": bisect_reason},
+            suspects=suspects,
             bisect_mode=bisect_mode,
             tested_side=tested_side,
-            kept_group=list(keep_group),
-            tested_group=list(test_group),
-            moved_mods=move_records,
-            result=round_result,
-            trigger_reason=bisect_reason,
-            startup_success=bool(start_res.get("success")),
-            failure_kind="" if round_result == "pass" else failure_kind,
-            failure_detail="" if round_result == "pass" else failure_detail,
-            continuation_targets=list(continuation_targets),
-            pending_other_group=list(pending_group),
-            next_allowed_requests=list(next_allowed_requests),
-            fallback_targets=list(fallback_targets),
+            keep_group=keep_group,
+            test_group=test_group,
+            moved_mods=moved_mods,
+            round_result=round_result,
+            start_res=start_res,
+            failure_kind=failure_kind,
+            failure_detail=failure_detail,
+            continuation_targets=continuation_targets,
+            pending_group=pending_group,
+            next_allowed_requests=next_allowed_requests,
+            fallback_targets=fallback_targets,
             suspects_invalidated=suspects_invalidated,
-            notes=notes + [f"start_success={bool(start_res.get('success'))}"],
+            notes=notes,
         )
         feedback = self._build_bisect_feedback_payload(
             suspects=suspects,
@@ -959,50 +1229,23 @@ class ServerBuilder:
             fallback_targets=fallback_targets,
             suspects_invalidated=suspects_invalidated,
         )
-        completed_requests = list(dict.fromkeys([*(getattr(session, "completed_requests", []) or []), bisect_mode]))
-        progress_token = self._make_bisect_progress_token(
-            suspects=suspects,
+        session_update: PreparedBisectSessionRoundUpdate = cast(PreparedBisectSessionRoundUpdate, prepare_bisect_session_round_update(
+            session=session,
             bisect_mode=bisect_mode,
-            tested_side=tested_side,
-            round_result=round_result,
+            suspects=suspects,
+            source_mods=source_mods,
             final_suspects=final_suspects,
+            round_result=round_result,
+            round_record=round_record,
+            feedback=feedback,
+            pending_group=pending_group,
+            continuation_targets=continuation_targets,
             next_allowed_requests=next_allowed_requests,
-        )
-        previous_token = str(getattr(session, "progress_token", "") or "")
-        stagnant_rounds = int(getattr(session, "stagnant_rounds", 0) or 0)
-        if progress_token == previous_token:
-            stagnant_rounds += 1
-            round_record.notes.append(f"stagnant_round_detected={stagnant_rounds}")
-        else:
-            stagnant_rounds = 0
-        self.bisect_session = BisectSession(
-            **{
-                **asdict(session),
-                "active": bool(
-                    next_allowed_requests
-                    or pending_group
-                    or continuation_targets
-                    or fallback_targets
-                    or (round_result != "pass" and len(final_suspects) > 1)
-                ),
-                "source_mods": list(source_mods),
-                "suspect_mods": list(final_suspects),
-                "safe_mods": [m for m in source_mods if m not in final_suspects],
-                "rounds": [*session.rounds, round_record],
-                "final_suspects": list(final_suspects if len(final_suspects) <= 3 else final_suspects[:3]),
-                "stopped_reason": "bisect_round_completed",
-                "last_round_feedback": feedback,
-                "pending_group": list(pending_group),
-                "continuation_targets": list(continuation_targets),
-                "next_allowed_requests": list(next_allowed_requests),
-                "completed_requests": completed_requests,
-                "fallback_targets": list(fallback_targets),
-                "suspects_invalidated": suspects_invalidated,
-                "progress_token": progress_token,
-                "stagnant_rounds": stagnant_rounds,
-                "pending_round_plan": {},
-            }
-        )
+            fallback_targets=fallback_targets,
+            suspects_invalidated=suspects_invalidated,
+        ))
+        stagnant_rounds = session_update["stagnant_rounds"]
+        self.bisect_session = update_bisect_session_after_round(**session_update)
         self.last_bisect_feedback = feedback
         self.rollback_mods(snapshot_tag)
         self._log_bisect_event(
@@ -1034,25 +1277,22 @@ class ServerBuilder:
             f"result={round_result}:keep={json.dumps(keep_group, ensure_ascii=False)}:"
             f"test={json.dumps(test_group, ensure_ascii=False)}:moves={json.dumps(moved_mods, ensure_ascii=False)}"
         )
-        execution = {
-            "index": idx,
-            "action_type": "bisect_mods",
-            "status": "applied",
-            "snapshot_tag": snapshot_tag,
-            "result": round_result,
-            "tested_side": tested_side,
-            "keep_group": keep_group,
-            "test_group": test_group,
-            "moved_mods": moved_mods,
-            "next_suspects": final_suspects,
-            "startup_success": bool(start_res.get("success")),
-            "failure_kind": "" if round_result == "pass" else failure_kind,
-            "already_bisected": True,
-            "next_allowed_requests": next_allowed_requests,
-            "fallback_targets": fallback_targets,
-            "suspects_invalidated": suspects_invalidated,
-            "feedback": feedback,
-        }
+        execution = summarize_bisect_round_outcome(
+            idx=idx,
+            snapshot_tag=snapshot_tag,
+            tested_side=tested_side,
+            keep_group=keep_group,
+            test_group=test_group,
+            moved_mods=moved_mods,
+            final_suspects=final_suspects,
+            round_result=round_result,
+            startup_success=bool(start_res.get("success")),
+            failure_kind="" if round_result == "pass" else failure_kind,
+            next_allowed_requests=next_allowed_requests,
+            fallback_targets=fallback_targets,
+            suspects_invalidated=suspects_invalidated,
+            feedback=feedback,
+        )
         return False, execution, None
 
     def _run_move_bisect_mods_action(
@@ -1328,8 +1568,10 @@ class ServerBuilder:
         return False, execution, None
 
     def _attempt_trace_path(self, attempt: int, stage: str) -> Path:
-        safe_stage = re.sub(r"[^a-zA-Z0-9_\-.]+", "_", str(stage or "unknown")).strip("_") or "unknown"
-        return self.workdirs.logs / f"attempt_{attempt:02d}_{safe_stage}.json"
+        return attempt_trace_path(self, attempt, stage)
+
+    def _sanitize_trace_stage(self, stage: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_\-.]+", "_", str(stage or "unknown")).strip("_") or "unknown"
 
     def _append_attempt_trace(
         self,
@@ -1337,204 +1579,57 @@ class ServerBuilder:
         stage: str,
         status: str,
         *,
-        context_summary: dict | None = None,
-        recognition_plan: dict | None = None,
-        ai_result: dict | None = None,
-        action_plan: list[dict] | None = None,
-        preflight: list[dict] | None = None,
-        execution: list[dict] | None = None,
-        rollback: list[dict] | None = None,
+        context_summary: dict[str, object] | None = None,
+        recognition_plan: dict[str, object] | None = None,
+        ai_result: dict[str, object] | None = None,
+        action_plan: list[dict[str, object]] | None = None,
+        preflight: list[dict[str, object]] | None = None,
+        execution: list[dict[str, object]] | None = None,
+        rollback: list[dict[str, object]] | None = None,
     ) -> None:
-        trace = AttemptTrace(
-            attempt=attempt,
-            stage=stage,
-            status=status,
-            context_summary=dict(context_summary or {}),
-            recognition_plan=dict(recognition_plan or {}),
-            ai_result=dict(ai_result or {}),
-            action_plan=[dict(item) for item in (action_plan or [])],
-            preflight=[dict(item) for item in (preflight or [])],
-            execution=[dict(item) for item in (execution or [])],
-            rollback=[dict(item) for item in (rollback or [])],
+        append_attempt_trace(
+            self,
+            attempt,
+            stage,
+            status,
+            context_summary=context_summary,
+            recognition_plan=recognition_plan,
+            ai_result=ai_result,
+            action_plan=action_plan,
+            preflight=preflight,
+            execution=execution,
+            rollback=rollback,
         )
-        self.attempt_traces.append(trace)
-        path = self._attempt_trace_path(attempt, stage)
-        path.write_text(json.dumps(asdict(trace), ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _summarize_ai_context(self, context: dict) -> dict[str, object]:
-        log_excerpt = self._normalize_text_list(context.get("log_signal_summary", []), limit=10)
-        if not log_excerpt:
-            log_excerpt = self._extract_log_signal_lines(context.get("refined_log", ""), limit=8)
-        recognition_summary = context.get("recognition_summary", {})
-        return {
-            "mc_version": context.get("mc_version", "unknown"),
-            "loader": context.get("loader", "unknown"),
-            "loader_version": context.get("loader_version"),
-            "build": context.get("build"),
-            "start_mode": context.get("start_mode", "unknown"),
-            "recognition_summary": dict(recognition_summary) if isinstance(recognition_summary, dict) else {},
-            "mod_count": int(context.get("mod_count", 0) or 0),
-            "current_installed_mods_preview": self._normalize_text_list(context.get("current_installed_mods", []), limit=12),
-            "known_deleted_client_mods": self._normalize_text_list(context.get("known_deleted_client_mods", []), limit=20),
-            "recent_actions": self._normalize_text_list(context.get("recent_actions", []), limit=12),
-            "key_exception": str(context.get("key_exception") or "none"),
-            "log_signal_summary": log_excerpt,
-        }
+        return summarize_ai_context(self, context)
 
     def _serialize_detection_candidates(self, candidates: object, *, limit: int = 3) -> list[dict[str, object]]:
-        items = list(candidates or [])
-        serialized: list[dict[str, object]] = []
-        for candidate in items[:limit]:
-            value = getattr(candidate, "value", None)
-            if not value:
-                continue
-            serialized.append(
-                {
-                    "value": str(value),
-                    "confidence": float(getattr(candidate, "confidence", 0.0) or 0.0),
-                    "reason": str(getattr(candidate, "reason", "") or ""),
-                }
-            )
-        return serialized
+        return serialize_detection_candidates(candidates, limit=limit)
 
     def _build_recognition_summary(self) -> dict[str, object]:
-        manifest = getattr(self, "manifest", None)
-        if not manifest:
-            return {}
-        evidence = []
-        for item in list(getattr(manifest, "evidence", []) or [])[:5]:
-            evidence.append(
-                {
-                    "source_type": str(getattr(item, "source_type", "") or ""),
-                    "evidence_type": str(getattr(item, "evidence_type", "") or ""),
-                    "file": str(getattr(item, "file", "") or ""),
-                    "matched_text": str(getattr(item, "matched_text", "") or ""),
-                    "weight": float(getattr(item, "weight", 0.0) or 0.0),
-                    "reason": str(getattr(item, "reason", "") or ""),
-                }
-            )
-        return {
-            "pack_name": manifest.pack_name,
-            "confidence": float(getattr(manifest, "confidence", 0.0) or 0.0),
-            "active_loader": getattr(manifest, "loader", "unknown"),
-            "active_mc_version": getattr(manifest, "mc_version", "unknown"),
-            "active_loader_version": getattr(manifest, "loader_version", None),
-            "active_build": getattr(manifest, "build", None),
-            "active_start_mode": getattr(manifest, "start_mode", "unknown"),
-            "warnings": list(getattr(manifest, "warnings", []) or []),
-            "loader_candidates": self._serialize_detection_candidates(getattr(manifest, "loader_candidates", [])),
-            "mc_version_candidates": self._serialize_detection_candidates(getattr(manifest, "mc_version_candidates", [])),
-            "loader_version_candidates": self._serialize_detection_candidates(getattr(manifest, "loader_version_candidates", [])),
-            "build_candidates": self._serialize_detection_candidates(getattr(manifest, "build_candidates", [])),
-            "start_mode_candidates": self._serialize_detection_candidates(getattr(manifest, "start_mode_candidates", [])),
-            "evidence_preview": evidence,
-            "fallback_history": list(getattr(self, "recognition_attempts", [])[-5:]),
-            "recognition_strategy_used": str(getattr(manifest, "raw", {}).get("pack_type", "unknown")),
-            "recognition_pipeline": list(getattr(manifest, "raw", {}).get("recognition_pipeline", []) or []),
-            "recognition_phase_hits": list(getattr(manifest, "raw", {}).get("recognition_phase_hits", []) or []),
-            "recognition_phase_details": dict(getattr(manifest, "raw", {}).get("recognition_phase_details", {}) or {}),
-            "recognition_fallback_count": len(list(getattr(self, "recognition_attempts", []) or [])),
-            "recognition_switched": len(list(getattr(self, "recognition_attempts", []) or [])) > 0,
-            "recognition_finalized_after_runtime_feedback": any(
-                str(item.get("reason") or "") == "runtime_feedback_fallback"
-                for item in list(getattr(self, "recognition_attempts", []) or [])
-                if isinstance(item, dict)
-            ),
-        }
+        return build_recognition_summary(self)
+
+    def _summarize_remote_failure_events(self, *, detail_limit: int = 5) -> dict[str, object]:
+        return summarize_remote_failure_events(self, detail_limit=detail_limit)
 
     def _recognition_confidence_level(self, confidence: float) -> str:
-        if confidence >= 0.85:
-            return "high"
-        if confidence >= 0.55:
-            return "medium"
-        return "low"
+        return recognition_confidence_level(confidence)
 
     def _build_recognition_candidates(self) -> list[RecognitionFallbackPlan]:
         manifest = self.manifest
         if not manifest:
             return []
-        loaders = top_candidate_values(getattr(manifest, "loader_candidates", [])) or [
-            str(getattr(manifest, "loader", "unknown") or "unknown")
-        ]
-        mc_versions = top_candidate_values(getattr(manifest, "mc_version_candidates", [])) or [
-            str(getattr(manifest, "mc_version", "unknown") or "unknown")
-        ]
-        loader_versions = top_candidate_values(
-            getattr(manifest, "loader_version_candidates", []),
-            limit=4,
-        ) or [str(getattr(manifest, "loader_version", "") or "")]
-        start_modes = top_candidate_values(getattr(manifest, "start_mode_candidates", [])) or [
-            str(getattr(manifest, "start_mode", "jar") or "jar")
-        ]
-        builds = top_candidate_values(getattr(manifest, "build_candidates", []), limit=4) or [str(getattr(manifest, "build", "") or "")]
-        plans: list[RecognitionFallbackPlan] = []
-        for loader in loaders[:3]:
-            for mc_version in mc_versions[:2]:
-                for start_mode in start_modes[:2]:
-                    loader_version = next(
-                        (
-                            item
-                            for item in loader_versions
-                            if item and (mc_version in item or loader in item.lower())
-                        ),
-                        loader_versions[0] or None,
-                    )
-                    build = next((item for item in builds if item), None)
-                    confidence = 0.4
-                    if loader == getattr(manifest, "loader", "unknown"):
-                        confidence += 0.2
-                    if mc_version == getattr(manifest, "mc_version", "unknown"):
-                        confidence += 0.2
-                    if start_mode == getattr(manifest, "start_mode", "unknown"):
-                        confidence += 0.1
-                    plans.append(
-                        RecognitionFallbackPlan(
-                            loader=loader,
-                            loader_version=loader_version,
-                            mc_version=mc_version,
-                            build=build,
-                            start_mode=start_mode,
-                            java_version=choose_java_version(manifest, loader=loader, mc_version=mc_version),
-                            confidence=min(1.0, round(confidence, 3)),
-                            reason="候选识别计划",
-                            source_candidates=[loader, mc_version, start_mode],
-                        )
-                    )
-        dedup: dict[tuple[str, str | None, str | None, str], RecognitionFallbackPlan] = {}
-        for plan in plans:
-            key = (plan.loader, plan.loader_version, plan.mc_version, plan.start_mode)
-            if key not in dedup or dedup[key].confidence < plan.confidence:
-                dedup[key] = plan
-        return sorted(dedup.values(), key=lambda item: (-item.confidence, item.loader, item.start_mode))
+        return build_recognition_candidates(manifest, choose_java_version)
 
     def _preflight_recognition_plan(self, plan: RecognitionFallbackPlan) -> dict[str, object]:
-        server = self.workdirs.server
-        checks: list[str] = []
-        score = 0
-        if plan.start_mode in {"argsfile", "args_file"} and any(server.glob("libraries/**/unix_args.txt")):
-            score += 1
-            checks.append("argsfile_path_present")
-        if plan.loader == "forge" and (server / "libraries" / "net" / "minecraftforge").exists():
-            score += 1
-            checks.append("forge_libraries_present")
-        if plan.loader == "neoforge" and (server / "libraries" / "net" / "neoforged").exists():
-            score += 1
-            checks.append("neoforge_libraries_present")
-        if plan.loader in {"fabric", "quilt"} and any(server.glob("**/*fabric*loader*.jar")):
-            score += 1
-            checks.append("fabric_like_loader_present")
-        if (server / self.server_jar_name).exists():
-            score += 1
-            checks.append("server_jar_present")
-        if plan.java_version == choose_java_version(self.manifest, loader=plan.loader, mc_version=plan.mc_version):
-            score += 1
-            checks.append("java_version_matches_loader_strategy")
-        return {
-            "allowed": score > 0,
-            "score": score,
-            "checks": checks,
-            "confidence_level": self._recognition_confidence_level(plan.confidence),
-        }
+        return preflight_recognition_plan(
+            plan,
+            server_dir=self.workdirs.server,
+            server_jar_name=self.server_jar_name,
+            manifest=self.manifest,
+            choose_java=choose_java_version,
+        )
 
     def _apply_recognition_plan(self, plan: RecognitionFallbackPlan, *, reason: str) -> None:
         if not self.manifest:
@@ -1562,155 +1657,39 @@ class ServerBuilder:
             self.switch_java_version(plan.java_version)
 
     def _recognition_runtime_feedback(self, start_res: dict[str, object], log_info: dict[str, object]) -> dict[str, object]:
-        text = "\n".join(
-            [
-                str(start_res.get("stdout_tail") or ""),
-                str(start_res.get("stderr_tail") or ""),
-                str(log_info.get("refined_log") or ""),
-                str(log_info.get("key_exception") or ""),
-            ]
-        ).lower()
-        inferred_loader = None
-        if any(token in text for token in ("fml", "minecraftforge", "forge mod loader")):
-            inferred_loader = "forge"
-        elif "neoforge" in text:
-            inferred_loader = "neoforge"
-        elif "fabric-loader" in text or "fabricloader" in text:
-            inferred_loader = "fabric"
-        elif "quilt-loader" in text or "quilt" in text:
-            inferred_loader = "quilt"
-        inferred_mc_version = None
-        version_match = re.search(r"\b1\.\d+(?:\.\d+)?\b", text)
-        if version_match:
-            inferred_mc_version = version_match.group(0)
-        java_hint = infer_java_from_runtime_feedback(text, self.current_java_version)
-        return {
-            "inferred_loader": inferred_loader,
-            "inferred_mc_version": inferred_mc_version,
-            "java_hint": java_hint,
-            "raw": text[:800],
-        }
+        return recognition_runtime_feedback(start_res, log_info, self.current_java_version)
 
     def _select_next_recognition_plan(self, start_res: dict[str, object], log_info: dict[str, object]) -> RecognitionFallbackPlan | None:
-        runtime = self._recognition_runtime_feedback(start_res, log_info)
-        plans = self._build_recognition_candidates()
-        tried = {
-            (
-                str(item.get("loader")),
-                str(item.get("loader_version")),
-                str(item.get("mc_version")),
-                str(item.get("start_mode")),
-            )
-            for item in self.recognition_attempts
-        }
-        inferred_loader = runtime.get("inferred_loader")
-        inferred_mc_version = runtime.get("inferred_mc_version")
-        runtime_java_hint = runtime.get("java_hint")
-        boosted: list[RecognitionFallbackPlan] = []
-        for plan in plans:
-            if (plan.loader, str(plan.loader_version), str(plan.mc_version), plan.start_mode) in tried:
-                continue
-            preflight = self._preflight_recognition_plan(plan)
-            if not preflight.get("allowed"):
-                continue
-            confidence = plan.confidence + (0.25 if inferred_loader and plan.loader == inferred_loader else 0.0)
-            confidence += 0.12 if inferred_mc_version and plan.mc_version == inferred_mc_version else 0.0
-            confidence += 0.08 if runtime_java_hint and plan.java_version == runtime_java_hint else 0.0
-            confidence += min(float(preflight.get("score") or 0) * 0.03, 0.15)
-            boosted.append(
-                RecognitionFallbackPlan(
-                    loader=plan.loader,
-                    loader_version=plan.loader_version,
-                    mc_version=plan.mc_version,
-                    build=plan.build,
-                    start_mode=plan.start_mode,
-                    java_version=int(runtime_java_hint or plan.java_version),
-                    confidence=min(1.0, round(confidence, 3)),
-                    reason=(
-                        f"{plan.reason}; runtime_loader={inferred_loader or 'unknown'}; "
-                        f"runtime_mc={inferred_mc_version or 'unknown'}; "
-                        f"preflight={','.join(preflight.get('checks', [])) or 'none'}"
-                    ),
-                    source_candidates=list(plan.source_candidates),
-                )
-            )
-        if not boosted:
-            return None
-        return sorted(boosted, key=lambda item: (-item.confidence, item.java_version))[0]
+        return select_next_recognition_plan(
+            start_res=start_res,
+            log_info=log_info,
+            plans=self._build_recognition_candidates(),
+            recognition_attempts=list(self.recognition_attempts),
+            current_java_version=self.current_java_version,
+            preflight=self._preflight_recognition_plan,
+        )
 
     def _assess_action_preflight(self, action: dict) -> ActionPreflight:
         action_type = str(action.get("type") or "unknown")
-        details: list[str] = []
         if action_type == "continue_after_restore_mods":
             state = dict(getattr(self, "remove_validation_state", {}) or {})
-            can_continue = bool(state.get("continue_allowed", False))
-            post_remove_active_mods = [str(x).strip() for x in (state.get("post_remove_active_mods") or []) if str(x).strip()]
-            snapshot_tag = str(state.get("rollback_snapshot_tag") or "").strip()
-            consumed = bool(state.get("continued", False))
-            problem_changed = bool(state.get("problem_changed", False))
-            details.append(f"continue_allowed={can_continue}")
-            details.append(f"rollback_snapshot_tag={snapshot_tag or 'none'}")
-            if post_remove_active_mods:
-                details.append(f"post_remove_active_mods={json.dumps(post_remove_active_mods, ensure_ascii=False)}")
-            details.append(f"problem_changed={problem_changed}")
-            details.append(f"continued={consumed}")
-            if not can_continue or not snapshot_tag or not post_remove_active_mods:
-                return ActionPreflight(
-                    action_type=action_type,
-                    risk="medium",
-                    allowed=False,
-                    reason="no_remove_validation_context",
-                    details=details,
-                )
-            if consumed:
-                return ActionPreflight(
-                    action_type=action_type,
-                    risk="medium",
-                    allowed=False,
-                    reason="remove_validation_continue_already_consumed",
-                    details=details,
-                )
-            if not problem_changed:
-                return ActionPreflight(
-                    action_type=action_type,
-                    risk="medium",
-                    allowed=False,
-                    reason="remove_validation_problem_not_changed",
-                    details=details,
-                )
-            return ActionPreflight(
+            return assess_continue_after_restore_mods(
+                ContinueAfterRestoreModsState(
+                    continue_allowed=bool(state.get("continue_allowed", False)),
+                    post_remove_active_mods=[str(x).strip() for x in (state.get("post_remove_active_mods") or []) if str(x).strip()],
+                    rollback_snapshot_tag=str(state.get("rollback_snapshot_tag") or "").strip(),
+                    continued=bool(state.get("continued", False)),
+                    problem_changed=bool(state.get("problem_changed", False)),
+                ),
                 action_type=action_type,
-                risk="low",
-                allowed=True,
-                reason="remove_validation_continue_allowed",
-                details=details,
             )
         if action_type == "bisect_mods":
             bisect_mode = str(action.get("bisect_mode") or "initial").strip() or "initial"
-            if bisect_mode not in {"initial", "switch_group", "continue_failed_group"}:
-                return ActionPreflight(
-                    action_type=action_type,
-                    risk="high",
-                    allowed=False,
-                    reason="invalid_bisect_mode",
-                    details=[f"bisect_mode={bisect_mode}"],
-                )
             session = self._coerce_bisect_session()
             next_allowed = list(getattr(session, "next_allowed_requests", []) or [])
             completed = set(getattr(session, "completed_requests", []) or [])
             completed_tokens = set(getattr(session, "completed_request_tokens", []) or [])
             request_source = str(action.get("request_source") or "ai").strip() or "ai"
-            details.append(f"bisect_mode={bisect_mode}")
-            details.append(f"request_source={request_source}")
-            if bisect_mode != "initial" and bisect_mode not in next_allowed:
-                details.append(f"next_allowed_requests={json.dumps(next_allowed, ensure_ascii=False)}")
-                return ActionPreflight(
-                    action_type=action_type,
-                    risk="medium",
-                    allowed=False,
-                    reason="bisect_request_not_allowed_in_current_state",
-                    details=details,
-                )
             if bisect_mode == "switch_group":
                 resolved = self._resolve_mod_names_to_installed(list(getattr(session, "pending_group", []) or []))
             elif bisect_mode == "continue_failed_group":
@@ -1722,71 +1701,27 @@ class ServerBuilder:
                 [str(x).strip() for x in (action.get("move_candidates") or []) if str(x).strip()],
                 candidates=resolved,
             )
-            details.append(f"resolved_targets={json.dumps(resolved, ensure_ascii=False)}")
-            if action.get("keep_group") or action.get("test_group"):
-                details.append("manual_grouping_ignored_by_system=true")
-            if move_candidates:
-                details.append(f"move_candidates={json.dumps(move_candidates, ensure_ascii=False)}")
             fallback_targets = self._resolve_mod_names_to_installed(list(getattr(session, "fallback_targets", []) or []))
-            fallback_phase_allowed = (
-                bisect_mode == "initial"
-                and request_source == "system_auto_resume"
-                and bool(getattr(session, "suspects_invalidated", False))
-                and "initial" in next_allowed
-                and bool(fallback_targets)
-                and set(resolved) == set(fallback_targets)
-            )
-            request_token = bisect_mode
-            if fallback_phase_allowed:
-                request_token = f"initial:fallback:{','.join(sorted(resolved, key=str.lower))}"
-                details.append("fallback_phase=auto_resume")
-            if len(resolved) < 2:
-                return ActionPreflight(
-                    action_type=action_type, risk="medium", allowed=False, reason="insufficient_mods_for_bisect", details=details
-                )
-            if len(resolved) > 24:
-                return ActionPreflight(
-                    action_type=action_type, risk="high", allowed=False, reason="too_many_mod_targets_for_bisect", details=details
-                )
-            if len(move_candidates) > 3:
-                return ActionPreflight(
-                    action_type=action_type, risk="high", allowed=False, reason="too_many_dependency_moves", details=details
-                )
-            if request_token in completed_tokens and bisect_mode != "continue_failed_group":
-                details.append(f"completed_request_tokens={json.dumps(sorted(completed_tokens), ensure_ascii=False)}")
-                return ActionPreflight(
-                    action_type=action_type,
-                    risk="medium",
-                    allowed=False,
-                    reason="duplicate_bisect_stage_request",
-                    details=details,
-                )
-            if request_token == bisect_mode and bisect_mode in completed and bisect_mode != "continue_failed_group":
-                details.append(f"completed_requests={json.dumps(sorted(completed), ensure_ascii=False)}")
-                return ActionPreflight(
-                    action_type=action_type, risk="medium", allowed=False, reason="duplicate_bisect_stage_request", details=details
-                )
             last_bisect_feedback = dict(getattr(self, "last_bisect_feedback", {}) or {})
-            if bisect_mode == "initial" and last_bisect_feedback and not fallback_phase_allowed:
-                last_targets = self._resolve_mod_names_to_installed(
-                    [str(x) for x in (last_bisect_feedback.get("requested_targets") or []) if str(x).strip()],
-                    candidates=resolved,
+            last_targets = self._resolve_mod_names_to_installed(
+                [str(x) for x in (last_bisect_feedback.get("requested_targets") or []) if str(x).strip()],
+                candidates=resolved,
+            )
+            return assess_bisect_mods(
+                BisectPreflightInput(
+                    action_type=action_type,
+                    bisect_mode=bisect_mode,
+                    request_source=request_source,
+                    resolved_targets=resolved,
+                    move_candidates=move_candidates,
+                    next_allowed_requests=next_allowed,
+                    completed_requests=sorted(completed),
+                    completed_request_tokens=sorted(completed_tokens),
+                    last_requested_targets=last_targets,
+                    fallback_targets=fallback_targets,
+                    suspects_invalidated=bool(getattr(session, "suspects_invalidated", False)),
+                    manual_grouping_requested=bool(action.get("keep_group") or action.get("test_group")),
                 )
-                if set(last_targets) == set(resolved) and not move_candidates:
-                    details.append(f"last_bisect_feedback={json.dumps(last_bisect_feedback, ensure_ascii=False)}")
-                    return ActionPreflight(
-                        action_type=action_type,
-                        risk="medium",
-                        allowed=False,
-                        reason="duplicate_bisect_request_after_previous_round",
-                        details=details,
-                    )
-            return ActionPreflight(
-                action_type=action_type,
-                risk="medium",
-                allowed=True,
-                reason="controlled_bisect_allowed",
-                details=details,
             )
         if action_type == "remove_mods":
             targets = [str(x).strip() for x in (action.get("targets") or []) if str(x).strip()]
@@ -1795,111 +1730,42 @@ class ServerBuilder:
             direct_targets = [x for x in targets if not x.startswith("regex:")]
             resolved = self._resolve_mod_names_to_installed(direct_targets)
             unresolved = [x for x in direct_targets if x not in resolved]
-            details.append(f"rollback_on_failure={rollback_on_failure}")
-            if regex_targets:
-                details.append(f"regex_targets={json.dumps(regex_targets, ensure_ascii=False)}")
-            if resolved:
-                details.append(f"resolved_targets={json.dumps(resolved, ensure_ascii=False)}")
-            if unresolved:
-                details.append(f"unresolved_targets={json.dumps(unresolved, ensure_ascii=False)}")
-            if regex_targets:
-                return ActionPreflight(
-                    action_type=action_type,
-                    risk="high",
-                    allowed=False,
-                    reason="regex_remove_requires_manual_review",
-                    details=details,
-                )
-            if not resolved:
-                return ActionPreflight(
-                    action_type=action_type,
-                    risk="medium",
-                    allowed=False,
-                    reason="no_installed_targets_resolved",
-                    details=details,
-                )
-            if len(resolved) > AI_REMOVE_MODS_SAFE_LIMIT:
-                return ActionPreflight(
-                    action_type=action_type,
-                    risk="high",
-                    allowed=False,
-                    reason="too_many_mod_targets",
-                    details=details,
-                )
-            return ActionPreflight(
+            return assess_remove_mods(
                 action_type=action_type,
-                risk="medium",
-                allowed=True,
-                reason="resolved_low_volume_mod_removal",
-                details=details,
+                resolved_targets=resolved,
+                regex_targets=regex_targets,
+                unresolved_targets=unresolved,
+                rollback_on_failure=rollback_on_failure,
+                safe_limit=AI_REMOVE_MODS_SAFE_LIMIT,
             )
 
         if action_type == "adjust_memory":
             xmx = str(action.get("xmx", self.jvm_xmx) or self.jvm_xmx)
             xms = str(action.get("xms", self.jvm_xms) or self.jvm_xms)
             xmx_norm, xms_norm = self._normalize_memory_plan(xmx, xms)
-            details.append(f"normalized_plan=Xmx={xmx_norm},Xms={xms_norm}")
             current_xmx_gb = parse_mem_to_gb(self.jvm_xmx)
             next_xmx_gb = parse_mem_to_gb(xmx_norm)
-            if next_xmx_gb > self.get_system_memory() * float(self.config.memory.max_ram_ratio):
-                return ActionPreflight(
-                    action_type=action_type,
-                    risk="high",
-                    allowed=False,
-                    reason="memory_plan_exceeds_cap",
-                    details=details,
-                )
-            delta = abs(next_xmx_gb - current_xmx_gb)
-            if delta > 4:
-                return ActionPreflight(
-                    action_type=action_type,
-                    risk="high",
-                    allowed=False,
-                    reason="memory_change_too_large",
-                    details=details,
-                )
-            return ActionPreflight(
+            return assess_adjust_memory(
                 action_type=action_type,
-                risk="low",
-                allowed=True,
-                reason="bounded_memory_adjustment",
-                details=details,
+                xmx_norm=xmx_norm,
+                xms_norm=xms_norm,
+                current_xmx_gb=current_xmx_gb,
+                next_xmx_gb=next_xmx_gb,
+                system_memory_gb=self.get_system_memory(),
+                max_ram_ratio=float(self.config.memory.max_ram_ratio),
             )
 
         if action_type == "change_java":
             version = int(action.get("version", self.current_java_version) or self.current_java_version)
-            details.append(f"target_version={version}")
-            if version not in SUPPORTED_JAVA_VERSIONS:
-                return ActionPreflight(
-                    action_type=action_type,
-                    risk="high",
-                    allowed=False,
-                    reason="unsupported_java_version",
-                    details=details,
-                )
-            if abs(version - self.current_java_version) > 4:
-                return ActionPreflight(
-                    action_type=action_type,
-                    risk="high",
-                    allowed=False,
-                    reason="java_version_jump_too_large",
-                    details=details,
-                )
-            return ActionPreflight(
-                action_type=action_type,
-                risk="medium",
-                allowed=True,
-                reason="whitelisted_java_switch",
-                details=details,
-            )
+            return assess_change_java(action_type=action_type, target_version=version, current_java_version=self.current_java_version)
 
         if action_type in {"stop_and_report", "report_manual_fix"}:
-            return ActionPreflight(action_type=action_type, risk="low", allowed=True, reason="non_mutating_action", details=details)
+            return assess_non_mutating_action(action_type)
 
-        return ActionPreflight(action_type=action_type, risk="high", allowed=False, reason="unknown_action_type", details=details)
+        return assess_unknown_action(action_type)
 
-    def _rollback_action(self, action_type: str, snapshot_tag: str, previous_state: dict[str, object]) -> dict[str, object]:
-        result: dict[str, object] = {"action_type": action_type, "snapshot_tag": snapshot_tag, "performed": False}
+    def _rollback_action(self, action_type: str, snapshot_tag: str, previous_state: PreviousActionState) -> RollbackResult:
+        result: RollbackResult = {"action_type": action_type, "snapshot_tag": snapshot_tag, "performed": False}
         try:
             if action_type == "remove_mods":
                 self.rollback_mods(snapshot_tag)
@@ -1909,197 +1775,54 @@ class ServerBuilder:
                 result["performed"] = True
             elif action_type == "adjust_memory":
                 self.set_jvm_args(
-                    str(previous_state.get("jvm_xmx") or self.jvm_xmx),
-                    str(previous_state.get("jvm_xms") or self.jvm_xms),
-                    list(previous_state.get("extra_jvm_flags") or self.extra_jvm_flags),
+                    previous_state["jvm_xmx"] or self.jvm_xmx,
+                    previous_state["jvm_xms"] or self.jvm_xms,
+                    list(previous_state["extra_jvm_flags"] or self.extra_jvm_flags),
                 )
                 result["performed"] = True
             elif action_type == "change_java":
-                previous_version = int(previous_state.get("current_java_version") or self.current_java_version)
-                previous_bin = previous_state.get("current_java_bin")
+                previous_version = int(previous_state["current_java_version"] or self.current_java_version)
+                previous_bin = previous_state["current_java_bin"]
                 self.current_java_version = previous_version
                 self.current_java_bin = Path(str(previous_bin)) if previous_bin else None
-                self.extra_jvm_flags = list(previous_state.get("extra_jvm_flags") or self.extra_jvm_flags)
+                self.extra_jvm_flags = list(previous_state["extra_jvm_flags"] or self.extra_jvm_flags)
                 self._write_start_script()
                 self.operations.append(f"rollback_java_version:{previous_version}")
                 result["performed"] = True
-        except Exception as exc:
+        except (FileNotFoundError, OSError, ValueError) as exc:
             result["error"] = f"{type(exc).__name__}:{exc}"
         return result
 
     def _execute_action_with_safeguards(
         self, idx: int, action: dict, preflight: ActionPreflight, snapshot_tag: str
-    ) -> tuple[bool, dict[str, object], dict[str, object] | None]:
+    ) -> tuple[bool, ActionExecutionResult, RollbackResult | None]:
         action_type = str(action.get("type") or "unknown")
-        current_jvm_xmx = str(getattr(self, "jvm_xmx", "4G") or "4G")
-        current_jvm_xms = str(getattr(self, "jvm_xms", current_jvm_xmx) or current_jvm_xmx)
-        current_extra_jvm_flags = list(getattr(self, "extra_jvm_flags", []) or [])
-        current_java_version = int(getattr(self, "current_java_version", 21) or 21)
-        current_java_bin = getattr(self, "current_java_bin", None)
-        previous_state: dict[str, object] = {
-            "jvm_xmx": current_jvm_xmx,
-            "jvm_xms": current_jvm_xms,
-            "extra_jvm_flags": current_extra_jvm_flags,
-            "current_java_version": current_java_version,
-            "current_java_bin": str(current_java_bin) if current_java_bin else "",
-        }
-        execution: dict[str, object] = {
-            "index": idx,
-            "action_type": action_type,
-            "status": "skipped",
-            "snapshot_tag": snapshot_tag,
-            "risk": preflight.risk,
-        }
-        rollback: dict[str, object] | None = None
+        previous_state = build_previous_action_state(self)
+        execution = build_initial_execution_result(idx=idx, action_type=action_type, snapshot_tag=snapshot_tag, preflight=preflight)
+        rollback: RollbackResult | None = None
 
         if action_type in {"remove_mods", "bisect_mods"}:
             self.backup_mods(snapshot_tag)
 
         try:
             if action_type == "bisect_mods":
-                return self._run_bisect_mods_action(idx, action, snapshot_tag)
+                ok, bisect_execution, bisect_rollback = self._run_bisect_mods_action(idx, action, snapshot_tag)
+                return ok, cast(ActionExecutionResult, bisect_execution), cast(RollbackResult | None, bisect_rollback)
             if action_type == "remove_mods":
-                targets = action.get("targets") or []
-                rollback_on_failure = bool(action.get("rollback_on_failure", False))
-                names = [x for x in targets if not str(x).startswith("regex:")]
-                resolved_names = self._resolve_mod_names_to_installed([str(x) for x in names])
-                previous_crash_reports = list(
-                    getattr(self, "last_rollback_remove_mods", {}).get("crash_reports_after_validation", []) or []
+                return execute_remove_mods_action(
+                    self,
+                    idx=idx,
+                    action=action,
+                    snapshot_tag=snapshot_tag,
+                    previous_state=previous_state,
+                    execution=execution,
                 )
-                previous_excerpt = str(getattr(self, "last_rollback_remove_mods", {}).get("validation_crash_excerpt", "") or "")
-                if resolved_names:
-                    self.remove_mods_by_name(
-                        resolved_names,
-                        source="ai_action",
-                        reason=f"attempt_action_index={idx}:explicit_targets",
-                    )
-                installed_after_ai = self.list_mods()
-                forced_targets, forced_rationale, matched_chains = self._resolve_dependency_cleanup_targets(
-                    self.last_ai_result.dependency_chains if self.last_ai_result else [],
-                    installed_after_ai,
-                )
-                execution.update(
-                    {
-                        "status": "applied",
-                        "resolved_targets": resolved_names,
-                        "rollback_on_failure": rollback_on_failure,
-                        "forced_targets": forced_targets,
-                        "forced_rationale": forced_rationale[:20],
-                        "matched_dependency_chains": matched_chains[:10],
-                    }
-                )
-                if forced_targets:
-                    self.remove_mods_by_name(
-                        forced_targets,
-                        source="dependency_cleanup",
-                        reason="depend_on_known_deleted_client_mod",
-                    )
-                    self.operations.append(f"dependency_cleanup_forced_remove:targets={json.dumps(forced_targets, ensure_ascii=False)}")
-                post_remove_active_mods = list(self.list_mods())
-                if rollback_on_failure:
-                    validation_res = self.start_server(timeout=self.config.runtime.start_timeout)
-                    validation_success = bool(validation_res.get("success"))
-                    crash_reports_after_validation = [
-                        str(x) for x in (validation_res.get("crash_reports_snapshot") or []) if str(x).strip()
-                    ]
-                    validation_excerpt = str(validation_res.get("stderr_tail") or validation_res.get("reason") or "")
-                    crash_report_delta = sorted(
-                        set(crash_reports_after_validation).symmetric_difference(set(previous_crash_reports))
-                    )
-                    problem_changed = bool(crash_report_delta)
-                    execution.update(
-                        {
-                            "validation_start_performed": True,
-                            "validation_success": validation_success,
-                            "validation_success_source": validation_res.get("success_source"),
-                            "validation_problem_changed": problem_changed,
-                        }
-                    )
-                    if not validation_success:
-                        rollback = self._rollback_action(action_type, snapshot_tag, previous_state)
-                        self.last_rollback_remove_mods = {
-                            "triggered": bool(rollback and rollback.get("performed")),
-                            "snapshot_tag": snapshot_tag,
-                            "action_index": idx,
-                            "removed_targets": list(resolved_names),
-                            "forced_targets": list(forced_targets),
-                            "validation_success": validation_success,
-                            "validation_failure_signals": list(validation_res.get("failure_signals") or []),
-                            "validation_readiness_evidence": list(validation_res.get("readiness_evidence") or []),
-                            "validation_crash_excerpt": validation_excerpt,
-                            "crash_reports_after_validation": crash_reports_after_validation,
-                            "crash_reports_new_after_validation": [
-                                str(x) for x in (validation_res.get("crash_reports_new") or []) if str(x).strip()
-                            ],
-                            "crash_reports_changed_since_last_context": False,
-                        }
-                        self.remove_validation_state = {
-                            "triggered": bool(rollback and rollback.get("performed")),
-                            "continue_allowed": problem_changed,
-                            "continued": False,
-                            "rollback_snapshot_tag": snapshot_tag,
-                            "action_index": idx,
-                            "removed_targets": list(resolved_names),
-                            "forced_targets": list(forced_targets),
-                            "post_remove_active_mods": post_remove_active_mods,
-                            "previous_crash_reports": previous_crash_reports,
-                            "validation_crash_reports": crash_reports_after_validation,
-                            "crash_report_delta": crash_report_delta,
-                            "previous_excerpt": previous_excerpt,
-                            "validation_excerpt": validation_excerpt,
-                            "failure_signals": list(validation_res.get("failure_signals") or []),
-                            "readiness_evidence": list(validation_res.get("readiness_evidence") or []),
-                            "problem_changed": problem_changed,
-                        }
-                        execution.update(
-                            {
-                                "status": "rolled_back",
-                                "rollback_reason": "startup_validation_failed",
-                                "validation_failure_excerpt": self._extract_log_signal_lines(
-                                    "\n".join(
-                                        [
-                                            str(validation_res.get("stdout") or ""),
-                                            str(validation_res.get("stderr") or ""),
-                                            str(validation_res.get("reason") or ""),
-                                        ]
-                                    ),
-                                    limit=8,
-                                ),
-                            }
-                        )
-                        return False, execution, rollback
-                else:
-                    self.last_rollback_remove_mods = {}
-                    self.remove_validation_state = {}
             elif action_type == "continue_after_restore_mods":
-                state = dict(getattr(self, "remove_validation_state", {}) or {})
-                rollback_snapshot_tag = str(state.get("rollback_snapshot_tag") or snapshot_tag).strip()
-                restored_active = self._set_active_mods(
-                    [str(x) for x in (state.get("post_remove_active_mods") or []) if str(x).strip()],
-                    rollback_snapshot_tag,
-                    reason="continue_after_restore_mods",
-                )
-                self.operations.append(f"continue_after_restore_mods:{rollback_snapshot_tag}")
-                execution.update(
-                    {
-                        "status": "applied",
-                        "restored_snapshot_tag": rollback_snapshot_tag,
-                        "restored_active_mods": restored_active,
-                        "restored_targets": list(state.get("removed_targets") or []),
-                    }
-                )
-                state["continued"] = True
-                self.remove_validation_state = state
+                return execute_continue_after_restore_mods_action(self, snapshot_tag=snapshot_tag, execution=execution)
             elif action_type == "adjust_memory":
-                xmx = action.get("xmx", self.jvm_xmx)
-                xms = action.get("xms", self.jvm_xms)
-                xmx_norm, xms_norm = self._normalize_memory_plan(str(xmx), str(xms))
-                self.set_jvm_args(xmx_norm, xms_norm)
-                execution.update({"status": "applied", "xmx": xmx_norm, "xms": xms_norm})
+                return execute_adjust_memory_action(self, action=action, execution=execution)
             elif action_type == "change_java":
-                version = int(action.get("version", 21))
-                self.switch_java_version(version)
-                execution.update({"status": "applied", "version": version})
+                return execute_change_java_action(self, action=action, execution=execution)
             elif action_type == "stop_and_report":
                 self.stop_reason = str(action.get("final_reason", "stop_and_report"))
                 self.operations.append(f"stop_and_report:{self.stop_reason}")
@@ -2120,9 +1843,13 @@ class ServerBuilder:
                 return True, execution, None
             else:
                 execution.update({"status": "ignored", "reason": "unknown_action_type"})
-        except Exception as exc:
+        except (FileNotFoundError, OSError, ValueError, DownloadError, ExternalServiceError) as exc:
             execution.update({"status": "failed", "error": f"{type(exc).__name__}:{exc}"})
             rollback = self._rollback_action(action_type, snapshot_tag, previous_state)
+            rollback_state = "none"
+            if rollback is not None:
+                rollback_state = "performed" if rollback.get("performed") else f"failed:{rollback.get('error', 'unknown')}"
+            self.operations.append(f"action_failed:{action_type}:{type(exc).__name__}:rollback={rollback_state}")
             return False, execution, rollback
 
         return False, execution, rollback
@@ -2750,179 +2477,13 @@ class ServerBuilder:
 
     # 输出
     def generate_report(self) -> str:
-        report_path = self.workdirs.root / "report.txt"
-        recognition_summary = self._build_recognition_summary()
-        ai_summary = "none"
-        ai_detail_lines: list[str] = []
-        if self.last_ai_result:
-            ai_summary = (
-                f"issue={self.last_ai_result.primary_issue}, "
-                f"confidence={self.last_ai_result.confidence:.2f}, "
-                f"reason={self.last_ai_result.reason}"
-            )
-            ai_detail_lines = [
-                f"- 输入摘要: {self.last_ai_result.input_summary or 'none'}",
-                f"- 用户可读摘要: {self.last_ai_result.user_summary or 'none'}",
-                f"- 命中的已删除mod: {json.dumps(self.last_ai_result.hit_deleted_mods, ensure_ascii=False)}",
-                f"- 依赖链: {json.dumps(self.last_ai_result.dependency_chains, ensure_ascii=False)}",
-                f"- 删除判定依据: {json.dumps(self.last_ai_result.deletion_rationale, ensure_ascii=False)}",
-                f"- 冲突/异常说明: {json.dumps(self.last_ai_result.conflicts_or_exceptions, ensure_ascii=False)}",
-                f"- 证据: {json.dumps(self.last_ai_result.evidence, ensure_ascii=False)}",
-                f"- 建议手动修复步骤: {json.dumps(self.last_ai_result.suggested_manual_steps, ensure_ascii=False)}",
-                f"- 思考链: {json.dumps(self.last_ai_result.thought_chain, ensure_ascii=False)}",
-            ]
-
-        deleted_history_lines: list[str] = []
-        for mod_name in sorted(self.known_deleted_client_mods):
-            evidence = self.deleted_mod_evidence.get(mod_name, [])
-            deleted_history_lines.append(f"- {mod_name}: {json.dumps(evidence, ensure_ascii=False)}")
-        deleted_mod_sources = getattr(self, "deleted_mod_sources", {}) if isinstance(getattr(self, "deleted_mod_sources", {}), dict) else {}
-        deleted_source_lines: list[str] = []
-        for mod_name in sorted(deleted_mod_sources):
-            deleted_source_lines.append(f"- {mod_name}: {json.dumps(deleted_mod_sources.get(mod_name, {}), ensure_ascii=False)}")
-        attempt_trace_lines = [
-            (
-                f"- attempt={trace.attempt}, stage={trace.stage}, status={trace.status}, "
-                f"file={self._attempt_trace_path(trace.attempt, trace.stage).name}"
-            )
-            for trace in self.attempt_traces
-        ]
-        bisect_tree_lines = self._format_bisect_tree_lines()
-        loader_candidate_values = [item.get("value") for item in recognition_summary.get("loader_candidates", [])]
-        mc_candidate_values = [item.get("value") for item in recognition_summary.get("mc_version_candidates", [])]
-        build_candidate_values = [item.get("value") for item in recognition_summary.get("build_candidates", [])]
-        start_mode_candidate_values = [item.get("value") for item in recognition_summary.get("start_mode_candidates", [])]
-        recognition_lines = [
-            f"- 输入包名: {recognition_summary.get('pack_name', 'unknown')}",
-            f"- 当前 loader: {recognition_summary.get('active_loader', 'unknown')}",
-            f"- 当前 MC 版本: {recognition_summary.get('active_mc_version', 'unknown')}",
-            f"- 当前 loader_version: {recognition_summary.get('active_loader_version', None)}",
-            f"- 当前 build: {recognition_summary.get('active_build', None)}",
-            f"- 当前启动模式: {recognition_summary.get('active_start_mode', 'unknown')}",
-            f"- 识别置信度: {recognition_summary.get('confidence', 0.0):.2f}",
-            f"- 候选 loader: {json.dumps(loader_candidate_values, ensure_ascii=False)}",
-            f"- 候选 MC 版本: {json.dumps(mc_candidate_values, ensure_ascii=False)}",
-            f"- 候选 build: {json.dumps(build_candidate_values, ensure_ascii=False)}",
-            f"- 候选启动模式: {json.dumps(start_mode_candidate_values, ensure_ascii=False)}",
-            f"- 识别流水线: {json.dumps(recognition_summary.get('recognition_pipeline', []), ensure_ascii=False)}",
-            f"- 命中的识别阶段: {json.dumps(recognition_summary.get('recognition_phase_hits', []), ensure_ascii=False)}",
-            f"- 阶段明细: {json.dumps(recognition_summary.get('recognition_phase_details', {}), ensure_ascii=False)}",
-            f"- 回退历史: {json.dumps(recognition_summary.get('fallback_history', []), ensure_ascii=False)}",
-            f"- 证据摘要: {json.dumps(recognition_summary.get('evidence_preview', []), ensure_ascii=False)}",
-        ]
-        lines = [
-            "MC Auto Server Builder 报告",
-            f"生成时间: {datetime.now().isoformat()}",
-            f"工作目录: {self.workdirs.root}",
-            f"是否成功启动: {self.run_success}",
-            f"实际尝试次数: {self.attempts_used}",
-            f"最终状态: {'成功' if self.run_success else '失败'} / {self.stop_reason or 'success_or_attempt_limit'}",
-            f"清理/删除Mods数量: {len(self.removed_mods)}",
-            f"二分测试临时移除数量: {len(getattr(self, 'bisect_removed_mods', []))}",
-            "删除列表:",
-            *[f"- {m}" for m in self.removed_mods],
-            f"最终JVM: Xmx={self.jvm_xmx}, Xms={self.jvm_xms}",
-            f"Java版本: {self.detect_current_java_version()}",
-            "识别过程摘要:",
-            *recognition_lines,
-            f"最后一次AI结论: {ai_summary}",
-            "AI 手动兜底摘要:",
-            f"- 用户摘要: {self.last_ai_manual_report.get('user_summary', 'none') if self.last_ai_manual_report else 'none'}",
-            (
-                f"- 手动步骤: {json.dumps(self.last_ai_manual_report.get('suggested_manual_steps', []), ensure_ascii=False)}"
-                if self.last_ai_manual_report
-                else "- 手动步骤: []"
-            ),
-            (
-                f"- 证据: {json.dumps(self.last_ai_manual_report.get('evidence', []), ensure_ascii=False)}"
-                if self.last_ai_manual_report
-                else "- 证据: []"
-            ),
-            "AI高价值分析明细:",
-            *(ai_detail_lines or ["- none"]),
-            "Attempt Trace 索引:",
-            *(attempt_trace_lines or ["- none"]),
-            "完整 Bisect Tree:",
-            *bisect_tree_lines,
-            "已知且已删除客户端mod（本次运行历史）:",
-            *(deleted_history_lines or ["- none"]),
-            "删除 mod 来源分层统计:",
-            *(deleted_source_lines or ["- none"]),
-            f"终止原因: {self.stop_reason or 'success_or_attempt_limit'}",
-            f"总操作数: {len(self.operations)}",
-            "操作记录:",
-            *[f"- {x}" for x in self.operations],
-        ]
-        report_path.write_text("\n".join(lines), encoding="utf-8")
-        return str(report_path)
+        return generate_report(self)
 
     def _build_meta_payload(self) -> dict[str, object]:
-        manifest = self.manifest
-        recognition_summary = self._build_recognition_summary()
-        return {
-            "pack_source": {
-                "input_type": getattr(self.pack_input, "input_type", "unknown"),
-                "source": getattr(self.pack_input, "source", "unknown"),
-                "file_id": getattr(self.pack_input, "file_id", None),
-            },
-            "manifest_summary": {
-                "pack_name": getattr(manifest, "pack_name", "unknown") if manifest else "unknown",
-                "mc_version": getattr(manifest, "mc_version", "unknown") if manifest else "unknown",
-                "loader": getattr(manifest, "loader", "unknown") if manifest else "unknown",
-                "loader_version": getattr(manifest, "loader_version", None) if manifest else None,
-                "build": getattr(manifest, "build", None) if manifest else None,
-                "start_mode": getattr(manifest, "start_mode", "unknown") if manifest else "unknown",
-                "warnings": list(getattr(manifest, "warnings", []) or []) if manifest else [],
-            },
-            "recognition_result": recognition_summary,
-            "java": {
-                "selected_version": self.current_java_version,
-                "detected_version": self.detect_current_java_version(),
-                "xmx": self.jvm_xmx,
-                "xms": self.jvm_xms,
-                "extra_jvm_flags": list(self.extra_jvm_flags),
-            },
-            "start_command": {
-                "mode": self.start_command_mode,
-                "value": self.start_command_value,
-            },
-            "deleted_mods": {
-                "removed_mods": list(self.removed_mods),
-                "bisect_removed_mods": list(self.bisect_removed_mods),
-                "evidence": dict(self.deleted_mod_evidence),
-                "source_breakdown": dict(getattr(self, "deleted_mod_sources", {})),
-            },
-            "ai": {
-                "last_result": asdict(self.last_ai_result) if self.last_ai_result else None,
-                "manual_report": dict(self.last_ai_manual_report),
-            },
-            "attempts": {
-                "attempts_used": self.attempts_used,
-                "run_success": self.run_success,
-                "stop_reason": self.stop_reason,
-                "recognition_attempts": list(self.recognition_attempts),
-            },
-            "operations": list(self.operations),
-        }
+        return build_meta_payload(self)
 
     def package_server(self) -> str:
-        out = self.workdirs.root / "server_pack.zip"
-        excluded_runtime_dirs = {
-            "crash-reports",
-            "logs",
-            "world",
-            "world_nether",
-            "world_the_end",
-        }
-        with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("build_meta.json", json.dumps(self._build_meta_payload(), ensure_ascii=False, indent=2))
-            for p in self.workdirs.server.rglob("*"):
-                if p.is_file() and not any(part in excluded_runtime_dirs for part in p.relative_to(self.workdirs.server).parts):
-                    zf.write(p, p.relative_to(self.workdirs.server))
-            for p in self.workdirs.java_bins.rglob("*"):
-                if p.is_file():
-                    zf.write(p, Path("java_bins") / p.relative_to(self.workdirs.java_bins))
-        return str(out)
+        return package_server(self)
 
     # 主流程
     def run(self) -> dict:
@@ -3004,7 +2565,10 @@ class ServerBuilder:
                         if should_stop:
                             self._log("install.stop", f"AI 决策停止，reason={self.stop_reason}", level="WARN")
                             break
-                        same_issue_count = self._record_success_guard_observation(ai.get("primary_issue"), ai.get("confidence"))
+                        same_issue_count = self._record_success_guard_observation(
+                            str(ai.get("primary_issue") or "other"),
+                            ai.get("confidence"),
+                        )
                         if same_issue_count >= 2:
                             self.stop_reason = "success_guard_same_issue_requires_manual_review"
                             self.last_ai_manual_report = {
@@ -3393,13 +2957,16 @@ class ServerBuilder:
         seen_pairs: set[tuple[int, int]] = set()
         pairs: list[tuple[int, int]] = []
 
-        for mod in files:
-            project_id = mod.get("projectID")
-            file_id = mod.get("fileID")
+        for raw_mod in files:
+            mod = _normalize_curseforge_manifest_entry(raw_mod)
+            if not mod:
+                continue
+            project_id = mod["projectID"]
+            file_id = mod["fileID"]
             if project_id is None or file_id is None:
                 continue
             try:
-                pair = (int(project_id), int(file_id))
+                pair = (int(cast(Any, project_id)), int(cast(Any, file_id)))
             except (TypeError, ValueError):
                 continue
             if pair in seen_pairs:
@@ -3415,65 +2982,83 @@ class ServerBuilder:
         enable_parallel = bool(self.config.download.manifest_resolve_parallel_enabled)
         resolve_workers = max(1, int(self.config.download.manifest_resolve_max_workers or 1))
 
-        pair_to_data: dict[tuple[int, int], dict] = {}
+        pair_to_data: dict[tuple[int, int], CurseForgeFilePayload] = {}
         unresolved_pairs: list[tuple[int, int]] = []
 
         batched: list[list[tuple[int, int]]] = [pairs[i : i + batch_size] for i in range(0, len(pairs), batch_size)]
 
-        def _run_cf_batch(batch_pairs: list[tuple[int, int]]) -> tuple[dict[tuple[int, int], dict], list[tuple[int, int]]]:
-            result, unresolved = self._cf_fetch_files_batch(batch_pairs, retry=batch_retry)
-            return result, unresolved
+        def _run_cf_batch(batch_pairs: list[tuple[int, int]]) -> CurseForgeBatchResolution:
+            return self._cf_fetch_files_batch(batch_pairs, retry=batch_retry)
 
         if enable_parallel and len(batched) > 1:
             workers = min(resolve_workers, len(batched))
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mcasb-cf-batch") as pool:
-                fut_map = {pool.submit(_run_cf_batch, batch): batch for batch in batched}
-                for fut in as_completed(fut_map):
-                    resolved, unresolved = fut.result()
-                    pair_to_data.update(resolved)
-                    unresolved_pairs.extend(unresolved)
+                fut_map: dict[Future[CurseForgeBatchResolution], list[tuple[int, int]]] = {
+                    pool.submit(_run_cf_batch, batch): batch for batch in batched
+                }
+                for batch_fut in as_completed(fut_map):
+                    resolution = batch_fut.result()
+                    pair_to_data.update(resolution.resolved)
+                    unresolved_pairs.extend(resolution.unresolved)
         else:
             for batch in batched:
-                resolved, unresolved = _run_cf_batch(batch)
-                pair_to_data.update(resolved)
-                unresolved_pairs.extend(unresolved)
+                resolution = _run_cf_batch(batch)
+                pair_to_data.update(resolution.resolved)
+                unresolved_pairs.extend(resolution.unresolved)
 
         batched_hit = len(pair_to_data)
 
         if unresolved_pairs:
 
-            def _fetch_single(pair: tuple[int, int]) -> tuple[tuple[int, int], dict | None]:
+            def _fetch_single(pair: tuple[int, int]) -> CurseForgeManifestPairResolution:
                 project_id_val, file_id_val = pair
                 try:
-                    data = self._cf_get_json(f"/v1/mods/{project_id_val}/files/{file_id_val}").get("data") or {}
-                    return pair, data if isinstance(data, dict) and data else None
-                except Exception:
-                    return pair, None
+                    response = self._cf_get_json(f"/v1/mods/{project_id_val}/files/{file_id_val}")
+                    data = _normalize_curseforge_file_payload(response.get("data"))
+                    return CurseForgeManifestPairResolution(pair=pair, data=data)
+                except Exception as exc:
+                    self._record_manifest_failure_event(
+                        platform="curseforge",
+                        subject="manifest_file_fallback",
+                        operation="curseforge_manifest_fallback_failed",
+                        failure=_build_remote_failure_detail("fallback_fetch", exc),
+                        context={"project_id": project_id_val, "file_id": file_id_val},
+                    )
+                    return CurseForgeManifestPairResolution(pair=pair, data=None)
 
             if enable_parallel and len(unresolved_pairs) > 1:
                 workers = min(resolve_workers, len(unresolved_pairs))
                 with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mcasb-cf-fallback") as pool:
-                    fut_map = {pool.submit(_fetch_single, pair): pair for pair in unresolved_pairs}
-                    for fut in as_completed(fut_map):
-                        pair, data = fut.result()
-                        if data:
-                            pair_to_data[pair] = data
+                    fallback_fut_map: dict[Future[CurseForgeManifestPairResolution], tuple[int, int]] = {
+                        pool.submit(_fetch_single, pair): pair for pair in unresolved_pairs
+                    }
+                    for fallback_fut in as_completed(fallback_fut_map):
+                        resolved_pair = fallback_fut.result()
+                        if resolved_pair.data is not None:
+                            pair_to_data[resolved_pair.pair] = resolved_pair.data
                             fallback_hit += 1
                         else:
                             resolve_failed += 1
             else:
                 for pair in unresolved_pairs:
-                    _, data = _fetch_single(pair)
-                    if data:
-                        pair_to_data[pair] = data
+                    resolved_pair = _fetch_single(pair)
+                    if resolved_pair.data is not None:
+                        pair_to_data[pair] = resolved_pair.data
                         fallback_hit += 1
                     else:
                         resolve_failed += 1
 
         for project_id, file_id in pairs:
-            data = pair_to_data.get((project_id, file_id)) or {}
-            if not data:
+            data = pair_to_data.get((project_id, file_id))
+            if data is None:
                 self.operations.append(f"curseforge_mod_meta_missing:{project_id}:{file_id}")
+                self._record_manifest_failure_event(
+                    platform="curseforge",
+                    subject="manifest_mod",
+                    operation="curseforge_mod_meta_missing",
+                    failure=RemoteFailureDetail(stage="resolve", category="fallback_miss", message="manifest metadata unresolved"),
+                    context={"project_id": project_id, "file_id": file_id},
+                )
                 continue
 
             file_name = str(data.get("fileName") or f"cf-{project_id}-{file_id}.jar")
@@ -3481,7 +3066,7 @@ class ServerBuilder:
                 platform="curseforge",
                 file_name=file_name,
                 rel_path=None,
-                platform_hints=self._extract_curseforge_type_hints(data),
+                platform_hints=self._extract_curseforge_type_hints(cast(dict[str, Any], data)),
             )
             if not can_download:
                 skipped_filtered += 1
@@ -3510,9 +3095,16 @@ class ServerBuilder:
                 continue
 
             missing += 1
-            url = data.get("downloadUrl") or self._build_curseforge_edge_download_url(data)
+            url = data.get("downloadUrl") or self._build_curseforge_edge_download_url(cast(dict[str, Any], data))
             if not url:
                 self.operations.append(f"curseforge_mod_no_url:{project_id}:{file_id}")
+                self._record_manifest_failure_event(
+                    platform="curseforge",
+                    subject="manifest_mod",
+                    operation="curseforge_mod_no_url",
+                    failure=RemoteFailureDetail(stage="resolve_url", category="no_url", message="download URL missing"),
+                    context={"project_id": project_id, "file_id": file_id, "file_name": file_name},
+                )
                 continue
 
             tasks.append(DownloadTask(out=dst, urls=[str(url)], stage="install.download.curseforge"))
@@ -3526,6 +3118,13 @@ class ServerBuilder:
             for item in failed_items:
                 failed_task = item.task
                 self.operations.append(f"curseforge_manifest_fill_failed:{failed_task.out.name}:{item.error}")
+                self._record_manifest_failure_event(
+                    platform="curseforge",
+                    subject="manifest_download",
+                    operation="curseforge_manifest_fill_failed",
+                    failure=_build_download_failure_detail(item),
+                    context={"target": failed_task.out.name},
+                )
 
         resolve_elapsed = time.perf_counter() - started_at
         self.operations.append(
@@ -3657,6 +3256,13 @@ class ServerBuilder:
             if not downloads:
                 failed += 1
                 self.operations.append(f"modrinth_manifest_fill_no_url:{normalized_rel}")
+                self._record_manifest_failure_event(
+                    platform="modrinth",
+                    subject="manifest_file",
+                    operation="modrinth_manifest_fill_no_url",
+                    failure=RemoteFailureDetail(stage="resolve_url", category="no_url", message="downloads missing"),
+                    context={"path": normalized_rel, "project_id": project_id, "file_id": file_id},
+                )
                 continue
 
             hashes = item.get("hashes") or {}
@@ -3697,12 +3303,28 @@ class ServerBuilder:
                     self.downloader.download_task(retried)
                     downloaded += 1
                 except Exception as e:
-                    remain.append(DownloadFailure(task=retried, error=f"{type(e).__name__}:{e}"))
+                    remain.append(
+                        DownloadFailure(
+                            task=retried,
+                            error=f"{type(e).__name__}:{e}",
+                            category="fallback_miss",
+                            stage=retried.stage,
+                            exc_type=type(e).__name__,
+                            message=str(e),
+                        )
+                    )
 
             for item in remain:
                 failed += 1
                 safe_unlink(item.task.out)
                 self.operations.append(f"modrinth_manifest_fill_failed:{item.task.out}:{item.error}")
+                self._record_manifest_failure_event(
+                    platform="modrinth",
+                    subject="manifest_download",
+                    operation="modrinth_manifest_fill_failed",
+                    failure=_build_download_failure_detail(item),
+                    context={"target": str(item.task.out)},
+                )
 
         self.operations.append(
             "modrinth_manifest_fill:"
@@ -3723,12 +3345,17 @@ class ServerBuilder:
         if token:
             headers["Authorization"] = token
 
-        return http_get_json(
-            f"{base}{path}",
-            headers=headers,
-            params=params,
-            timeout=60,
-        )
+        try:
+            return http_get_json(
+                f"{base}{path}",
+                headers=headers,
+                params=params,
+                timeout=60,
+                proxies=self._request_proxies(),
+                trust_env=self._request_trust_env(),
+            )
+        except (ExternalRequestError, ExternalResponseError, ExternalDataError) as exc:
+            raise ExternalServiceError(f"Modrinth API 请求失败: {path}") from exc
 
     def _pick_modrinth_pack_version(self, versions: list[dict]) -> dict | None:
         candidates: list[tuple[int, str, dict]] = []
@@ -3787,12 +3414,17 @@ class ServerBuilder:
             "Accept": "application/json",
             "x-api-key": api_key,
         }
-        return http_get_json(
-            f"https://api.curseforge.com{path}",
-            headers=headers,
-            params=params,
-            timeout=60,
-        )
+        try:
+            return http_get_json(
+                f"https://api.curseforge.com{path}",
+                headers=headers,
+                params=params,
+                timeout=60,
+                proxies=self._request_proxies(),
+                trust_env=self._request_trust_env(),
+            )
+        except (ExternalRequestError, ExternalResponseError, ExternalDataError) as exc:
+            raise ExternalServiceError(f"CurseForge API 请求失败: {path}") from exc
 
     def _cf_post_json(self, path: str, payload: dict) -> dict:
         api_key = (self.config.curseforge_api_key or "").strip()
@@ -3804,23 +3436,33 @@ class ServerBuilder:
             "Content-Type": "application/json",
             "x-api-key": api_key,
         }
-        resp = requests.post(
-            f"https://api.curseforge.com{path}",
-            headers=headers,
-            json=payload,
-            timeout=60,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            with self._create_request_session() as session:
+                resp = session.post(
+                    f"https://api.curseforge.com{path}",
+                    headers=headers,
+                    json=payload,
+                    timeout=60,
+                )
+        except requests.RequestException as exc:
+            raise ExternalRequestError(f"CurseForge POST 请求失败: {path}") from exc
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            raise ExternalResponseError(f"CurseForge POST 返回非成功状态: {path} (HTTP {resp.status_code})") from exc
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise ExternalDataError(f"CurseForge POST 响应不是合法 JSON: {path}") from exc
 
     def _cf_fetch_files_batch(
         self,
         pairs: list[tuple[int, int]],
         *,
         retry: int = 0,
-    ) -> tuple[dict[tuple[int, int], dict], list[tuple[int, int]]]:
+    ) -> CurseForgeBatchResolution:
         if not pairs:
-            return {}, []
+            return CurseForgeBatchResolution(resolved={}, unresolved=[])
 
         file_ids = sorted({fid for _, fid in pairs})
         attempts = max(1, retry + 1)
@@ -3829,34 +3471,43 @@ class ServerBuilder:
         for attempt in range(1, attempts + 1):
             try:
                 data_arr = self._cf_post_json("/v1/mods/files", payload={"fileIds": file_ids}).get("data") or []
-                data_map: dict[tuple[int, int], dict] = {}
+                data_map: dict[tuple[int, int], CurseForgeFilePayload] = {}
                 for item in data_arr:
-                    if not isinstance(item, dict):
+                    normalized_item = _normalize_curseforge_file_payload(item)
+                    if normalized_item is None:
                         continue
-                    mod_id = item.get("modId")
-                    fid = item.get("id")
+                    mod_id = normalized_item.get("modId")
+                    fid = normalized_item.get("id")
                     try:
-                        key = (int(mod_id), int(fid))
+                        key = (int(cast(Any, mod_id)), int(cast(Any, fid)))
                     except (TypeError, ValueError):
                         continue
-                    data_map[key] = item
+                    data_map[key] = normalized_item
 
-                resolved: dict[tuple[int, int], dict] = {}
+                resolved: dict[tuple[int, int], CurseForgeFilePayload] = {}
                 unresolved: list[tuple[int, int]] = []
                 for pair in pairs:
                     found = data_map.get(pair)
-                    if found:
+                    if found is not None:
                         resolved[pair] = found
                     else:
                         unresolved.append(pair)
-                return resolved, unresolved
+                return CurseForgeBatchResolution(resolved=resolved, unresolved=unresolved)
             except Exception as e:
                 last_error = e
 
         self.operations.append(
             f"curseforge_manifest_batch_failed:file_ids={len(file_ids)},error={type(last_error).__name__ if last_error else 'unknown'}"
         )
-        return {}, list(pairs)
+        if last_error is not None:
+            self._record_manifest_failure_event(
+                platform="curseforge",
+                subject="manifest_file_batch",
+                operation="curseforge_manifest_batch_failed",
+                failure=_build_remote_failure_detail("batch_fetch", last_error),
+                context={"file_ids": len(file_ids), "attempts": attempts},
+            )
+        return CurseForgeBatchResolution(resolved={}, unresolved=list(pairs))
 
     def _pick_curseforge_pack_file(self, files: list[dict]) -> dict | None:
         zip_files = [f for f in files if str(f.get("fileName", "")).lower().endswith(".zip")]
@@ -4132,22 +3783,77 @@ class ServerBuilder:
                     f"{op_prefix} JSON 类型异常 profile={profile_name}: {type(data).__name__}",
                     level="WARN",
                 )
-            except Exception as e:
-                error_message = str(e).strip()
-                self.operations.append(f"{op_prefix}:request_error:{version}:profile={profile_name}:{type(e).__name__}")
-                error_suffix = f" - {error_message}" if error_message else ""
+            except (ExternalRequestError, ExternalResponseError, ExternalDataError) as e:
+                failure = _build_remote_failure_detail("fetch_json", e)
+                error_suffix = f" - {failure.message}" if failure.message else ""
+                self.operations.append(
+                    f"{op_prefix}:{failure.category}_error:{version}:profile={profile_name}:{failure.exc_type or 'unknown'}"
+                )
                 self._log(
                     stage,
-                    f"{op_prefix} 请求异常 URL={url} profile={profile_name}: {type(e).__name__}{error_suffix}",
+                    f"{op_prefix} 请求异常 URL={url} profile={profile_name}: {failure.exc_type or 'unknown'}{error_suffix}",
                     level="DEBUG",
                 )
                 self._log(
                     stage,
-                    f"{op_prefix} 请求异常 profile={profile_name}: {type(e).__name__}{error_suffix}",
+                    f"{op_prefix} 请求异常 profile={profile_name}: {failure.exc_type or 'unknown'}{error_suffix}",
                     level="WARN",
                 )
 
         return None, ""
+
+    def _record_remote_failure(
+        self,
+        op_prefix: str,
+        version: int | str,
+        failure: RemoteFailureDetail,
+        *,
+        stage: str,
+        profile: str = "",
+    ) -> None:
+        suffix = f":profile={profile}" if profile else ""
+        self.operations.append(f"{op_prefix}_{failure.operation_token()}:{version}{suffix}")
+        self._log(stage, failure.log_message(op_prefix), level="WARN")
+
+    def _append_remote_failure_event(
+        self,
+        *,
+        platform: str,
+        subject: str,
+        failure: RemoteFailureDetail,
+        operation: str,
+        context: Mapping[str, object] | None = None,
+    ) -> None:
+        events = getattr(self, "remote_failure_events", None)
+        if not isinstance(events, list):
+            events = []
+            self.remote_failure_events = events
+        payload: dict[str, object] = {
+            "platform": platform,
+            "subject": subject,
+            "operation": operation,
+            **failure.to_event_payload(),
+        }
+        if context:
+            payload["context"] = {str(key): value for key, value in context.items()}
+        events.append(payload)
+
+    def _record_manifest_failure_event(
+        self,
+        *,
+        platform: str,
+        subject: str,
+        operation: str,
+        failure: RemoteFailureDetail,
+        context: Mapping[str, object] | None = None,
+    ) -> None:
+        self._append_remote_failure_event(
+            platform=platform,
+            subject=subject,
+            operation=operation,
+            failure=failure,
+            context=context,
+        )
 
     def _download_graalvm_from_oracle(self, version: int) -> bool:
         if version not in (21, 25):
@@ -4294,14 +4000,9 @@ class ServerBuilder:
             self.java_params_mode_by_version[version] = "graalvm"
             self.operations.append(f"oracle_graalvm_download_success:{version}:{os_name}:{arch_name}")
             return True
-        except Exception as e:
-            error_message = str(e).strip()
-            self.operations.append(f"oracle_graalvm_download_failed:{version}:{type(e).__name__}")
-            self._log(
-                stage,
-                f"oracle_graalvm_download 下载异常 URL={file_url}: {type(e).__name__}{f' - {error_message}' if error_message else ''}",
-                level="DEBUG",
-            )
+        except (DownloadError, OSError, zipfile.BadZipFile, tarfile.TarError, ValueError) as e:
+            failure = _build_remote_failure_detail("download_or_extract", e)
+            self._record_remote_failure("oracle_graalvm", version, failure, stage=stage)
             self._log(stage, f"Oracle GraalVM 下载失败，手动页面: {manual_url}", level="WARN")
             return False
 
@@ -4316,8 +4017,9 @@ class ServerBuilder:
 
         try:
             releases = http_get_json(api_url, headers=headers, timeout=60)
-        except Exception as e:
-            self.operations.append(f"graalvm17_release_fetch_failed:{type(e).__name__}")
+        except (ExternalRequestError, ExternalResponseError, ExternalDataError) as e:
+            failure = _build_remote_failure_detail("release_fetch", e)
+            self._record_remote_failure("graalvm17", 17, failure, stage="install.download.github_graalvm")
             return False
 
         arch_aliases = self._current_arch_aliases()
@@ -4375,8 +4077,9 @@ class ServerBuilder:
             self.java_params_mode_by_version[17] = "graalvm"
             self.operations.append(f"graalvm17_selected_asset:{name}")
             return True
-        except Exception as e:
-            self.operations.append(f"graalvm17_download_or_extract_failed:{type(e).__name__}")
+        except (DownloadError, OSError, zipfile.BadZipFile, tarfile.TarError, ValueError) as e:
+            failure = _build_remote_failure_detail("download_or_extract", e)
+            self._record_remote_failure("graalvm17", 17, failure, stage="install.download.github_graalvm")
             return False
 
     def _ensure_java_installed(self, version: int) -> bool:
@@ -4453,8 +4156,9 @@ class ServerBuilder:
             self.java_params_mode_by_version[version] = "common_only"
             self.operations.append(f"temurin_download_success:{version}:{os_name}:{arch_name}")
             return True
-        except Exception as e:
-            self.operations.append(f"temurin_download_failed:{version}:{type(e).__name__}")
+        except (DownloadError, OSError, zipfile.BadZipFile, tarfile.TarError, ValueError) as e:
+            failure = _build_remote_failure_detail("download_or_extract", e)
+            self._record_remote_failure("temurin", version, failure, stage="install.download.temurin")
             return False
 
     def _download_dragonwell_from_github(self, version: int) -> bool:
@@ -4469,8 +4173,9 @@ class ServerBuilder:
 
         try:
             releases = http_get_json(api_url, headers=headers, timeout=60)
-        except Exception as e:
-            self.operations.append(f"dragonwell_release_fetch_failed:{repo}:{type(e).__name__}")
+        except (ExternalRequestError, ExternalResponseError, ExternalDataError) as e:
+            failure = _build_remote_failure_detail("release_fetch", e)
+            self._record_remote_failure("dragonwell", repo, failure, stage="install.download.dragonwell")
             return False
 
         asset = self._pick_dragonwell_asset(releases)
@@ -4512,8 +4217,9 @@ class ServerBuilder:
             self.java_params_mode_by_version[version] = "graalvm"
             self.operations.append(f"dragonwell_selected_asset:{repo}:{name}")
             return True
-        except Exception as e:
-            self.operations.append(f"dragonwell_download_or_extract_failed:{repo}:{type(e).__name__}")
+        except (DownloadError, OSError, zipfile.BadZipFile, tarfile.TarError, ValueError) as e:
+            failure = _build_remote_failure_detail("download_or_extract", e)
+            self._record_remote_failure("dragonwell", repo, failure, stage="install.download.dragonwell")
             return False
 
     def _pick_dragonwell_asset(self, releases: list[dict]) -> dict | None:
@@ -4610,9 +4316,12 @@ class ServerBuilder:
 
                 imported += 1
                 self.operations.append(f"graalvm_external_package_imported:{version}:{item}")
-            except Exception as e:
+            except (DownloadError, OSError, zipfile.BadZipFile, tarfile.TarError, ValueError) as e:
                 failed += 1
-                self.operations.append(f"graalvm_external_package_import_failed:{version}:{item}:{type(e).__name__}")
+                failure = _build_remote_failure_detail("external_package_import", e)
+                self.operations.append(
+                    f"graalvm_external_package_import_failed:{version}:{item}:{failure.category}:{failure.exc_type or 'unknown'}"
+                )
 
         self.operations.append(f"graalvm_external_package_import_summary:{version}:ok={imported},failed={failed}")
 
@@ -4880,8 +4589,8 @@ class ServerBuilder:
                     str(execution.get("status") or "unknown"),
                     action_plan=[dict(a)],
                     preflight=[preflight_payload],
-                    execution=[execution],
-                    rollback=[rollback] if rollback else [],
+                    execution=[dict(execution)],
+                    rollback=[dict(rollback)] if rollback else [],
                 )
             if t == "bisect_mods":
                 self._log_bisect_event(
@@ -4940,7 +4649,7 @@ class ServerBuilder:
         task = DownloadTask(out=out, urls=[url], stage=stage, headers=headers, session_factory=session_factory)
         done, failed = self.downloader.download_files([task])
         if failed:
-            raise RuntimeError(f"下载失败: {url} ({failed[0].error})")
+            raise DownloadError(f"下载失败: {url} ({failed[0].error})")
         return done[0]
 
     def _normalize_memory_plan(self, xmx: str, xms: str) -> tuple[str, str]:

@@ -7,7 +7,7 @@
 - 许可证：`GPL-3.0-only`
 - CLI 入口：`mcasb`
 
-核心实现入口：[`main()`](src/mc_auto_server_builder/cli.py#L24)、[`ServerBuilder.run()`](src/mc_auto_server_builder/builder.py#L2129)
+核心实现入口：[`main()`](src/mc_auto_server_builder/cli.py:39)、[`ServerBuilder.run()`](src/mc_auto_server_builder/builder.py:2129)
 
 ---
 
@@ -62,6 +62,19 @@ mcasb /path/to/modpack.zip --config config.local.json --json
 - CurseForge 项目 ID 或链接（如 `396246` / `396246:7760973`）
 - Modrinth 项目 slug/ID 或链接
 
+先做配置校验：
+
+```bash
+mcasb --check-config --config config.local.json
+```
+
+使用 JSON 结果做 CI / 脚本集成：
+
+```bash
+mcasb --check-config --config config.local.json --json
+mcasb /path/to/modpack.zip --config config.local.json --base-dir ./workspace --json
+```
+
 ---
 
 ## 配置要点（高频）
@@ -83,6 +96,8 @@ mcasb /path/to/modpack.zip --config config.local.json --json
   - 并发、超时、重试、终端下载 UI
 - 平台鉴权
   - `curseforge_api_key`、`modrinth_api_token`、`github_api_key` 等
+
+配置文件会拒绝未知字段，入口由 [`AppConfig.load()`](src/mc_auto_server_builder/config.py:203) 负责；CLI 预检由 [`main()`](src/mc_auto_server_builder/cli.py:39) 统一处理，适合在正式构建前先执行 `--check-config`。
 
 ---
 
@@ -142,8 +157,30 @@ pip install -e .[dev]
 
 ```bash
 ruff check .
+mypy src
 pytest
 ```
+
+覆盖率门禁已在 [`pyproject.toml`](pyproject.toml) 中配置，默认执行 `pytest` 时会输出缺失行并校验总覆盖率。
+
+### 测试分层与开发导航
+
+- CLI 入口回归：[`tests/test_cli.py`](tests/test_cli.py)
+- 核心构建/失败分类/动作护栏：[`tests/test_builder.py`](tests/test_builder.py)
+- 配置解析：[`tests/test_config.py`](tests/test_config.py)
+- 输入源解析：[`tests/test_input_parser.py`](tests/test_input_parser.py)
+
+近期已将识别与报告辅助逻辑从超长构建流程中拆出到：
+
+- [`recognition_runtime.py`](src/mc_auto_server_builder/recognition_runtime.py)
+- [`reporting.py`](src/mc_auto_server_builder/reporting.py)
+
+当前开发导航建议：
+
+1. CLI/参数与输出契约看 [`main()`](src/mc_auto_server_builder/cli.py:39)
+2. 识别候选与运行时切换看 [`select_next_recognition_plan()`](src/mc_auto_server_builder/recognition_runtime.py:118)
+3. 识别计划应用与 action preflight 热点看 [`ServerBuilder._apply_recognition_plan()`](src/mc_auto_server_builder/builder.py:1353) 与 [`ServerBuilder._assess_action_preflight()`](src/mc_auto_server_builder/builder.py:1391)
+4. trace/report 产物看 [`generate_report()`](src/mc_auto_server_builder/reporting.py:174)
 
 构建分发包：
 
@@ -158,7 +195,7 @@ CI 流程见 [`CI`](.github/workflows/ci.yml)。
 
 ## 贡献
 
-- 提交前请确保本地通过 `ruff` 与 `pytest`
+- 提交前请确保本地通过 `ruff`、`mypy` 与 `pytest`
 - 建议先提 Issue 再提交 PR
 - 模板：
   - Bug：[`bug_report.md`](.github/ISSUE_TEMPLATE/bug_report.md)
