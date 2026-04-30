@@ -3637,6 +3637,14 @@ class ServerBuilder:
         except Exception as e:
             self.operations.append(f"install_server_core:{loader}:failed:{type(e).__name__}")
 
+        if self._recover_start_command_from_existing_server_artifacts(
+            loader=loader,
+            mc_version=mc_version,
+            loader_version=loader_version,
+            reason=f"install_server_core:recover_existing:{loader}",
+        ):
+            return
+
         # 无法识别或安装失败：保底占位，确保流程不中断
         server_jar = self.workdirs.server / "server.jar"
         if not server_jar.exists():
@@ -4335,6 +4343,84 @@ class ServerBuilder:
         self.start_command_value = normalized_value
         self.operations.append(f"start_command_set:{normalized_mode}:{normalized_value}:{reason}")
 
+    def _pick_installed_server_jar(
+        self,
+        loader: str | None = None,
+        mc_version: str | None = None,
+        loader_version: str | None = None,
+    ) -> str | None:
+        candidates = [path for path in self.workdirs.server.glob("*.jar") if path.is_file()]
+        if not candidates:
+            return None
+
+        normalized_loader = str(loader or getattr(getattr(self, "manifest", None), "loader", "") or "").strip().lower()
+        normalized_mc_version = str(mc_version or getattr(getattr(self, "manifest", None), "mc_version", "") or "").strip().lower()
+        normalized_loader_version = str(
+            loader_version or getattr(getattr(self, "manifest", None), "loader_version", "") or ""
+        ).strip().lower()
+
+        def score(path: Path) -> tuple[int, int, int, str]:
+            name = path.name
+            lower = name.lower()
+            value = 0
+
+            if lower.endswith("-installer.jar") or lower == "forge-installer.jar" or lower == "neoforge-installer.jar":
+                value -= 100
+
+            if normalized_loader == "forge":
+                if lower.startswith("forge-"):
+                    value += 40
+                if lower.startswith("minecraft_server"):
+                    value -= 24
+                if lower.startswith("neoforge-"):
+                    value -= 12
+                if "fabric" in lower or "quilt" in lower:
+                    value -= 12
+            elif normalized_loader == "neoforge":
+                if lower.startswith("neoforge-"):
+                    value += 40
+                if lower.startswith("forge-"):
+                    value += 8
+                if lower.startswith("minecraft_server"):
+                    value -= 24
+                if "fabric" in lower or "quilt" in lower:
+                    value -= 12
+            elif normalized_loader == "fabric":
+                if "fabric" in lower:
+                    value += 40
+                if lower.startswith("minecraft_server"):
+                    value -= 16
+            elif normalized_loader == "quilt":
+                if "quilt" in lower:
+                    value += 40
+                if lower.startswith("minecraft_server"):
+                    value -= 16
+            else:
+                if lower.startswith(("forge-", "neoforge-")) or "fabric" in lower or "quilt" in lower:
+                    value += 16
+
+            if normalized_loader_version:
+                if normalized_loader_version in lower:
+                    value += 20
+                else:
+                    compact_loader_version = normalized_loader_version.split("-", 1)[-1]
+                    if compact_loader_version and compact_loader_version in lower:
+                        value += 12
+
+            if normalized_mc_version and normalized_mc_version in lower:
+                value += 8
+
+            if lower == "server.jar":
+                value -= 10
+            elif "server" in lower:
+                value += 2
+
+            return (value, len(name), -len(lower), lower)
+
+        preferred = sorted(candidates, key=score, reverse=True)[0]
+        self.operations.append(f"start_command_pick_server_jar:{preferred.name}:{normalized_loader or 'unknown'}")
+        return preferred.name
+
     def _parse_start_command_from_run_scripts(self) -> bool:
         run_sh = self.workdirs.server / "run.sh"
         run_bat = self.workdirs.server / "run.bat"
@@ -4413,6 +4499,28 @@ class ServerBuilder:
         rel = preferred.relative_to(self.workdirs.server).as_posix()
         self._set_start_command("argsfile", rel, "modern_loader_args")
         return True
+
+    def _recover_start_command_from_existing_server_artifacts(
+        self,
+        loader: str | None = None,
+        mc_version: str | None = None,
+        loader_version: str | None = None,
+        reason: str = "existing_server_artifacts",
+    ) -> bool:
+        if self._parse_start_command_from_run_scripts():
+            self.operations.append(f"start_command_recovered:run_script:{reason}")
+            return True
+        if self._apply_modern_loader_start_mode():
+            self.operations.append(f"start_command_recovered:argsfile:{reason}")
+            return True
+
+        picked = self._pick_installed_server_jar(loader=loader, mc_version=mc_version, loader_version=loader_version)
+        if picked:
+            self.server_jar_name = picked
+            self._set_start_command("jar", self.server_jar_name, reason)
+            self.operations.append(f"start_command_recovered:jar:{picked}:{reason}")
+            return True
+        return False
 
     def _write_start_script(self) -> None:
         script = self._start_script_path()
@@ -4696,20 +4804,18 @@ class ServerBuilder:
 
             # 部分版本会生成 run.sh/run.bat；否则尝试识别 server jar
             if not (self.workdirs.server / "run.sh").exists() and not (self.workdirs.server / "run.bat").exists():
-                candidates = sorted(self.workdirs.server.glob("*server*.jar"))
-                if candidates:
-                    self.server_jar_name = candidates[-1].name
-                else:
-                    self.server_jar_name = "server.jar"
+                self.server_jar_name = (
+                    self._pick_installed_server_jar(loader=loader, mc_version=mc_version, loader_version=loader_version)
+                    or "server.jar"
+                )
                 self._set_start_command("jar", self.server_jar_name, f"forge_family_fallback:{loader}")
                 return
 
             # 存在 run 脚本但未能解析，回退 jar 推断
-            candidates = sorted(self.workdirs.server.glob("*server*.jar"))
-            if candidates:
-                self.server_jar_name = candidates[-1].name
-            else:
-                self.server_jar_name = "server.jar"
+            self.server_jar_name = (
+                self._pick_installed_server_jar(loader=loader, mc_version=mc_version, loader_version=loader_version)
+                or "server.jar"
+            )
             self._set_start_command("jar", self.server_jar_name, f"forge_family_parse_failed_fallback:{loader}")
         finally:
             self._cleanup_server_install_artifacts(installer_paths)
@@ -4749,11 +4855,10 @@ class ServerBuilder:
                 return
 
             # 优先从已安装产物中推断 server jar，最终回退到 server.jar
-            candidates = sorted(self.workdirs.server.glob("*server*.jar"))
-            if candidates:
-                self.server_jar_name = candidates[-1].name
-            else:
-                self.server_jar_name = "server.jar"
+            self.server_jar_name = (
+                self._pick_installed_server_jar(loader=loader, mc_version=mc_version, loader_version=loader_version)
+                or "server.jar"
+            )
             self._set_start_command("jar", self.server_jar_name, f"fabric_family_parse_failed_fallback:{loader}")
         finally:
             self._cleanup_server_install_artifacts(installer_paths)

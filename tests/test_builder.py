@@ -2680,6 +2680,43 @@ def test_apply_modern_loader_start_mode_prefers_neoforge_candidate_when_manifest
     assert builder.start_command_value == "libraries/net/neoforged/neoforge/21.1.1-beta/unix_args.txt"
 
 
+def test_pick_installed_server_jar_prefers_forge_jar_over_vanilla_server_for_legacy_forge(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.operations = []
+    builder.workdirs = type("WorkDirs", (), {"server": tmp_path})()
+    builder.manifest = PackManifest(
+        pack_name="Pack",
+        mc_version="1.12.2",
+        loader="forge",
+        loader_version="1.12.2-14.23.5.2860",
+    )
+    (tmp_path / "forge-1.12.2-14.23.5.2860.jar").write_text("forge", encoding="utf-8")
+    (tmp_path / "minecraft_server.1.12.2.jar").write_text("vanilla", encoding="utf-8")
+    (tmp_path / "server.jar").write_text("placeholder", encoding="utf-8")
+
+    chosen = ServerBuilder._pick_installed_server_jar(builder)
+
+    assert chosen == "forge-1.12.2-14.23.5.2860.jar"
+
+
+def test_pick_installed_server_jar_prefers_forge_jar_for_1710_style_name(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.operations = []
+    builder.workdirs = type("WorkDirs", (), {"server": tmp_path})()
+    builder.manifest = PackManifest(
+        pack_name="Pack",
+        mc_version="1.7.10",
+        loader="forge",
+        loader_version="1.7.10-10.13.4.1614-1.7.10",
+    )
+    (tmp_path / "forge-1.7.10-10.13.4.1614-1.7.10.jar").write_text("forge", encoding="utf-8")
+    (tmp_path / "minecraft_server.1.7.10.jar").write_text("vanilla", encoding="utf-8")
+
+    chosen = ServerBuilder._pick_installed_server_jar(builder)
+
+    assert chosen == "forge-1.7.10-10.13.4.1614-1.7.10.jar"
+
+
 def test_build_meta_payload_contains_recognition_and_runtime_state():
     builder = ServerBuilder.__new__(ServerBuilder)
     builder.pack_input = type("PackInput", (), {"input_type": "local_zip", "source": "pack.zip", "file_id": None})()
@@ -3511,6 +3548,39 @@ def test_install_server_core_uses_split_loader_branches():
     ServerBuilder._install_server_core(builder)
 
     assert called == ["fabric:quilt"]
+
+
+def test_install_server_core_recovers_existing_forge_jar_when_installer_fails(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.manifest = PackManifest(
+        pack_name="demo",
+        mc_version="1.12.2",
+        loader="forge",
+        loader_version="1.12.2-14.23.5.2860",
+    )
+    builder.operations = []
+    builder.server_jar_name = "server.jar"
+    builder.start_command_mode = "jar"
+    builder.start_command_value = builder.server_jar_name
+    builder.workdirs = type("WorkDirs", (), {"server": tmp_path})()
+    builder._set_start_command = ServerBuilder._set_start_command.__get__(builder, ServerBuilder)
+    builder._pick_installed_server_jar = ServerBuilder._pick_installed_server_jar.__get__(builder, ServerBuilder)
+    builder._recover_start_command_from_existing_server_artifacts = (
+        ServerBuilder._recover_start_command_from_existing_server_artifacts.__get__(builder, ServerBuilder)
+    )
+    builder._parse_start_command_from_run_scripts = lambda: False
+    builder._apply_modern_loader_start_mode = lambda: False
+    builder._install_forge_like_server = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("installer failed"))
+    builder._install_fabric_like_server = lambda **_kwargs: None
+    (tmp_path / "forge-1.12.2-14.23.5.2860.jar").write_text("forge", encoding="utf-8")
+
+    ServerBuilder._install_server_core(builder)
+
+    assert builder.server_jar_name == "forge-1.12.2-14.23.5.2860.jar"
+    assert builder.start_command_value == "forge-1.12.2-14.23.5.2860.jar"
+    assert not (tmp_path / "server.jar").exists()
+    assert any(op == "install_server_core:forge:failed:RuntimeError" for op in builder.operations)
+    assert any(op.startswith("start_command_recovered:jar:forge-1.12.2-14.23.5.2860.jar") for op in builder.operations)
 
 
 def test_extract_latest_crash_mod_issue_returns_latest_section():
