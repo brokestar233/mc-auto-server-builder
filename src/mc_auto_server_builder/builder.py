@@ -14,7 +14,6 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Literal, Mapping, TypedDict, cast
-from urllib.parse import urlparse
 
 import psutil
 import requests
@@ -55,8 +54,6 @@ from .bisect_runtime import (
 from .config import AppConfig
 from .defaults import (
     SUPPORTED_JAVA_VERSIONS,
-    get_common_jvm_params,
-    get_jvm_params_for_java_version,
 )
 from .diagnostics import (
     build_dependency_graph,
@@ -71,6 +68,13 @@ from .install_runtime import (
     prepare_runtime_environment,
     prepare_server_files,
     resolve_pack_and_manifest,
+)
+from .java_runtime import (
+    download_recommended_java,
+    ensure_java_installed,
+    import_graalvm_external_packages,
+    java_bin_path,
+    resolve_java_params_for_version,
 )
 from .mod_runtime import (
     add_remove_regex,
@@ -178,11 +182,9 @@ from .util import (
     adoptium_platform_triplet,
     configure_requests_session,
     extract_archive,
-    extract_archive_payload_into,
     gb_to_mem_str,
     graceful_stop_process,
     http_get_json,
-    is_http_url,
     is_local_tcp_port_open,
     normalize_client_relative_path,
     normalize_java_home_layout,
@@ -2803,43 +2805,13 @@ class ServerBuilder:
         self._install_fabric_family_server(loader="quilt", mc_version=mc_version, loader_version=loader_version)
 
     def _download_recommended_java(self) -> None:
-        if not self.manifest:
-            return
-        version = choose_latest_lts_java_version()
-        try:
-            version = choose_java_version(self.manifest)
-        except Exception:
-            version = choose_latest_lts_java_version()
-
-        if self._ensure_java_installed(version):
-            self.current_java_bin = self._java_bin_path(version)
-            self.current_java_version = version
-            self._import_graalvm_external_packages(version)
-            self.operations.append(f"download_java:installed_target_{version}")
-        else:
-            # 回退系统 Java，避免中断主流程
-            self.current_java_bin = Path("java")
-            self.current_java_version = version
-            self.operations.append(f"download_java:fallback_system_java_target_{version}")
-
-        self.extra_jvm_flags = list(
-            dict.fromkeys(
-                [
-                    *self._resolve_java_params_for_version(version),
-                    *self.config.extra_jvm_flags,
-                ]
-            )
-        )
+        download_recommended_java(self)
 
     def _resolve_java_params_for_version(self, version: int) -> list[str]:
-        mode = self.java_params_mode_by_version.get(version)
-        if mode == "common_only":
-            return get_common_jvm_params()
-        return get_jvm_params_for_java_version(version)
+        return resolve_java_params_for_version(self, version)
 
     def _java_bin_path(self, version: int) -> Path:
-        bin_name = "java.exe" if os.name == "nt" else "java"
-        return self.workdirs.java_bins / f"jdk-{version}" / "bin" / bin_name
+        return java_bin_path(self, version)
 
     def _oracle_graalvm_manual_page_url(self) -> str:
         return "https://www.oracle.com/downloads/graalvm-downloads.html"
@@ -3216,40 +3188,7 @@ class ServerBuilder:
             return False
 
     def _ensure_java_installed(self, version: int) -> bool:
-        java_bin = self._java_bin_path(version)
-        if java_bin.exists():
-            if version in (17, 21, 25) and version not in self.java_params_mode_by_version:
-                self.java_params_mode_by_version[version] = "graalvm"
-            return True
-
-        # Java 8/11：仅 Dragonwell（不回退 Adoptium）
-        if version in (8, 11):
-            if self._download_dragonwell_from_github(version):
-                self.java_params_mode_by_version[version] = "graalvm"
-                return self._java_bin_path(version).exists()
-            return False
-
-        # Java 17：优先 GitHub Releases 的 graalvm17，失败回退 Adoptium（并降级参数为 common_only）
-        if version == 17:
-            if self._download_graalvm17_from_github():
-                return self._java_bin_path(version).exists()
-            if self._download_temurin_from_adoptium(version):
-                self.java_params_mode_by_version[version] = "common_only"
-                self.operations.append(f"java_params_mode_fallback_common:{version}")
-                return self._java_bin_path(version).exists()
-            return False
-
-        # Java 21/25：优先 Oracle GraalVM，失败回退 Adoptium（并降级参数为 common_only）
-        if version in (21, 25):
-            if self._download_graalvm_from_oracle(version):
-                return self._java_bin_path(version).exists()
-            if self._download_temurin_from_adoptium(version):
-                self.java_params_mode_by_version[version] = "common_only"
-                self.operations.append(f"java_params_mode_fallback_common:{version}")
-                return self._java_bin_path(version).exists()
-            return False
-
-        return False
+        return ensure_java_installed(self, version)
 
     def _download_temurin_from_adoptium(self, version: int) -> bool:
         try:
@@ -3411,52 +3350,7 @@ class ServerBuilder:
         return {machine}
 
     def _import_graalvm_external_packages(self, version: int) -> None:
-        if version not in (17, 21, 25):
-            return
-        items = [str(x).strip() for x in self.config.graalvm_external_packages if str(x).strip()]
-        if not items:
-            return
-
-        java_home = self.workdirs.java_bins / f"jdk-{version}"
-        if not java_home.exists():
-            return
-
-        imported = 0
-        failed = 0
-        ext_dir = java_home / "external_packages"
-        ext_dir.mkdir(parents=True, exist_ok=True)
-
-        for idx, item in enumerate(items, start=1):
-            try:
-                if is_http_url(item):
-                    parsed = urlparse(item)
-                    filename = Path(parsed.path).name or f"external-{idx}.bin"
-                    local_artifact = self.workdirs.java_bins / "external_packages" / filename
-                    self._download_file(item, local_artifact)
-                    src = local_artifact
-                else:
-                    src = Path(item)
-                    if not src.is_absolute():
-                        src = (self.base_dir / src).resolve()
-                    if not src.exists() or not src.is_file():
-                        raise FileNotFoundError(str(src))
-
-                lower_name = src.name.lower()
-                if lower_name.endswith(".zip") or lower_name.endswith(".tar.gz") or lower_name.endswith(".tgz"):
-                    extract_archive_payload_into(src, ext_dir, tag=f"pkg_{idx}")
-                else:
-                    shutil.copy2(src, ext_dir / src.name)
-
-                imported += 1
-                self.operations.append(f"graalvm_external_package_imported:{version}:{item}")
-            except (DownloadError, OSError, zipfile.BadZipFile, tarfile.TarError, ValueError) as e:
-                failed += 1
-                failure = _build_remote_failure_detail("external_package_import", e)
-                self.operations.append(
-                    f"graalvm_external_package_import_failed:{version}:{item}:{failure.category}:{failure.exc_type or 'unknown'}"
-                )
-
-        self.operations.append(f"graalvm_external_package_import_summary:{version}:ok={imported},failed={failed}")
+        import_graalvm_external_packages(self, version)
 
     def _set_start_command(self, mode: str, value: str, reason: str) -> None:
         set_start_command(self, mode, value, reason)
