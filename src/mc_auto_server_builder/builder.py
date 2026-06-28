@@ -68,7 +68,6 @@ from .input_parser import parse_pack_input
 from .install_runtime import (
     download_curseforge_pack,
     download_modrinth_pack,
-    extract_full_pack_version_payload_if_needed,
     prepare_runtime_environment,
     prepare_server_files,
     resolve_pack_and_manifest,
@@ -100,6 +99,14 @@ from .models import (
     PackInput,
     PackManifest,
     WorkDirs,
+)
+from .pack_runtime import (
+    classify_manifest_file_type,
+    copy_client_files_with_blacklist,
+    extract_curseforge_type_hints,
+    extract_full_pack_version_payload_if_needed,
+    extract_modrinth_type_hints,
+    manifest_target_path,
 )
 from .recognition import RecognitionFallbackPlan, choose_java_version, choose_latest_lts_java_version
 from .recognition_runtime import (
@@ -2103,24 +2110,10 @@ class ServerBuilder:
         return download_curseforge_pack(self, project_id, file_id=file_id)
 
     def _extract_curseforge_type_hints(self, file_data: dict) -> list[str]:
-        hints: list[str] = []
-        for key in ("gameVersions", "displayName", "fileName"):
-            val = file_data.get(key)
-            if isinstance(val, list):
-                hints.extend(str(x) for x in val if str(x).strip())
-            elif val is not None and str(val).strip():
-                hints.append(str(val))
-        return hints
+        return extract_curseforge_type_hints(self, file_data)
 
     def _extract_modrinth_type_hints(self, item: dict) -> list[str]:
-        hints: list[str] = []
-        for key in ("project_type", "projectType", "file_type", "fileType", "tags"):
-            val = item.get(key)
-            if isinstance(val, list):
-                hints.extend(str(x) for x in val if str(x).strip())
-            elif val is not None and str(val).strip():
-                hints.append(str(val))
-        return hints
+        return extract_modrinth_type_hints(self, item)
 
     def _classify_manifest_file_type(
         self,
@@ -2130,69 +2123,16 @@ class ServerBuilder:
         rel_path: str | None,
         platform_hints: list[str],
     ) -> tuple[str, bool, str]:
-        def _contains_any(text: str, patterns: set[str]) -> bool:
-            return any(p in text for p in patterns)
-
-        shader_patterns = {"shader", "shaders", "shaderpack", "shaderpacks"}
-        resource_patterns = {
-            "resourcepack",
-            "resourcepacks",
-            "resource-pack",
-            "resource_pack",
-            "texturepack",
-            "texturepacks",
-            "texture-pack",
-            "texture_pack",
-        }
-        plugin_patterns = {"plugin", "plugins", "bukkit", "spigot", "paper", "purpur", "bungeecord", "velocity"}
-        datapack_patterns = {"datapack", "datapacks", "data-pack", "data_pack", "pack.mcmeta"}
-        mod_patterns = {"mod", "mods"}
-
-        normalized_hints = " ".join(str(x).strip().lower() for x in platform_hints if str(x).strip())
-        if normalized_hints:
-            if _contains_any(normalized_hints, shader_patterns):
-                return "shader", False, "platform_hint:shader"
-            if _contains_any(normalized_hints, resource_patterns):
-                return "resourcepack", False, "platform_hint:resourcepack"
-            if _contains_any(normalized_hints, plugin_patterns):
-                return "plugin", True, "platform_hint:plugin"
-            if _contains_any(normalized_hints, datapack_patterns):
-                return "datapack", True, "platform_hint:datapack"
-            if _contains_any(normalized_hints, mod_patterns):
-                return "mod", True, "platform_hint:mod"
-
-        merged = " ".join(filter(None, [file_name, rel_path or ""])).strip().lower()
-        if merged:
-            if _contains_any(merged, shader_patterns):
-                return "shader", False, "name_or_path:shader"
-            if _contains_any(merged, resource_patterns):
-                return "resourcepack", False, "name_or_path:resourcepack"
-            if _contains_any(merged, plugin_patterns):
-                return "plugin", True, "name_or_path:plugin"
-            if _contains_any(merged, datapack_patterns):
-                return "datapack", True, "name_or_path:datapack"
-            if _contains_any(merged, mod_patterns):
-                return "mod", True, "name_or_path:mod"
-
-        suffix = Path(file_name).suffix.lower()
-        if suffix in {".jar", ".litemod"}:
-            return "mod", True, "file_ext:jar_like_default_mod"
-
-        return "unknown", False, f"unrecognized:{platform}"
+        return classify_manifest_file_type(
+            self,
+            platform=platform,
+            file_name=file_name,
+            rel_path=rel_path,
+            platform_hints=platform_hints,
+        )
 
     def _manifest_target_path(self, file_type: str, file_name: str, rel_path: str | None = None) -> Path:
-        clean_name = (file_name or "").strip() or "unnamed.bin"
-        if file_type == "plugin":
-            return self.workdirs.client_temp / "plugins" / clean_name
-        if file_type == "datapack":
-            return self.workdirs.client_temp / "datapacks" / clean_name
-        if file_type == "mod":
-            return self.workdirs.client_temp / "mods" / clean_name
-
-        normalized_rel = normalize_client_relative_path(rel_path or "")
-        if normalized_rel:
-            return self.workdirs.client_temp / normalized_rel
-        return self.workdirs.client_temp / clean_name
+        return manifest_target_path(self, file_type, file_name, rel_path=rel_path)
 
     def _record_manifest_type_decision(
         self,
@@ -2764,69 +2704,7 @@ class ServerBuilder:
         return f"https://edge.forgecdn.net/files/{num // 1000}/{num % 1000:03d}/{file_name}"
 
     def _copy_client_files_with_blacklist(self, blacklist: set[str]) -> tuple[int, int]:
-        copied = 0
-        skipped = 0
-
-        base = self.workdirs.client_temp
-        roots: list[Path] = [base]
-
-        base_files = [p for p in base.iterdir() if p.is_file()]
-
-        # 一些压缩包会再包一层根目录，兜底纳入扫描
-        top_dirs = [p for p in base.iterdir() if p.is_dir()]
-        if len(top_dirs) == 1:
-            nested_root = top_dirs[0]
-            if nested_root.name.lower() not in {
-                "overrides",
-                "override",
-                "server-overrides",
-                "server_overrides",
-                "serveroverrides",
-                "server",
-                "serverfiles",
-                "server-files",
-                "serverpack",
-                "server_pack",
-                "resourcepacks",
-            }:
-                # 若 client_temp 仅有一层根目录且没有根层文件，则仅展开该目录内容，避免多一层路径
-                if not base_files:
-                    roots = [nested_root]
-                else:
-                    roots.append(nested_root)
-
-        # 去重保持顺序
-        dedup_roots: list[Path] = []
-        seen: set[Path] = set()
-        for r in roots:
-            if r not in seen and r.exists() and r.is_dir():
-                dedup_roots.append(r)
-                seen.add(r)
-
-        for root in dedup_roots:
-            for src in root.iterdir():
-                name_lc = src.name.lower()
-
-                # overrides 必须在 prepare 阶段被扁平合并，不允许作为目录层级进入 server
-                if name_lc in {"overrides", "override", "server-overrides", "server_overrides", "serveroverrides"}:
-                    skipped += 1
-                    continue
-                if name_lc == "resourcepacks" and src.is_dir():
-                    kept = self._extract_server_resourcepacks(src)
-                    if kept:
-                        copied += kept
-                    else:
-                        skipped += 1
-                    continue
-                if name_lc in blacklist:
-                    skipped += 1
-                    continue
-
-                dst = self.workdirs.server / src.name
-                replace_path(src, dst)
-                copied += 1
-
-        return copied, skipped
+        return copy_client_files_with_blacklist(self, blacklist)
 
     def _extract_server_resourcepacks(self, resourcepacks_dir: Path) -> int:
         if not resourcepacks_dir.exists() or not resourcepacks_dir.is_dir():
