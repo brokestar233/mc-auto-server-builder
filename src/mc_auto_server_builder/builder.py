@@ -73,6 +73,22 @@ from .install_runtime import (
     prepare_server_files,
     resolve_pack_and_manifest,
 )
+from .mod_runtime import (
+    add_remove_regex,
+    apply_known_client_blacklist,
+    apply_recognition_based_client_cleanup,
+    backup_mods,
+    list_current_installed_client_mods,
+    list_mods,
+    normalize_mod_token,
+    record_deleted_client_mod,
+    record_deleted_mod_detail,
+    remove_mods_by_name,
+    remove_mods_by_regex,
+    resolve_dependency_cleanup_targets,
+    resolve_mod_names_to_installed,
+    rollback_mods,
+)
 from .models import (
     ActionPreflight,
     AIResult,
@@ -145,7 +161,6 @@ from .util import (
     ExternalServiceError,
     StructuredLogger,
     adoptium_platform_triplet,
-    backup_directory,
     configure_requests_session,
     extract_archive,
     extract_archive_payload_into,
@@ -540,6 +555,7 @@ class ServerBuilder:
         self.bisect_removed_mods: list[str] = []
         self.known_deleted_client_mods: set[str] = set()
         self.deleted_mod_evidence: dict[str, list[str]] = {}
+        self.deleted_mod_sources: dict[str, dict[str, list[str]]] = {}
         self.last_ai_payload: dict[str, object] = {}
         self.last_ai_result: AIResult | None = None
         self.last_ai_manual_report: dict[str, object] = {}
@@ -657,212 +673,43 @@ class ServerBuilder:
 
     # 文件与mods操作
     def list_mods(self) -> list[str]:
-        mods_dir = self.workdirs.server / "mods"
-        if not mods_dir.exists():
-            return []
-        return sorted([p.name for p in mods_dir.glob("*.jar") if p.is_file()])
+        return list_mods(self)
 
     def _record_deleted_client_mod(self, mod_name: str, source: str, reason: str) -> None:
-        clean = str(mod_name or "").strip()
-        if not clean:
-            return
-        self.known_deleted_client_mods.add(clean)
-        evidence = f"{source}:{reason}"
-        existing = self.deleted_mod_evidence.setdefault(clean, [])
-        if evidence not in existing:
-            existing.append(evidence)
+        record_deleted_client_mod(self, mod_name, source, reason)
 
     def _record_deleted_mod_detail(self, mod_name: str, category: str, source: str, reason: str) -> None:
-        clean = str(mod_name or "").strip()
-        if not clean:
-            return
-        detail_map = getattr(self, "deleted_mod_sources", None)
-        if not isinstance(detail_map, dict):
-            detail_map = {}
-            self.deleted_mod_sources = detail_map
-        entry = detail_map.setdefault(
-            clean,
-            {
-                "builtin_rule": [],
-                "user_rule": [],
-                "ai_suggested": [],
-                "dependency_cleanup": [],
-                "bisect": [],
-                "other": [],
-            },
-        )
-        bucket = category if category in entry else "other"
-        payload = f"{source}:{reason}"
-        if payload not in entry[bucket]:
-            entry[bucket].append(payload)
+        record_deleted_mod_detail(self, mod_name, category, source, reason)
 
     def _normalize_mod_token(self, value: str) -> str:
-        token = str(value or "").strip().lower()
-        token = token.removesuffix(".jar")
-        token = re.sub(r"[\s_\-\.]+", "", token)
-        return token
+        return normalize_mod_token(self, value)
 
     def _resolve_mod_names_to_installed(self, names: list[str], candidates: list[str] | None = None) -> list[str]:
-        mods = candidates if candidates is not None else self.list_mods()
-        if not mods:
-            return []
-
-        exact = {m: m for m in mods}
-        lower_map = {m.lower(): m for m in mods}
-        token_map = {self._normalize_mod_token(m): m for m in mods}
-        resolved: list[str] = []
-        for raw in names:
-            val = str(raw or "").strip()
-            if not val:
-                continue
-            if val in exact:
-                pick = exact[val]
-            elif val.lower() in lower_map:
-                pick = lower_map[val.lower()]
-            else:
-                t = self._normalize_mod_token(val)
-                pick = token_map.get(t) or ""
-                if not pick and t:
-                    for tk, mod_name in token_map.items():
-                        if t in tk or tk in t:
-                            pick = mod_name
-                            break
-            if pick and pick not in resolved:
-                resolved.append(pick)
-        return resolved
+        return resolve_mod_names_to_installed(self, names, candidates=candidates)
 
     def list_current_installed_client_mods(self) -> list[str]:
-        mods = self.list_mods()
-        if not mods:
-            return []
-
-        patterns = self.rule_db.list_rules()
-        compiled: list[tuple[str, re.Pattern[str]]] = []
-        for pat in patterns:
-            try:
-                compiled.append((pat, re.compile(pat)))
-            except re.error:
-                continue
-
-        matched: list[str] = []
-        for mod in mods:
-            if any(cre.search(mod) for _, cre in compiled):
-                matched.append(mod)
-        return sorted(dict.fromkeys(matched))
+        return list_current_installed_client_mods(self)
 
     def remove_mods_by_name(self, names: list[str], source: str = "manual", reason: str = ""):
-        mods_dir = self.workdirs.server / "mods"
-        for n in names:
-            target = mods_dir / n
-            if target.exists():
-                target.unlink()
-                if source == "bisect":
-                    self.bisect_removed_mods.append(n)
-                else:
-                    self.removed_mods.append(n)
-                self.operations.append(f"remove_mod_by_name:{n}")
-                if source == "ai":
-                    self._log("install.remove_mod", f"删除mod:{n} 原因:{reason}")
-                self._record_deleted_client_mod(n, source=source, reason=reason or "explicit_name")
-                category = "other"
-                if source == "bisect":
-                    category = "bisect"
-                elif source == "builtin_rule":
-                    category = "builtin_rule"
-                elif source in {"regex_rule", "user_rule"}:
-                    category = "user_rule"
-                elif source == "ai":
-                    category = "ai_suggested"
-                elif source == "dependency_cleanup":
-                    category = "dependency_cleanup"
-                self._record_deleted_mod_detail(n, category=category, source=source, reason=reason or "explicit_name")
+        remove_mods_by_name(self, names, source=source, reason=reason)
 
     def remove_mods_by_regex(self, patterns: list[str], source: str = "regex_rule"):
-        for pat in patterns:
-            try:
-                cre = re.compile(pat)
-            except re.error:
-                self._log("install.blacklist", f"忽略非法正则规则: {pat}", level="WARN")
-                self.operations.append(f"remove_mods_by_regex_invalid:{pat}")
-                continue
-
-            mods = self.list_mods()
-            if not mods:
-                break
-
-            matched = [m for m in mods if cre.search(m)]
-            for mod_name in matched:
-                self._log("install.blacklist.match", f"命中黑名单规则: pattern={pat} -> mod={mod_name}")
-            self.remove_mods_by_name(matched, source=source, reason=f"pattern={pat}")
+        remove_mods_by_regex(self, patterns, source=source)
 
     def add_remove_regex(self, pattern: str, desc: str = ""):
-        self.rule_db.add_rule(pattern, desc)
-        self.operations.append(f"add_remove_regex:{pattern}")
+        add_remove_regex(self, pattern, desc=desc)
 
     def apply_known_client_blacklist(self):
-        patterns = self.rule_db.list_rules()
-        self.remove_mods_by_regex(patterns, source="builtin_rule")
+        apply_known_client_blacklist(self)
 
     def apply_recognition_based_client_cleanup(self) -> list[str]:
-        manifest = getattr(self, "manifest", None)
-        if not manifest:
-            return []
-        mods_dir = self.workdirs.server / "mods"
-        if not mods_dir.exists():
-            return []
-
-        removal_patterns = (
-            (
-                re.compile(r"(?:fancymenu|embeddiumplus|oculus|rubidium|sodiumextras|reeses[_\-.]?sodium)", re.IGNORECASE),
-                "client_visual_mod",
-            ),
-            (re.compile(r"(?:xaeros[_\-.]?minimap|journeymap|controlling|notenoughanimations)", re.IGNORECASE), "client_utility_mod"),
-            (re.compile(r"(?:presencefootsteps|entityculling|3dskinlayers|skinlayers)", re.IGNORECASE), "client_render_mod"),
-        )
-        removed: list[str] = []
-        for mod_path in sorted(mods_dir.glob("*.jar"), key=lambda p: p.name.lower()):
-            for pattern, reason in removal_patterns:
-                if pattern.search(mod_path.name):
-                    self.remove_mods_by_name(
-                        [mod_path.name],
-                        source="dependency_cleanup",
-                        reason=f"recognition_prior_cleanup:{reason}",
-                    )
-                    removed.append(mod_path.name)
-                    break
-        if removed:
-            self.operations.append(f"recognition_prior_cleanup:removed={json.dumps(removed, ensure_ascii=False)}")
-        return removed
+        return apply_recognition_based_client_cleanup(self)
 
     def backup_mods(self, tag: str):
-        mods_dir = self.workdirs.server / "mods"
-        if not mods_dir.exists():
-            return
-
-        signature = tuple(
-            sorted(
-                str(path.relative_to(mods_dir)).replace("\\", "/")
-                for path in mods_dir.rglob("*")
-                if path.is_file()
-            )
-        )
-        previous_signature = self._mods_backup_signatures.get(tag)
-        if previous_signature == signature:
-            self.operations.append(f"backup_mods_skip_unchanged:{tag}")
-            return
-
-        backup_directory(mods_dir, self.workdirs.backups, f"mods_{tag}")
-        self._mods_backup_signatures[tag] = signature
-        self.operations.append(f"backup_mods:{tag}")
+        backup_mods(self, tag)
 
     def rollback_mods(self, tag: str):
-        src = self.workdirs.backups / f"mods_{tag}"
-        dst = self.workdirs.server / "mods"
-        if src.exists():
-            if dst.exists():
-                shutil.rmtree(dst)
-            shutil.copytree(src, dst)
-            self.operations.append(f"rollback_mods:{tag}")
+        rollback_mods(self, tag)
 
     def _split_mods_for_bisect(self, mods: list[str]) -> tuple[list[str], list[str]]:
         clean = sorted({str(x).strip() for x in mods if str(x).strip()}, key=lambda x: x.lower())
@@ -2091,34 +1938,7 @@ class ServerBuilder:
         dependency_chains: list[list[str]],
         installed_mods: list[str],
     ) -> tuple[list[str], list[str], list[list[str]]]:
-        if not dependency_chains or not installed_mods or not self.known_deleted_client_mods:
-            return [], [], []
-
-        known_deleted_tokens = {self._normalize_mod_token(x) for x in self.known_deleted_client_mods if str(x).strip()}
-        forced_names: list[str] = []
-        rationale: list[str] = []
-        matched_chains: list[list[str]] = []
-
-        for chain in dependency_chains:
-            clean_chain = [str(x).strip() for x in chain if str(x).strip()]
-            if len(clean_chain) < 2:
-                continue
-
-            hit_indexes = [idx for idx, node in enumerate(clean_chain) if self._normalize_mod_token(node) in known_deleted_tokens]
-            if not hit_indexes:
-                continue
-
-            matched_chains.append(clean_chain)
-            for hit_idx in hit_indexes:
-                deleted_node = clean_chain[hit_idx]
-                dependents = clean_chain[:hit_idx]
-                resolved = self._resolve_mod_names_to_installed(dependents, candidates=installed_mods)
-                for dep in resolved:
-                    if dep not in forced_names:
-                        forced_names.append(dep)
-                    rationale.append(f"{dep} 依赖已删除客户端mod {deleted_node}，触发强制删除")
-
-        return forced_names, rationale, matched_chains
+        return resolve_dependency_cleanup_targets(self, dependency_chains, installed_mods)
 
     def _build_openai_messages(self, prompt: str) -> list[dict[str, str]]:
         return self.ai_service._build_openai_messages(prompt)
