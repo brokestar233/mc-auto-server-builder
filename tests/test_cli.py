@@ -51,10 +51,11 @@ def test_main_build_path_invokes_builder_and_outputs_json(tmp_path, monkeypatch,
     captured: dict[str, object] = {}
 
     class FakeBuilder:
-        def __init__(self, source: str, config: object, base_dir: str):
+        def __init__(self, source: str, config: object, base_dir: str, resume_dir: str | None = None):
             captured["source"] = source
             captured["config"] = config
             captured["base_dir"] = base_dir
+            captured["resume_dir"] = resume_dir
 
         def run(self) -> dict[str, object]:
             return {
@@ -85,10 +86,11 @@ def test_main_build_path_renders_human_summary_without_json(tmp_path, monkeypatc
     source_path.write_text("zip", encoding="utf-8")
 
     class FakeBuilder:
-        def __init__(self, source: str, config: object, base_dir: str):
+        def __init__(self, source: str, config: object, base_dir: str, resume_dir: str | None = None):
             self.source = source
             self.config = config
             self.base_dir = base_dir
+            self.resume_dir = resume_dir
 
         def run(self) -> dict[str, object]:
             return {
@@ -117,10 +119,11 @@ def test_main_proxy_override_updates_config(tmp_path, monkeypatch, capsys):
     captured: dict[str, object] = {}
 
     class FakeBuilder:
-        def __init__(self, source: str, config: object, base_dir: str):
+        def __init__(self, source: str, config: object, base_dir: str, resume_dir: str | None = None):
             captured["source"] = source
             captured["config"] = config
             captured["base_dir"] = base_dir
+            captured["resume_dir"] = resume_dir
 
         def run(self) -> dict[str, object]:
             return {
@@ -156,3 +159,34 @@ def test_main_proxy_override_updates_config(tmp_path, monkeypatch, capsys):
     assert config.proxy.all == "http://127.0.0.1:7890"
     assert config.proxy.no_proxy == "localhost,127.0.0.1"
     assert config.proxy.trust_env is False
+
+
+def test_main_resume_allows_missing_source_and_passes_resume_dir(tmp_path, monkeypatch, capsys):
+    resume_dir = tmp_path / "runs" / "workdir_123"
+    resume_dir.mkdir(parents=True)
+    (resume_dir / "run_state.json").write_text(json.dumps({"source_input": "12345"}), encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    class FakeBuilder:
+        def __init__(self, source: str | None, config: object, base_dir: str, resume_dir: str | None = None):
+            captured["source"] = source
+            captured["base_dir"] = base_dir
+            captured["resume_dir"] = resume_dir
+
+        def run(self) -> dict[str, object]:
+            return {
+                "success": True,
+                "workdir": str(resume_dir),
+                "report": str(resume_dir / "report.txt"),
+                "package": str(resume_dir / "server_pack.zip"),
+            }
+
+    monkeypatch.setattr(cli, "ServerBuilder", FakeBuilder)
+    monkeypatch.setattr("sys.argv", ["mcasb", "--resume", str(resume_dir), "--json"])
+
+    cli.main()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["success"] is True
+    assert captured["source"] is None
+    assert captured["resume_dir"] == str(resume_dir)

@@ -403,6 +403,140 @@ def test_ai_provider_does_not_retry_external_data_error():
     )
 
 
+def test_call_openai_compatible_chat_includes_json_schema_response_format():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.config = SimpleNamespace(
+        ai=SimpleNamespace(
+            provider="openai_compatible",
+            base_url="https://api.example.com",
+            chat_path="/v1/chat/completions",
+            endpoint="",
+            model="gpt-test",
+            timeout_sec=5,
+            max_retries=0,
+            retry_backoff_sec=0.0,
+            enabled=True,
+            debug=False,
+            stream=False,
+            temperature=0.2,
+            top_p=0.9,
+            max_tokens=256,
+            stop=[],
+            api_key="",
+        ),
+        proxy=SimpleNamespace(to_requests_proxies=lambda: None, trust_env=True),
+    )
+    builder._log = lambda *_args, **_kwargs: None
+    service = BuilderAIService(builder)
+    captured: dict[str, object] = {}
+
+    class Resp:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "{\"final_output\":{\"primary_issue\":\"other\","
+                                "\"confidence\":0.1,\"reason\":\"ok\",\"actions\":[]}}"
+                            )
+                        }
+                    }
+                ]
+            }
+
+    class FakeSession:
+        def __init__(self):
+            self.proxies = {}
+            self.trust_env = True
+
+        def post(self, *_args, **kwargs):
+            captured.update(kwargs)
+            return Resp()
+
+        def close(self):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    import mc_auto_server_builder.ai as ai_module
+
+    original_session = ai_module.requests.Session
+    try:
+        ai_module.requests.Session = FakeSession
+        response_format = service._build_response_format("mcasb_test", ["stop_and_report"])
+        service._call_openai_compatible_chat("hello", response_format=response_format)
+    finally:
+        ai_module.requests.Session = original_session
+
+    assert captured["json"]["response_format"]["type"] == "json_schema"
+    assert captured["json"]["response_format"]["json_schema"]["name"] == "mcasb_test"
+
+
+def test_analyze_uses_repair_prompt_after_invalid_json_response():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.config = SimpleNamespace(
+        ai=SimpleNamespace(
+            enabled=True,
+            debug=False,
+            provider="openai_compatible",
+            endpoint="https://api.example.com/v1/chat/completions",
+            model="gpt-test",
+            timeout_sec=5,
+            max_retries=0,
+            retry_backoff_sec=0.0,
+            stream=False,
+            temperature=0.2,
+            top_p=0.9,
+            max_tokens=256,
+            stop=[],
+            api_key="",
+            base_url="",
+            chat_path="/v1/chat/completions",
+        ),
+        proxy=SimpleNamespace(to_requests_proxies=lambda: None, trust_env=True),
+    )
+    builder._log = lambda *_args, **_kwargs: None
+    builder.operations = []
+    builder.attempts_used = 1
+    builder.last_ai_payload = {}
+    builder.last_ai_manual_report = {}
+    service = BuilderAIService(builder)
+
+    calls: list[tuple[str, object]] = []
+
+    def fake_call_ai_provider(prompt: str, response_format: dict[str, object] | None = None) -> str:
+        calls.append((prompt, response_format))
+        if len(calls) == 1:
+            return "not-json"
+        return json.dumps(
+            {
+                "final_output": {
+                    "primary_issue": "other",
+                    "confidence": 0.2,
+                    "reason": "fixed",
+                    "actions": [{"type": "stop_and_report", "final_reason": "fixed"}],
+                }
+            },
+            ensure_ascii=False,
+        )
+
+    service._call_ai_provider = fake_call_ai_provider  # type: ignore[method-assign]
+
+    result = service.analyze({"mc_version": "1.20.1", "loader": "forge"})
+
+    assert result["actions"][0]["type"] == "stop_and_report"
+    assert len(calls) == 2
+    assert "JSON 修复器" in calls[1][0]
+
+
 def test_configure_requests_session_applies_proxy_settings():
     session = requests.Session()
     try:
@@ -1275,7 +1409,7 @@ def test_start_server_detects_first_crash_report_and_kills_process(tmp_path):
 
         def fake_tail(*_args, **_kwargs):
             state["calls"] += 1
-            if state["calls"] == 2:
+            if state["calls"] == 1:
                 crash_dir = server_dir / "crash-reports"
                 crash_dir.mkdir(parents=True, exist_ok=True)
                 (crash_dir / "crash-1.txt").write_text("boom", encoding="utf-8")
@@ -1369,7 +1503,7 @@ def test_start_server_detects_new_empty_crash_reports_dir_and_kills_process(tmp_
 
         def fake_tail(*_args, **_kwargs):
             state["calls"] += 1
-            if state["calls"] == 2:
+            if state["calls"] == 1:
                 (server_dir / "crash-reports").mkdir(parents=True, exist_ok=True)
             return ""
 
@@ -1471,7 +1605,7 @@ def test_start_server_waits_for_crash_report_after_crash_reports_dir_created(tmp
 
     def fake_read_tail_text(_path: Path, lines: int = 300):
         state["calls"] += 1
-        if state["calls"] == 2:
+        if state["calls"] == 1:
             crash_dir = server_dir / "crash-reports"
             crash_dir.mkdir(parents=True, exist_ok=True)
         return ""
@@ -1568,7 +1702,7 @@ def test_start_server_detects_increased_crash_reports(tmp_path):
 
         def fake_tail(*_args, **_kwargs):
             state["calls"] += 1
-            if state["calls"] == 2:
+            if state["calls"] == 1:
                 (crash_dir / "crash-new.txt").write_text("new", encoding="utf-8")
             return ""
 
@@ -2283,6 +2417,72 @@ def test_build_prompt_uses_compact_rule_sections_for_bisect_state():
     assert "rollback_on_failure=true" in prompt
 
 
+def test_build_success_guard_prompt_limits_action_scope():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder._log = lambda *_args, **_kwargs: None
+    builder.config = type("Cfg", (), {"ai": type("AI", (), {"enabled": False, "debug": False})()})()
+    service = BuilderAIService(builder)
+
+    prompt = service.build_success_guard_prompt(
+        service.build_success_guard_context_payload(
+            {
+                "bisect_active": True,
+                "bisect_next_allowed_requests": ["switch_group"],
+                "bisect_feedback": {"tested_side": "keep"},
+            }
+        )
+    )
+
+    assert "成功态专项分析器" in prompt
+    assert "只允许输出 remove_mods、bisect_mods、move_bisect_mods、report_manual_fix、stop_and_report" in prompt
+    assert "禁止输出 adjust_memory、change_java、switch_recognition_candidate、continue_after_restore_mods" in prompt
+
+
+def test_build_context_payload_preserves_runtime_and_recognition_fields():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder._log = lambda *_args, **_kwargs: None
+    builder.config = type("Cfg", (), {"ai": type("AI", (), {"enabled": False, "debug": False})()})()
+    service = BuilderAIService(builder)
+
+    payload = service.build_context_payload(
+        {
+            "mc_version": "1.20.1",
+            "loader": "forge",
+            "loader_version": "47.2.0",
+            "build": "47.2.0",
+            "start_mode": "argsfile",
+            "recognition_summary": {"confidence": 0.82, "active_loader": "forge"},
+            "failure_signals": ["loader_misclassification"],
+            "readiness_evidence": ["hard_timeout_reached"],
+            "resource_summary": {"peak_rss_mb": 1024.0},
+            "key_exception": "RuntimeException",
+            "suspected_mods": ["bad.jar"],
+            "oom_detected": True,
+            "jvm_exit_code": 137,
+            "start_command_check": {"issues": ["argsfile_missing"]},
+            "crash_report_analysis": {"caused_by": ["java.lang.RuntimeException: boom"]},
+            "dependency_graph": {"deleted_dependency_hits": [{"file_name": "dep.jar"}]},
+            "mod_metadata_summary": {"client_only_mods": ["client.jar"]},
+        }
+    )
+
+    assert payload["server_profile"]["loader_version"] == "47.2.0"
+    assert payload["server_profile"]["build"] == "47.2.0"
+    assert payload["server_profile"]["start_mode"] == "argsfile"
+    assert payload["recognition_state"]["recognition_summary"]["confidence"] == 0.82
+    assert payload["startup_state"]["failure_signals"] == ["loader_misclassification"]
+    assert payload["startup_state"]["readiness_evidence"] == ["hard_timeout_reached"]
+    assert payload["startup_state"]["resource_summary"]["peak_rss_mb"] == 1024.0
+    assert payload["startup_state"]["key_exception"] == "RuntimeException"
+    assert payload["startup_state"]["suspected_mods"] == ["bad.jar"]
+    assert payload["startup_state"]["oom_detected"] is True
+    assert payload["startup_state"]["jvm_exit_code"] == 137
+    assert payload["deterministic_tools"]["start_command_check"]["issues"] == ["argsfile_missing"]
+    assert payload["deterministic_tools"]["crash_report_analysis"]["caused_by"] == ["java.lang.RuntimeException: boom"]
+    assert payload["deterministic_tools"]["dependency_graph"]["deleted_dependency_hits"][0]["file_name"] == "dep.jar"
+    assert payload["deterministic_tools"]["mod_metadata_summary"]["client_only_mods"] == ["client.jar"]
+
+
 def test_normalize_ai_result_accepts_remove_mods_rollback_flag():
     builder = ServerBuilder.__new__(ServerBuilder)
     builder._log = lambda *_args, **_kwargs: None
@@ -2885,6 +3085,7 @@ def test_package_server_embeds_build_meta_json(tmp_path):
         assert "build_meta.json" in names
         payload = json.loads(zf.read("build_meta.json").decode("utf-8"))
         assert payload["manifest_summary"]["loader"] == "forge"
+        assert payload["artifacts"]["package_mode"] == "full"
         assert payload["remote_failures"]["summary"]["total"] == 0
         assert "server.jar" in names
         assert "java_bins/java" in names
@@ -2941,6 +3142,68 @@ def test_package_server_excludes_runtime_directories(tmp_path):
         assert "world/level.dat" not in names
         assert "world_nether/level.dat" not in names
         assert "world_the_end/level.dat" not in names
+
+
+def test_package_server_minimal_mode_keeps_diagnostics_and_small_server_files(tmp_path):
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.workdirs = type(
+        "WorkDirs",
+        (),
+        {
+            "root": tmp_path,
+            "server": tmp_path / "server",
+            "java_bins": tmp_path / "java_bins",
+            "logs": tmp_path / "logs",
+        },
+    )()
+    builder.workdirs.server.mkdir()
+    builder.workdirs.java_bins.mkdir()
+    builder.workdirs.logs.mkdir()
+    (builder.workdirs.root / "report.txt").write_text("report", encoding="utf-8")
+    builder.log_file_path = builder.workdirs.logs / "install.log"
+    builder.log_file_path.write_text("install-log", encoding="utf-8")
+    (builder.workdirs.logs / "attempt_01_ai_analysis.json").write_text("{}", encoding="utf-8")
+    (builder.workdirs.server / "start.sh").write_text("#!/bin/sh", encoding="utf-8")
+    (builder.workdirs.server / "server.properties").write_text("motd=test", encoding="utf-8")
+    (builder.workdirs.server / "server.jar").write_text("jar", encoding="utf-8")
+    (builder.workdirs.java_bins / "java").write_text("bin", encoding="utf-8")
+    builder.config = type("Cfg", (), {"artifacts": type("Artifacts", (), {"package_mode": "minimal"})()})()
+    builder._build_meta_payload = ServerBuilder._build_meta_payload.__get__(builder, ServerBuilder)
+    builder._build_recognition_summary = lambda: {"active_loader": "forge", "confidence": 0.9}
+    builder.detect_current_java_version = lambda: 21
+    builder.pack_input = type("PackInput", (), {"input_type": "local_zip", "source": "pack.zip", "file_id": None})()
+    builder.manifest = PackManifest(pack_name="Pack", mc_version="1.20.1", loader="forge")
+    builder.current_java_version = 21
+    builder.jvm_xmx = "4G"
+    builder.jvm_xms = "2G"
+    builder.extra_jvm_flags = []
+    builder.start_command_mode = "jar"
+    builder.start_command_value = "server.jar"
+    builder.removed_mods = []
+    builder.bisect_removed_mods = []
+    builder.deleted_mod_evidence = {}
+    builder.last_ai_result = None
+    builder.last_ai_manual_report = {}
+    builder.attempts_used = 0
+    builder.run_success = False
+    builder.stop_reason = ""
+    builder.recognition_attempts = []
+    builder.operations = []
+    builder.remote_failure_events = []
+    builder._summarize_remote_failure_events = ServerBuilder._summarize_remote_failure_events.__get__(builder, ServerBuilder)
+
+    out = ServerBuilder.package_server(builder)
+
+    with zipfile.ZipFile(out, "r") as zf:
+        names = set(zf.namelist())
+        assert "build_meta.json" in names
+        assert "diagnostics/report.txt" in names
+        assert "diagnostics/install.log" in names
+        assert "diagnostics/attempt_traces/attempt_01_ai_analysis.json" in names
+        assert "server/start.sh" in names
+        assert "server/server.properties" in names
+        assert "server.jar" not in names
+        assert "java_bins/java" not in names
 
 
 def test_select_next_recognition_plan_uses_runtime_feedback(tmp_path):
@@ -4313,7 +4576,7 @@ def test_successful_start_with_pending_bisect_followup_triggers_success_ai_analy
     builder._append_attempt_trace = lambda *args, **kwargs: None
     builder.extract_relevant_log = lambda *_args, **_kwargs: {"log_tail": "", "crash_excerpt": "", "conflicts_or_exceptions": []}
     builder.start_server = lambda timeout=300: {"success": True, "success_source": "log_done", "stdout_tail": "Done", "stderr_tail": ""}
-    builder.analyze_with_ai = lambda context: {
+    builder.analyze_success_guard_with_ai = lambda context: {
         "primary_issue": "mod_conflict",
         "confidence": 0.5,
         "actions": [
@@ -4341,7 +4604,7 @@ def test_successful_start_with_pending_bisect_followup_triggers_success_ai_analy
         if start_res["success"]:
             if builder._has_pending_bisect_followup():
                 ai_context = builder._build_ai_context(start_res, {"log_tail": "", "crash_excerpt": "", "conflicts_or_exceptions": []})
-                ai = builder.analyze_with_ai(ai_context)
+                ai = builder.analyze_success_guard_with_ai(ai_context)
                 should_stop = builder._apply_actions(ai.get("actions", []), attempt=i)
                 if should_stop:
                     break

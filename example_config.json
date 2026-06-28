@@ -32,6 +32,9 @@
     "connect_timeout": 15,
     "read_timeout": 120
   },
+  "artifacts": {
+    "package_mode": "full"
+  },
   "server_port": 25565,
   "github_api_key": "",
   "curseforge_api_key": "",

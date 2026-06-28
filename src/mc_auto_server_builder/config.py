@@ -123,6 +123,13 @@ def _normalize_str_list(value: object, path: str, *, default: list[str] | None =
     return result
 
 
+def _normalize_package_mode(value: object, path: str, *, default: str = "full") -> str:
+    text = _normalize_str(value, path, default=default).lower()
+    if text not in {"full", "minimal"}:
+        _raise_config_error(path, "必须是 'full' 或 'minimal'")
+    return text
+
+
 def _reject_unknown_fields(section: str, payload: dict[str, object], allowed: set[str]) -> None:
     unknown = sorted(set(payload) - allowed)
     if unknown:
@@ -194,6 +201,11 @@ class DownloadRuntimeConfig:
 
 
 @dataclass(slots=True)
+class ArtifactConfig:
+    package_mode: str = "full"
+
+
+@dataclass(slots=True)
 class ProxyConfig:
     http: str = ""
     https: str = ""
@@ -219,6 +231,7 @@ class AppConfig:
     ai: AIConfig = field(default_factory=AIConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     download: DownloadRuntimeConfig = field(default_factory=DownloadRuntimeConfig)
+    artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     server_port: int = 25565
     extra_jvm_flags: list[str] = field(default_factory=list)
@@ -247,6 +260,7 @@ class AppConfig:
             "ai",
             "logging",
             "download",
+            "artifacts",
             "proxy",
             "server_port",
             "extra_jvm_flags",
@@ -264,6 +278,7 @@ class AppConfig:
         ai_data = _normalize_object(data.get("ai"), "ai")
         logging_data = _normalize_object(data.get("logging"), "logging")
         download_data = _normalize_object(data.get("download"), "download")
+        artifacts_data = _normalize_object(data.get("artifacts"), "artifacts")
         proxy_data = _normalize_object(data.get("proxy"), "proxy")
 
         _reject_unknown_fields("memory", memory_data, {"xmx", "xms", "max_ram_ratio"})
@@ -325,6 +340,7 @@ class AppConfig:
                 "terminal_ui_refresh_interval_sec",
             },
         )
+        _reject_unknown_fields("artifacts", artifacts_data, {"package_mode"})
         _reject_unknown_fields("proxy", proxy_data, {"http", "https", "all", "no_proxy", "trust_env"})
         return cls(
             memory=MemoryConfig(
@@ -466,6 +482,13 @@ class AppConfig:
                     default=0.1,
                     minimum=0.0,
                 ),
+            ),
+            artifacts=ArtifactConfig(
+                package_mode=_normalize_package_mode(
+                    artifacts_data.get("package_mode"),
+                    "artifacts.package_mode",
+                    default="full",
+                )
             ),
             proxy=ProxyConfig(
                 http=_normalize_str(proxy_data.get("http"), "proxy.http", default=""),

@@ -9,13 +9,11 @@ import subprocess
 import tarfile
 import threading
 import time
-import traceback
 import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, fields
-from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Mapping, TypedDict, cast
+from typing import Any, Callable, Literal, Mapping, TypedDict, cast
 from urllib.parse import urlparse
 
 import psutil
@@ -60,7 +58,21 @@ from .defaults import (
     get_common_jvm_params,
     get_jvm_params_for_java_version,
 )
-from .input_parser import parse_manifest_from_zip, parse_pack_input
+from .diagnostics import (
+    build_dependency_graph,
+    inspect_crash_report,
+    inspect_mod_metadata,
+    verify_start_command_artifacts,
+)
+from .input_parser import parse_pack_input
+from .install_runtime import (
+    download_curseforge_pack,
+    download_modrinth_pack,
+    extract_full_pack_version_payload_if_needed,
+    prepare_runtime_environment,
+    prepare_server_files,
+    resolve_pack_and_manifest,
+)
 from .models import (
     ActionPreflight,
     AIResult,
@@ -68,9 +80,9 @@ from .models import (
     BisectMoveRecord,
     BisectRoundRecord,
     BisectSession,
+    CacheDirs,
     PackInput,
     PackManifest,
-    StartResult,
     WorkDirs,
 )
 from .recognition import RecognitionFallbackPlan, choose_java_version, choose_latest_lts_java_version
@@ -93,7 +105,33 @@ from .reporting import (
     summarize_ai_context,
     summarize_remote_failure_events,
 )
+from .resume_runtime import (
+    build_pack_cache_key,
+    build_resume_state,
+    download_pack_to_cache,
+    load_manifest_from_cache,
+    load_resume_source_from_path,
+    manifest_cache_path,
+    pack_cache_zip_path,
+    persist_manifest_cache,
+    persist_resume_state,
+    read_resume_state,
+    restore_resume_state,
+    resume_prepared_server_available,
+)
 from .rule_db import RuleDB
+from .runtime_startup import (
+    collect_process_resource_snapshot,
+    detect_command_probe_ready,
+    detect_current_java_version,
+    detect_failure_signals,
+    detect_log_ready_signal,
+    extract_latest_crash_mod_issue,
+    extract_relevant_log,
+    read_startup_log_tail,
+    snapshot_crash_reports,
+    start_server,
+)
 from .util import (
     ColorPolicy,
     DownloadConfig,
@@ -117,7 +155,6 @@ from .util import (
     http_get_json,
     is_http_url,
     is_local_tcp_port_open,
-    merge_overrides_into_base,
     normalize_client_relative_path,
     normalize_java_home_layout,
     normalize_memory_plan,
@@ -131,9 +168,19 @@ from .util import (
     threaded_pipe_reader,
     verify_hashes,
 )
-from .workspace import create_workdirs
+from .workspace import create_cache_dirs, create_workdirs
 
 AI_REMOVE_MODS_SAFE_LIMIT = 3
+
+# Keep these module-level names available for monkeypatch-based tests and runtime indirection.
+_STARTUP_COMPAT_EXPORTS = (
+    threading,
+    read_tail_text,
+    threaded_pipe_reader,
+    terminate_process,
+    graceful_stop_process,
+    is_local_tcp_port_open,
+)
 
 
 class PreviousActionState(TypedDict):
@@ -149,6 +196,9 @@ class RollbackResult(TypedDict, total=False):
     snapshot_tag: str
     performed: bool
     error: str
+
+
+AttemptLoopDecision = Literal["continue", "stop", "success"]
 
 
 class ActionExecutionResult(TypedDict, total=False):
@@ -441,11 +491,30 @@ def _build_download_failure_detail(item: DownloadFailure) -> RemoteFailureDetail
 class ServerBuilder:
     _ALLOWED_MANIFEST_DOWNLOAD_TYPES = {"mod", "plugin", "datapack"}
 
-    def __init__(self, source: str, config: AppConfig | None = None, base_dir: str | Path = "."):
+    def __init__(
+        self,
+        source: str | None,
+        config: AppConfig | None = None,
+        base_dir: str | Path = ".",
+        resume_dir: str | Path | None = None,
+    ):
         self.config = config or AppConfig()
-        self.pack_input: PackInput = parse_pack_input(source)
-        self.base_dir = Path(base_dir).resolve()
-        self.workdirs: WorkDirs = create_workdirs(self.base_dir)
+        self.resume_requested = resume_dir is not None
+        resume_path = Path(resume_dir).resolve() if resume_dir is not None else None
+        derived_base_dir = Path(base_dir).resolve()
+        if resume_path is not None and resume_path.parent.name == "runs":
+            derived_base_dir = resume_path.parent.parent
+        self.base_dir = derived_base_dir
+        self.cache_dirs: CacheDirs = create_cache_dirs(self.base_dir)
+        self.workdirs: WorkDirs = create_workdirs(self.base_dir, resume_dir=resume_path, cache_dirs=self.cache_dirs)
+        self.resume_state_path: Path = self.workdirs.root / "run_state.json"
+        self.source_input = str(source or "").strip()
+        if not self.source_input and resume_path is not None:
+            resume_source = self._load_resume_source_from_path(resume_path)
+            self.source_input = resume_source
+        if not self.source_input:
+            raise ValueError("缺少 source 参数")
+        self.pack_input: PackInput = parse_pack_input(self.source_input)
         self.rule_db = RuleDB(self.workdirs.db / "rules.sqlite3")
         self.rule_db.seed_defaults()
         for p in self.config.user_blacklist_regex:
@@ -489,6 +558,9 @@ class ServerBuilder:
         self.start_command_value: str = self.server_jar_name
         self.recognition_attempts: list[dict[str, object]] = []
         self.log_file_path: Path = self.workdirs.logs / "install.log"
+        self.resolved_pack_zip_path: Path | None = None
+        self.pack_cache_key: str = ""
+        self.resume_state: dict[str, object] = {}
         try:
             color_policy = ColorPolicy((self.config.logging.color_policy or "auto").lower())
         except ValueError:
@@ -515,6 +587,8 @@ class ServerBuilder:
             ),
             logger=self.logger,
         )
+        if self.resume_requested:
+            self._restore_resume_state()
 
     def _request_proxies(self) -> dict[str, str] | None:
         return self.config.proxy.to_requests_proxies()
@@ -544,6 +618,42 @@ class ServerBuilder:
 
     def _serialize_ai_action(self, action: object) -> dict:
         return self.ai_service._serialize_ai_action(action)
+
+    def _load_resume_source_from_path(self, resume_path: Path) -> str:
+        return load_resume_source_from_path(self, resume_path)
+
+    def _read_resume_state(self) -> dict[str, object]:
+        return read_resume_state(self)
+
+    def _build_resume_state(self, *, prepared_server: bool) -> dict[str, object]:
+        return build_resume_state(self, prepared_server=prepared_server)
+
+    def _persist_resume_state(self, *, prepared_server: bool) -> None:
+        persist_resume_state(self, prepared_server=prepared_server)
+
+    def _restore_resume_state(self) -> None:
+        restore_resume_state(self)
+
+    def _resume_prepared_server_available(self) -> bool:
+        return resume_prepared_server_available(self)
+
+    def _build_pack_cache_key(self, *, source_hint: str | None = None) -> str:
+        return build_pack_cache_key(self, source_hint=source_hint)
+
+    def _pack_cache_zip_path(self, cache_key: str) -> Path:
+        return pack_cache_zip_path(self, cache_key)
+
+    def _manifest_cache_path(self, cache_key: str) -> Path:
+        return manifest_cache_path(self, cache_key)
+
+    def _load_manifest_from_cache(self, cache_key: str) -> PackManifest | None:
+        return load_manifest_from_cache(self, cache_key)
+
+    def _persist_manifest_cache(self, cache_key: str, manifest: PackManifest) -> None:
+        persist_manifest_cache(self, cache_key, manifest)
+
+    def _download_pack_to_cache(self, url: str, cache_key: str, *, stage: str = "install.download") -> Path:
+        return download_pack_to_cache(self, url, cache_key, stage=stage)
 
     # 文件与mods操作
     def list_mods(self) -> list[str]:
@@ -1898,433 +2008,35 @@ class ServerBuilder:
         return choose_java_version(manifest)
 
     def _collect_process_resource_snapshot(self, proc: subprocess.Popen) -> dict[str, float | int | str | None]:
-        try:
-            ps_proc = psutil.Process(proc.pid)
-            children = ps_proc.children(recursive=True)
-            rss_bytes = ps_proc.memory_info().rss
-            cpu_percent = ps_proc.cpu_percent(interval=None)
-            for child in children:
-                try:
-                    rss_bytes += child.memory_info().rss
-                    cpu_percent += child.cpu_percent(interval=None)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-            return {
-                "timestamp": datetime.now().isoformat(),
-                "rss_mb": round(rss_bytes / 1024 / 1024, 2),
-                "cpu_percent": round(cpu_percent, 2),
-                "process_count": len(children) + 1,
-            }
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            return {
-                "timestamp": datetime.now().isoformat(),
-                "rss_mb": 0.0,
-                "cpu_percent": 0.0,
-                "process_count": 0,
-                "error": "process_unavailable",
-            }
+        return collect_process_resource_snapshot(self, proc)
 
     def _detect_failure_signals(self, text: str) -> list[str]:
-        lowered = (text or "").lower()
-        patterns = (
-            (r"outofmemoryerror|java heap space|gc overhead limit exceeded", "memory_oom"),
-            (r"could not reserve enough space|insufficient memory|os::commit_memory", "memory_allocation"),
-            (r"address already in use|failed to bind to port|port .* in use", "port_in_use"),
-            (r"unsupportedclassversionerror|has been compiled by a more recent version", "java_version_mismatch"),
-            (r"could not find or load main class|unable to access jarfile|no such file", "start_command_error"),
-            (r"missing dependency|depends on|requires .* but it is missing", "missing_dependency"),
-            (r"client-only|dedicated server|invalid dist|wrong side", "client_mod_detected"),
-            (r"main class .* not found|@.*args\.txt|argument file .* not found", "loader_misclassification"),
-            (r"watchdog|server watchdog|deadlock", "watchdog_or_deadlock"),
-            (r"neoforge", "loader_signal_neoforge"),
-            (r"quilt", "loader_signal_quilt"),
-            (r"fabricloader|fabric", "loader_signal_fabric"),
-            (r"fml|forge", "loader_signal_forge"),
-        )
-        matched: list[str] = []
-        for pattern, label in patterns:
-            if re.search(pattern, lowered):
-                matched.append(label)
-        return matched
+        return detect_failure_signals(self, text)
 
     def detect_current_java_version(self) -> int:
-        cmd = [str(self.current_java_bin or "java"), "-version"]
-        cp = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        text = cp.stderr + cp.stdout
-        m = re.search(r'"(\d+)(?:\.(\d+))?.*"', text)
-        if not m:
-            return 0
-        major = int(m.group(1))
-        if major == 1 and m.group(2):
-            return int(m.group(2))
-        return major
+        return detect_current_java_version(self)
 
     def _detect_log_ready_signal(self, text: str) -> tuple[bool, str]:
-        for raw_line in (text or "").splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            if re.search(r"\bpreparing spawn area\b", line, flags=re.IGNORECASE):
-                return True, "log_preparing_spawn_area"
-            if re.search(
-                r'(?:^|:\s*)done\s*\([^\n\r)]*\)!?(?:\s*for help, type\s+"?help"?)?\s*$',
-                line,
-                flags=re.IGNORECASE,
-            ):
-                return True, "log_done"
-        return False, ""
+        return detect_log_ready_signal(self, text)
 
     def _detect_command_probe_ready(self, text: str) -> tuple[bool, str]:
-        if re.search(r"there\s+are.*players\s+online", text or "", flags=re.IGNORECASE | re.DOTALL):
-            return True, "cmd_probe_list_response"
-        return False, ""
+        return detect_command_probe_ready(self, text)
 
     def _snapshot_crash_reports(self, crash_dir: Path) -> tuple[bool, set[str]]:
-        exists = crash_dir.exists() and crash_dir.is_dir()
-        if not exists:
-            return False, set()
-        try:
-            return True, {p.name for p in crash_dir.iterdir() if p.is_file()}
-        except OSError:
-            return exists, set()
+        return snapshot_crash_reports(self, crash_dir)
+
+    def _read_startup_log_tail(self, log_path: Path, state: dict[str, object], *, lines: int = 300) -> str:
+        return read_startup_log_tail(self, log_path, state, lines=lines)
 
     # 运行与日志
     def start_server(self, timeout: int = 300) -> dict:
-        script = self._start_script_path()
-        if not script.exists():
-            self._write_start_script()
-
-        latest_log = self.workdirs.server / "logs" / "latest.log"
-        latest_log.parent.mkdir(parents=True, exist_ok=True)
-        crash_dir = self.workdirs.server / "crash-reports"
-        initial_crash_dir_exists, initial_crash_reports = self._snapshot_crash_reports(crash_dir)
-
-        cmd = [str(script)] if os.name != "nt" else ["cmd", "/c", str(script)]
-        proc = subprocess.Popen(
-            cmd,
-            cwd=self.workdirs.server,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-
-        stdout_lines: list[str] = []
-        stderr_lines: list[str] = []
-        threads = [
-            threading.Thread(target=threaded_pipe_reader, args=(proc.stdout, stdout_lines), daemon=True),
-            threading.Thread(target=threaded_pipe_reader, args=(proc.stderr, stderr_lines), daemon=True),
-        ]
-        for t in threads:
-            t.start()
-
-        probe_enabled = bool(self.config.runtime.startup_command_probe_enabled)
-        loop_interval = max(0.2, float(self.config.runtime.startup_probe_interval_sec))
-        soft_timeout = max(8.0, float(self.config.runtime.startup_soft_timeout))
-        hard_timeout = max(float(timeout), float(self.config.runtime.startup_hard_timeout))
-        start_at = time.monotonic()
-        soft_deadline = start_at + soft_timeout
-        hard_deadline = start_at + hard_timeout
-        next_probe_at = start_at + max(1.0, float(self.config.runtime.startup_command_probe_initial_delay_sec))
-        probe_retry = max(1.0, float(self.config.runtime.startup_command_probe_retry_sec))
-        probe_command = "list"
-
-        done = False
-        cmd_probe_ok = False
-        port_open = False
-        success_source = ""
-        readiness_evidence: list[str] = []
-        resource_samples: list[dict[str, float | int | str | None]] = []
-        failure_signals: list[str] = []
-        crash_detected = False
-        forced_termination = False
-
-        while True:
-            now = time.monotonic()
-            if now >= hard_deadline:
-                readiness_evidence.append("hard_timeout_reached")
-                break
-
-            log_tail = read_tail_text(latest_log, lines=300)
-            out_tail = "\n".join(stdout_lines[-120:])
-            err_tail = "\n".join(stderr_lines[-120:])
-            merged_tail = "\n".join([log_tail, out_tail, err_tail])
-
-            if proc.poll() is None:
-                resource_samples.append(self._collect_process_resource_snapshot(proc))
-
-            for signal in self._detect_failure_signals(merged_tail):
-                if signal not in failure_signals:
-                    failure_signals.append(signal)
-
-            current_crash_dir_exists, current_crash_reports = self._snapshot_crash_reports(crash_dir)
-            new_crash_reports = sorted(current_crash_reports - initial_crash_reports)
-            crash_dir_created = current_crash_dir_exists and not initial_crash_dir_exists
-            if crash_dir_created and not new_crash_reports:
-                self._log(
-                    "install.crash",
-                    "检测到 crash-reports 目录首次创建，等待 2 秒以便 crash 文件落盘后再分析",
-                    level="INFO",
-                )
-                time.sleep(2.0)
-                current_crash_dir_exists, current_crash_reports = self._snapshot_crash_reports(crash_dir)
-                new_crash_reports = sorted(current_crash_reports - initial_crash_reports)
-                crash_report_preview = ",".join(new_crash_reports[:3]) if new_crash_reports else "none"
-                self._log(
-                    "install.crash",
-                    f"crash-reports 复扫完成，新增 crash 文件 {len(new_crash_reports)} 个：{crash_report_preview}",
-                    level="INFO",
-                )
-            if crash_dir_created or new_crash_reports:
-                crash_detected = True
-                if "crash_report_created" not in failure_signals:
-                    failure_signals.append("crash_report_created")
-                if crash_dir_created and len(initial_crash_reports) == 0 and not new_crash_reports:
-                    readiness_evidence.append("crash_reports_dir_created")
-                elif len(initial_crash_reports) == 0:
-                    readiness_evidence.append(f"crash_reports_first_seen:{','.join(new_crash_reports[:3])}")
-                else:
-                    readiness_evidence.append(f"crash_reports_increased:{','.join(new_crash_reports[:3])}")
-                crash_report_preview = ",".join(new_crash_reports[:3]) if new_crash_reports else "none"
-                self._log(
-                    "install.crash",
-                    f"检测到 crash 证据，目录新建={crash_dir_created}，新增文件={crash_report_preview}，准备进入日志提取与 AI 分析",
-                    level="INFO",
-                )
-                break
-
-            if not port_open:
-                try:
-                    port_open = is_local_tcp_port_open(port=int(self.config.server_port), host="127.0.0.1", timeout=0.6)
-                except Exception:
-                    port_open = False
-                if port_open:
-                    readiness_evidence.append("port_open")
-
-            if not done:
-                done_detected, done_source = self._detect_log_ready_signal(merged_tail)
-                if done_detected:
-                    done = True
-                    success_source = done_source
-                    readiness_evidence.append(done_source)
-
-            if probe_enabled and not cmd_probe_ok and now >= soft_deadline and now >= next_probe_at and proc.poll() is None:
-                try:
-                    if proc.stdin:
-                        proc.stdin.write(f"{probe_command}\n")
-                        proc.stdin.flush()
-                        readiness_evidence.append(f"probe_sent:{probe_command}")
-                except Exception as e:
-                    readiness_evidence.append(f"probe_send_failed:{type(e).__name__}")
-                next_probe_at = now + probe_retry
-
-            if not cmd_probe_ok:
-                probe_detected, probe_source = self._detect_command_probe_ready(merged_tail)
-                if probe_detected:
-                    cmd_probe_ok = True
-                    success_source = probe_source
-                    readiness_evidence.append(probe_source)
-
-            if cmd_probe_ok or done:
-                break
-
-            if proc.poll() is not None:
-                readiness_evidence.append(f"process_exit:{proc.returncode}")
-                break
-
-            time.sleep(loop_interval)
-
-        process_alive = proc.poll() is None
-        if process_alive and not self.config.runtime.keep_running:
-            if crash_detected or not (cmd_probe_ok or done):
-                terminate_process(proc, timeout_sec=8.0)
-                forced_termination = True
-                readiness_evidence.append("forced_termination")
-            else:
-                graceful_stop_process(proc, timeout_sec=20.0, stop_command="stop")
-            process_alive = proc.poll() is None
-        elif (not success_source or crash_detected) and process_alive:
-            terminate_process(proc, timeout_sec=8.0)
-            forced_termination = True
-            readiness_evidence.append("forced_termination")
-            process_alive = proc.poll() is None
-
-        for t in threads:
-            t.join(timeout=1.0)
-
-        exit_code = proc.poll()
-        stdout_tail = "\n".join(stdout_lines[-80:])
-        stderr_tail = "\n".join(stderr_lines[-80:])
-        success = bool((cmd_probe_ok or done) and not crash_detected)
-        peak_rss_mb = max((float(item.get("rss_mb") or 0.0) for item in resource_samples), default=0.0)
-        peak_cpu_percent = max((float(item.get("cpu_percent") or 0.0) for item in resource_samples), default=0.0)
-        max_process_count = max((int(item.get("process_count") or 0) for item in resource_samples), default=0)
-
-        result = StartResult(
-            success=success,
-            done_detected=done,
-            command_probe_detected=cmd_probe_ok,
-            port_open_detected=port_open,
-            process_alive=process_alive,
-            crash_detected=crash_detected,
-            forced_termination=forced_termination,
-            success_source=success_source if success else "none",
-            readiness_evidence=readiness_evidence[-12:],
-            failure_signals=failure_signals[-12:],
-            resource_samples=resource_samples[-20:],
-            resource_summary={
-                "peak_rss_mb": round(peak_rss_mb, 2),
-                "peak_cpu_percent": round(peak_cpu_percent, 2),
-                "max_process_count": max_process_count,
-            },
-            exit_code=exit_code,
-            log_path=latest_log,
-            crash_dir=crash_dir,
-            stdout_tail=stdout_tail,
-            stderr_tail=stderr_tail,
-            crash_reports_snapshot=sorted(current_crash_reports if "current_crash_reports" in locals() else initial_crash_reports),
-            crash_reports_new=sorted(new_crash_reports if "new_crash_reports" in locals() else []),
-        )
-        self.operations.append(
-            "start_server:"
-            f"success={success},source={result.success_source},"
-            f"done={done},cmd_probe={cmd_probe_ok},port={port_open},exit={exit_code},alive={process_alive},"
-            f"failure_signals={json.dumps(result.failure_signals, ensure_ascii=False)},"
-            f"resource={json.dumps(result.resource_summary, ensure_ascii=False)}"
-        )
-        return asdict(result)
+        return start_server(self, timeout=timeout)
 
     def extract_relevant_log(self, log_path: str, crash_dir: str) -> dict:
-        crash_path = Path(crash_dir)
-        key_exception = ""
-        suspected_mods: list[str] = []
-        has_crash = False
-        crash_content = ""
-        crash_mod_issue = ""
-        oom_detected = False
-        jvm_exit_code: int | None = None
-
-        if crash_path.exists():
-            crashes = sorted(crash_path.glob("crash-*.txt"), key=lambda p: p.stat().st_mtime)
-            if crashes:
-                has_crash = True
-                crash_content = crashes[-1].read_text(encoding="utf-8", errors="ignore")
-                crash_mod_issue = self._extract_latest_crash_mod_issue(crash_content)
-                m = re.search(r"(?m)^\s*Caused by:\s*([^\n]+)", crash_content)
-                key_exception = m.group(1).strip() if m else ""
-                suspected_mods = re.findall(r"(?i)(?:mod|mods?)\s*[:=]\s*([A-Za-z0-9_\-\.]+)", crash_content)
-                oom_detected = bool(re.search(r"(?i)(outofmemoryerror|java heap space|gc overhead limit exceeded)", crash_content))
-                exit_code_match = re.search(r"(?i)(?:process\s+)?(?:exit\s*code|exitcode|returned\s+code)\s*[:=]\s*(-?\d+)", crash_content)
-                if exit_code_match:
-                    try:
-                        jvm_exit_code = int(exit_code_match.group(1))
-                    except ValueError:
-                        jvm_exit_code = None
-
-        log = Path(log_path)
-        refined = ""
-        if log.exists():
-            lines = log.read_text(encoding="utf-8", errors="ignore").splitlines()
-            trigger = [
-                "Exception",
-                "Error",
-                "Crash",
-                "at net.minecraft",
-                "java.lang.",
-                "Caused by",
-                "Mod Loading has failed",
-                "The game crashed",
-            ]
-            slices: list[list[str]] = []
-
-            idx = -1
-            for i in range(len(lines) - 1, -1, -1):
-                if any(t in lines[i] for t in trigger):
-                    idx = i
-                    break
-            if idx != -1:
-                start = max(0, idx - 100)
-                slices.append(lines[start:])
-
-            if lines:
-                slices.append(lines[-500:])
-
-            merged: list[str] = []
-            for part in slices:
-                for line in part:
-                    if not merged or merged[-1] != line:
-                        merged.append(line)
-
-            if len(merged) > 2000:
-                merged = merged[-2000:]
-            elif len(merged) > 1500:
-                merged = merged[-1800:]
-
-            refined = "\n".join(merged)
-
-            if not oom_detected:
-                oom_detected = bool(re.search(r"(?i)(outofmemoryerror|java heap space|gc overhead limit exceeded)", refined))
-
-            if jvm_exit_code is None:
-                code_patterns = [
-                    r"(?i)(?:process\s+)?(?:exit\s*code|exitcode|returned\s+code)\s*[:=]\s*(-?\d+)",
-                    r"(?i)(?:\bexit\b)\s*(-?\d+)",
-                ]
-                for pat in code_patterns:
-                    match_list = re.findall(pat, refined)
-                    if not match_list:
-                        continue
-                    try:
-                        jvm_exit_code = int(match_list[-1])
-                        break
-                    except ValueError:
-                        continue
-
-        if not key_exception:
-            m = re.search(r"(?m)([A-Za-z0-9_.]+(?:Exception|Error))", refined)
-            key_exception = m.group(1) if m else "unknown"
-
-        return {
-            "has_crash": has_crash,
-            "crash_content": crash_content,
-            "crash_mod_issue": crash_mod_issue,
-            "refined_log": refined,
-            "key_exception": key_exception,
-            "suspected_mods": sorted(set(suspected_mods))[:20],
-            "oom_detected": oom_detected,
-            "jvm_exit_code": jvm_exit_code,
-        }
+        return extract_relevant_log(self, log_path, crash_dir)
 
     def _extract_latest_crash_mod_issue(self, crash_content: str) -> str:
-        text = str(crash_content or "")
-        if not text.strip():
-            return ""
-
-        issue_pattern = re.compile(
-            r"(?ms)^\s*(--\s+Mod loading issue for:\s+.+?\s+--)\s*(.*?)\s*(?=^\s*--\s+System Details\s+--|\Z)",
-        )
-        matches = list(issue_pattern.finditer(text))
-        if not matches:
-            return ""
-
-        header = re.sub(r"\s+", " ", matches[-1].group(1)).strip()
-        body = matches[-1].group(2)
-        cleaned_lines: list[str] = []
-        seen: set[str] = set()
-        for raw_line in body.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            normalized = re.sub(r"\s+", " ", line)
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            cleaned_lines.append(normalized)
-
-        if not cleaned_lines:
-            return header
-        return "\n".join([header, *cleaned_lines[:20]])
+        return extract_latest_crash_mod_issue(self, crash_content)
 
     def _extract_json_object(self, text: str) -> dict | None:
         return self.ai_service._extract_json_object(text)
@@ -2337,6 +2049,42 @@ class ServerBuilder:
 
     def _normalize_ai_result(self, data: dict) -> AIResult:
         return self.ai_service._normalize_ai_result(data)
+
+    def _inspect_mod_metadata(self) -> dict[str, object]:
+        server_dir = getattr(getattr(self, "workdirs", None), "server", None)
+        if not isinstance(server_dir, Path):
+            return {"files": [], "mod_id_to_files": {}, "client_only_mods": []}
+        return inspect_mod_metadata(server_dir / "mods")
+
+    def _build_dependency_graph(self, mod_metadata: dict[str, object]) -> dict[str, object]:
+        return build_dependency_graph(mod_metadata, sorted(getattr(self, "known_deleted_client_mods", set()) or set()))
+
+    def _inspect_crash_report(self, log_info: dict[str, object]) -> dict[str, object]:
+        return inspect_crash_report(
+            str(log_info.get("crash_content") or ""),
+            str(log_info.get("refined_log") or ""),
+            str(log_info.get("crash_mod_issue") or ""),
+        )
+
+    def _verify_start_command_artifacts(self) -> dict[str, object]:
+        server_dir = getattr(getattr(self, "workdirs", None), "server", None)
+        if not isinstance(server_dir, Path):
+            return {"mode": "unknown", "value": "", "target_exists": False, "issues": ["missing_server_dir"]}
+        return verify_start_command_artifacts(
+            server_dir,
+            str(getattr(self, "start_command_mode", "jar") or "jar"),
+            str(getattr(self, "start_command_value", "") or ""),
+            server_jar_name=str(getattr(self, "server_jar_name", "server.jar") or "server.jar"),
+        )
+
+    def _build_deterministic_diagnostics(self, log_info: dict[str, object]) -> dict[str, object]:
+        mod_metadata = self._inspect_mod_metadata()
+        return {
+            "mod_metadata_summary": mod_metadata,
+            "dependency_graph": self._build_dependency_graph(mod_metadata),
+            "crash_report_analysis": self._inspect_crash_report(log_info),
+            "start_command_check": self._verify_start_command_artifacts(),
+        }
 
     def _resolve_dependency_cleanup_targets(
         self,
@@ -2393,14 +2141,17 @@ class ServerBuilder:
     def _call_ollama_generate(self, prompt: str) -> str:
         return self.ai_service._call_ollama_generate(prompt)
 
-    def _call_openai_compatible_chat(self, prompt: str) -> str:
-        return self.ai_service._call_openai_compatible_chat(prompt)
+    def _call_openai_compatible_chat(self, prompt: str, response_format: dict[str, object] | None = None) -> str:
+        return self.ai_service._call_openai_compatible_chat(prompt, response_format=response_format)
 
-    def _call_ai_provider(self, prompt: str) -> str:
-        return self.ai_service._call_ai_provider(prompt)
+    def _call_ai_provider(self, prompt: str, response_format: dict[str, object] | None = None) -> str:
+        return self.ai_service._call_ai_provider(prompt, response_format=response_format)
 
     def analyze_with_ai(self, context: dict) -> dict:
         return self.ai_service.analyze(context)
+
+    def analyze_success_guard_with_ai(self, context: dict) -> dict:
+        return self.ai_service.analyze_success_guard(context)
 
     def analyze_remove_validation_with_ai(self, context: dict) -> dict:
         return self.ai_service.analyze_remove_validation(context)
@@ -2485,346 +2236,51 @@ class ServerBuilder:
     def package_server(self) -> str:
         return package_server(self)
 
+    def _prepare_runtime_environment(self) -> None:
+        prepare_runtime_environment(self)
+
+    def _run_attempt_loop(self) -> bool:
+        from .attempt_runner import run_attempt_loop
+
+        return run_attempt_loop(self)
+
+    def _run_single_attempt(self, attempt: int) -> AttemptLoopDecision:
+        from .attempt_runner import run_single_attempt
+
+        return run_single_attempt(self, attempt)
+
+    def _handle_successful_attempt(self, attempt: int, start_res: dict[str, object]) -> AttemptLoopDecision:
+        from .attempt_runner import handle_successful_attempt
+
+        return handle_successful_attempt(self, attempt, start_res)
+
+    def _handle_failed_attempt(self, attempt: int, start_res: dict[str, object]) -> AttemptLoopDecision:
+        from .attempt_runner import handle_failed_attempt
+
+        return handle_failed_attempt(self, attempt, start_res)
+
+    def _finalize_run_result(self, success: bool) -> dict[str, object]:
+        from .attempt_runner import finalize_run_result
+
+        return finalize_run_result(self, success)
+
     # 主流程
     def run(self) -> dict:
-        self._log("install.start", f"开始安装，source={self.pack_input.source}")
-        try:
-            self._log("install.resolve", "解析输入与 manifest")
-            self._resolve_pack_and_manifest()
+        from .attempt_runner import run
 
-            self._log("install.prepare", "准备服务端文件")
-            self._prepare_server_files()
-
-            self._log("install.blacklist", "应用客户端黑名单规则")
-            self.apply_known_client_blacklist()
-            self.backup_mods("initial_copy")
-
-            self._log("install.meta", "首次启动前生成 eula.txt 与 server.properties")
-            self._ensure_server_meta_files()
-            desired_java = self._select_java_version_for_current_manifest()
-            if desired_java != self.current_java_version:
-                self.switch_java_version(desired_java)
-
-            success = False
-            for i in range(1, self.config.runtime.max_attempts + 1):
-                self.attempts_used = i
-                self._log("install.attempt", f"启动尝试 {i}/{self.config.runtime.max_attempts}")
-                self.backup_mods(f"attempt_{i}")
-                start_res = self.start_server(timeout=self.config.runtime.start_timeout)
-                if start_res["success"]:
-                    source = str(start_res.get("success_source") or "unknown")
-                    self._log("install.attempt", f"尝试 {i} 成功，判定来源={source}")
-                    if self._has_pending_bisect_followup():
-                        auto_resumed_bisect = False
-                        if self._should_auto_resume_full_bisect():
-                            auto_actions = [self._build_auto_resume_bisect_action()]
-                            self._append_attempt_trace(
-                                i,
-                                "success_auto_bisect_resume",
-                                "ok",
-                                action_plan=[dict(x) for x in auto_actions if isinstance(x, dict)],
-                            )
-                            self._log("install.bisect.auto_resume", json.dumps(auto_actions[0], ensure_ascii=False, sort_keys=True))
-                            should_stop = self._apply_actions(auto_actions, attempt=i)
-                            if should_stop:
-                                self._log("install.stop", f"AI 决策停止，reason={self.stop_reason}", level="WARN")
-                                break
-                            auto_resumed_bisect = True
-                            if self._has_pending_bisect_followup():
-                                continue
-                        if auto_resumed_bisect:
-                            success = True
-                            self.stop_reason = f"server_ready:{source}"
-                            break
-                        ai_context = self._build_ai_context(
-                            start_res,
-                            log_info={
-                                "log_tail": str(start_res.get("stdout_tail") or ""),
-                                "crash_excerpt": str(start_res.get("stderr_tail") or ""),
-                                "crash_mod_issue": "",
-                                "conflicts_or_exceptions": [],
-                            },
-                        )
-                        self._append_attempt_trace(
-                            i,
-                            "success_context_prepared",
-                            "ok",
-                            context_summary=self._summarize_ai_context(ai_context),
-                        )
-                        ai = self.analyze_with_ai(ai_context)
-                        self._append_attempt_trace(
-                            i,
-                            "success_ai_analysis",
-                            "ok",
-                            context_summary=self._summarize_ai_context(ai_context),
-                            ai_result=dict(ai),
-                            action_plan=[dict(x) for x in ai.get("actions", []) if isinstance(x, dict)],
-                        )
-                        self._log("install.ai", f"AI 成功态续轮分析完成，issue={ai.get('primary_issue')} confidence={ai.get('confidence')}")
-                        should_stop = self._apply_actions(ai.get("actions", []), attempt=i)
-                        if should_stop:
-                            self._log("install.stop", f"AI 决策停止，reason={self.stop_reason}", level="WARN")
-                            break
-                        same_issue_count = self._record_success_guard_observation(
-                            str(ai.get("primary_issue") or "other"),
-                            ai.get("confidence"),
-                        )
-                        if same_issue_count >= 2:
-                            self.stop_reason = "success_guard_same_issue_requires_manual_review"
-                            self.last_ai_manual_report = {
-                                "user_summary": (
-                                    "服务器虽然出现启动成功信号，但 AI 连续两轮在成功态识别出同类 "
-                                    "client_mod 风险，已停止自动回归以避免无意义重试。"
-                                ),
-                                "suggested_manual_steps": [
-                                    "检查最后两轮 success_ai_analysis 与 bisect feedback，确认剩余嫌疑 mod。",
-                                    "优先人工验证 success_guard_history 中涉及的客户端模组或渲染相关模组。",
-                                ],
-                                "evidence": list(getattr(self._coerce_bisect_session(), "success_guard_history", []) or []),
-                            }
-                            self._log("install.stop", f"AI 决策停止，reason={self.stop_reason}", level="WARN")
-                            break
-                        if self._has_pending_bisect_followup():
-                            continue
-                    accept_success, final_reason = self._should_accept_success_after_start(start_res)
-                    if not accept_success:
-                        continue
-                    success = True
-                    self.stop_reason = final_reason
-                    break
-                log_info = self.extract_relevant_log(str(start_res["log_path"]), str(start_res["crash_dir"]))
-                ai_context = self._build_ai_context(start_res, log_info)
-                next_plan = None
-                if start_res.get("crash_detected"):
-                    self._log("install.ai", "检测到 crash 证据，跳过 runtime recognition fallback，直接进入 AI 分析")
-                else:
-                    next_plan = self._select_next_recognition_plan(start_res, log_info)
-                self._append_attempt_trace(
-                    i,
-                    "context_prepared",
-                    "ok",
-                    context_summary=self._summarize_ai_context(ai_context),
-                    recognition_plan=(
-                        {
-                            "loader": next_plan.loader,
-                            "loader_version": next_plan.loader_version,
-                            "mc_version": next_plan.mc_version,
-                            "build": next_plan.build,
-                            "start_mode": next_plan.start_mode,
-                            "java_version": next_plan.java_version,
-                            "confidence": next_plan.confidence,
-                            "confidence_level": self._recognition_confidence_level(next_plan.confidence),
-                            "reason": next_plan.reason,
-                            "source_candidates": list(next_plan.source_candidates),
-                            "preflight": self._preflight_recognition_plan(next_plan),
-                        }
-                        if next_plan
-                        else {}
-                    ),
-                )
-                if next_plan:
-                    self._apply_recognition_plan(next_plan, reason="runtime_feedback_fallback")
-                    self._append_attempt_trace(
-                        i,
-                        "recognition_fallback_applied",
-                        "ok",
-                        context_summary=self._summarize_ai_context(ai_context),
-                        recognition_plan={
-                            "loader": next_plan.loader,
-                            "loader_version": next_plan.loader_version,
-                            "mc_version": next_plan.mc_version,
-                            "build": next_plan.build,
-                            "start_mode": next_plan.start_mode,
-                            "java_version": next_plan.java_version,
-                            "confidence": next_plan.confidence,
-                            "confidence_level": self._recognition_confidence_level(next_plan.confidence),
-                            "reason": next_plan.reason,
-                            "source_candidates": list(next_plan.source_candidates),
-                            "switch_reason": "runtime_feedback_fallback",
-                            "preflight": self._preflight_recognition_plan(next_plan),
-                        },
-                    )
-                    continue
-                remove_validation_stop = self._consume_remove_validation_followup(i, start_res, log_info)
-                if remove_validation_stop is True:
-                    break
-                if remove_validation_stop is False:
-                    continue
-                ai = self.analyze_with_ai(ai_context)
-                self._append_attempt_trace(
-                    i,
-                    "ai_analysis",
-                    "ok",
-                    context_summary=self._summarize_ai_context(ai_context),
-                    ai_result=dict(ai),
-                    action_plan=[dict(x) for x in ai.get("actions", []) if isinstance(x, dict)],
-                )
-                self._log("install.ai", f"AI 分析完成，issue={ai.get('primary_issue')} confidence={ai.get('confidence')}")
-                should_stop = self._apply_actions(ai.get("actions", []), attempt=i)
-                self._ai_debug(
-                    "loop.decision "
-                    f"attempt={i}, should_stop={should_stop}, stop_reason={self.stop_reason or 'none'}, "
-                    f"actions={json.dumps(ai.get('actions', []), ensure_ascii=False)}"
-                )
-                if should_stop:
-                    self._log("install.stop", f"AI 决策停止，reason={self.stop_reason}", level="WARN")
-                    break
-
-            self.run_success = success
-            if not success and not self.stop_reason:
-                self.stop_reason = "attempt_limit_reached"
-
-            # 兜底：确保最终产物中元文件仍然存在（幂等）
-            self._ensure_server_meta_files()
-            report = self.generate_report()
-            package = self.package_server()
-
-            self._log(
-                "install.finish",
-                f"完成: success={success}, attempts={self.attempts_used}, "
-                f"removed_mods={len(self.removed_mods)}, operations={len(self.operations)}",
-            )
-            return {
-                "success": success,
-                "workdir": str(self.workdirs.root),
-                "report": report,
-                "package": package,
-                "log_file": str(self.log_file_path),
-            }
-        except Exception as e:
-            self._log("install.error", f"安装失败: {type(e).__name__}: {e}", level="ERROR")
-            self._log("install.error", traceback.format_exc(), level="ERROR")
-            raise
+        return run(self)
 
     def _resolve_pack_and_manifest(self) -> None:
-        if self.pack_input.input_type == "local_zip":
-            zip_path = Path(self.pack_input.source)
-        elif self.pack_input.input_type == "curseforge":
-            zip_path = self._download_curseforge_pack(
-                project_id=self.pack_input.source,
-                file_id=self.pack_input.file_id,
-            )
-        elif self.pack_input.input_type == "modrinth":
-            zip_path = self._download_modrinth_pack(
-                project_or_slug=self.pack_input.source,
-                version_id=self.pack_input.file_id,
-            )
-        elif self.pack_input.input_type == "url":
-            zip_path = self._download_file(self.pack_input.source, self.workdirs.root / "pack.zip")
-        else:
-            raise NotImplementedError("不支持的输入类型")
-
-        self.manifest = parse_manifest_from_zip(zip_path)
-        self.operations.append(f"parse_manifest:{self.manifest.pack_name}")
+        resolve_pack_and_manifest(self)
 
     def _prepare_server_files(self) -> None:
-        assert self.pack_input
-        source_zip = Path(self.pack_input.source) if self.pack_input.input_type == "local_zip" else (self.workdirs.root / "pack.zip")
-        self._log("install.unpack", f"开始解压整合包: {source_zip}")
-        with zipfile.ZipFile(source_zip, "r") as zf:
-            zf.extractall(self.workdirs.client_temp)
-        self._log("install.unpack", f"解压完成 -> {self.workdirs.client_temp}")
-
-        self._extract_full_pack_version_payload_if_needed()
-
-        merged_files, merged_dirs, removed_dirs = merge_overrides_into_base(self.workdirs.client_temp)
-        self._log(
-            "install.overrides",
-            f"overrides 合并完成: merged_files={merged_files}, merged_dirs={merged_dirs}, removed_override_dirs={removed_dirs}",
-        )
-
-        self._log("install.download", "补全 CurseForge/Modrinth 清单中的缺失文件")
-        self._ensure_curseforge_manifest_mods()
-        self._ensure_modrinth_manifest_mods()
-
-        # 黑名单复制策略：默认复制绝大多数文件，仅排除明显客户端专用内容
-        # 这样即使会多带一些无关文件，也能尽量避免漏掉服务端关键文件。
-        blacklist = {
-            "assets",
-            "screenshots",
-            "shaderpacks",
-            "resourcepacks",
-            "saves",
-            "logs",
-            "crash-reports",
-            "PCL",
-            ".minecraft",
-            "launcher_profiles.json",
-            "options.txt",
-            "optionsof.txt",
-            "servers.dat",
-            "usercache.json",
-            "usernamecache.json",
-            "manifest.json",
-            "modrinth.index.json",
-            "modlist.html",
-        }
-        copied, skipped = self._copy_client_files_with_blacklist(blacklist)
-        self.operations.append(f"prepare_server_files:blacklist_copy:copied={copied},skipped={skipped}")
-        self._log("install.copy_server", f"客户端文件复制到服务端完成: copied={copied}, skipped={skipped}")
-
-        self._log("install.download", "下载推荐 Java 与安装服务端核心")
-        self._download_recommended_java()
-        self._install_server_core()
-        self._write_start_script()
-        self._log("install.finalize", "启动脚本生成完成")
+        prepare_server_files(self)
 
     def _extract_full_pack_version_payload_if_needed(self) -> None:
-        if not self.manifest:
-            return
-        full_pack = self.manifest.raw.get("full_pack") if isinstance(self.manifest.raw, dict) else None
-        if not isinstance(full_pack, dict):
-            return
-
-        version_name = str(full_pack.get("version_name") or "").strip()
-        version_dir = self.workdirs.client_temp / ".minecraft" / "versions" / version_name
-        if not version_name or not version_dir.exists() or not version_dir.is_dir():
-            return
-
-        copied = 0
-        for child in sorted(version_dir.iterdir(), key=lambda p: p.name.lower()):
-            if child.name in {f"{version_name}.jar", f"{version_name}.json"}:
-                continue
-            destination = self.workdirs.client_temp / child.name
-            replace_path(child, destination)
-            copied += 1
-
-        self.operations.append(f"full_pack_extract:{version_name}:copied={copied}")
-        self._log("install.unpack", f"全量包版本目录提取完成: version={version_name}, copied={copied}")
+        extract_full_pack_version_payload_if_needed(self)
 
     def _download_curseforge_pack(self, project_id: str, file_id: str | None = None) -> Path:
-        out = self.workdirs.root / "pack.zip"
-        resolved_project_id = self._resolve_curseforge_project_id(project_id)
-
-        if file_id:
-            file_data = self._cf_get_json(f"/v1/mods/{resolved_project_id}/files/{file_id}").get("data") or {}
-            if not file_data:
-                raise ValueError(f"CurseForge 文件不存在: project={resolved_project_id}, file={file_id}")
-            file_name = str(file_data.get("fileName", ""))
-            self.operations.append(f"curseforge_selected_file:project={resolved_project_id},file={file_id},name={file_name}")
-        else:
-            files = self._cf_get_json(f"/v1/mods/{resolved_project_id}/files", params={"pageSize": 50, "index": 0}).get("data") or []
-            if not files:
-                raise ValueError(f"CurseForge 项目没有可用文件: {resolved_project_id}")
-
-            selected = self._pick_curseforge_pack_file(files)
-            if not selected:
-                raise ValueError(f"CurseForge 项目无法选择可下载文件: {resolved_project_id}")
-
-            file_data = selected
-            file_id_val = file_data.get("id")
-            file_name = str(file_data.get("fileName", ""))
-            self.operations.append(
-                f"curseforge_selected_file_auto:project={resolved_project_id},file={file_id_val},name={file_name},strategy=generic"
-            )
-
-        url = file_data.get("downloadUrl") or self._build_curseforge_edge_download_url(file_data)
-        if not url:
-            raise ValueError(f"CurseForge 文件缺少下载地址: project={resolved_project_id}, file={file_data.get('id')}")
-
-        self._download_file(str(url), out)
-        self.operations.append(f"curseforge_download_pack:{resolved_project_id}:{file_data.get('id')}")
-        return out
+        return download_curseforge_pack(self, project_id, file_id=file_id)
 
     def _extract_curseforge_type_hints(self, file_data: dict) -> list[str]:
         hints: list[str] = []
@@ -3150,43 +2606,7 @@ class ServerBuilder:
         return str(project_id)
 
     def _download_modrinth_pack(self, project_or_slug: str, version_id: str | None = None) -> Path:
-        out = self.workdirs.root / "pack.zip"
-
-        project = self._mr_get_json(f"/v2/project/{project_or_slug}")
-        resolved_project_id = str(project.get("id") or project_or_slug)
-        project_slug = str(project.get("slug") or project_or_slug)
-
-        if version_id:
-            version = self._mr_get_json(f"/v2/version/{version_id}")
-            self.operations.append(f"modrinth_selected_version:project={resolved_project_id},version={version.get('id')},manual=true")
-        else:
-            versions = self._mr_get_json(f"/v2/project/{project_or_slug}/version")
-            if not isinstance(versions, list) or not versions:
-                raise ValueError(f"Modrinth 项目没有可用版本: {project_or_slug}")
-
-            selected = self._pick_modrinth_pack_version(versions)
-            if not selected:
-                raise ValueError(f"Modrinth 项目无法选择可下载版本: {project_or_slug}")
-            self.operations.append(
-                f"modrinth_selected_version_auto:project={resolved_project_id},version={selected.get('id')},strategy=generic"
-            )
-
-            version = selected
-
-        file_data = self._pick_modrinth_primary_pack_file(version.get("files") or [])
-        if not file_data:
-            raise ValueError(f"Modrinth 版本缺少可下载整合包文件: project={resolved_project_id}, version={version.get('id')}")
-
-        url = str(file_data.get("url") or "")
-        if not url:
-            raise ValueError(f"Modrinth 文件缺少下载地址: project={resolved_project_id}, version={version.get('id')}")
-
-        self._download_file(url, out)
-        self.operations.append(
-            "modrinth_download_pack:"
-            f"project={resolved_project_id},slug={project_slug},version={version.get('id')},file={file_data.get('filename')}"
-        )
-        return out
+        return download_modrinth_pack(self, project_or_slug, version_id=version_id)
 
     def _ensure_modrinth_manifest_mods(self) -> None:
         if not self.manifest:
@@ -4559,6 +3979,8 @@ class ServerBuilder:
                 'if exist "%SCRIPT_DIR%java_bins\\bin\\java.exe" set "JAVA_BIN=%SCRIPT_DIR%java_bins\\bin\\java.exe"\n'
                 'if not defined JAVA_BIN if exist "%SCRIPT_DIR%..\\java_bins\\bin\\java.exe" '
                 'set "JAVA_BIN=%SCRIPT_DIR%..\\java_bins\\bin\\java.exe"\n'
+                'if not defined JAVA_BIN if exist "%SCRIPT_DIR%..\\..\\.mcasb_cache\\java_bins\\bin\\java.exe" '
+                'set "JAVA_BIN=%SCRIPT_DIR%..\\..\\.mcasb_cache\\java_bins\\bin\\java.exe"\n'
                 "\n"
                 "if not defined JAVA_BIN (\n"
                 '  for /d %%D in ("%SCRIPT_DIR%java_bins\\jdk-*") do (\n'
@@ -4571,6 +3993,15 @@ class ServerBuilder:
                 "\n"
                 "if not defined JAVA_BIN (\n"
                 '  for /d %%D in ("%SCRIPT_DIR%..\\java_bins\\jdk-*") do (\n'
+                '    if exist "%%~fD\\bin\\java.exe" (\n'
+                '      set "JAVA_BIN=%%~fD\\bin\\java.exe"\n'
+                "      goto :java_found\n"
+                "    )\n"
+                "  )\n"
+                ")\n"
+                "\n"
+                "if not defined JAVA_BIN (\n"
+                '  for /d %%D in ("%SCRIPT_DIR%..\\..\\.mcasb_cache\\java_bins\\jdk-*") do (\n'
                 '    if exist "%%~fD\\bin\\java.exe" (\n'
                 '      set "JAVA_BIN=%%~fD\\bin\\java.exe"\n'
                 "      goto :java_found\n"
@@ -4601,8 +4032,12 @@ class ServerBuilder:
                 '  JAVA_BIN="$SCRIPT_DIR/java_bins/bin/java"\n'
                 'elif [ -x "$SCRIPT_DIR/../java_bins/bin/java" ]; then\n'
                 '  JAVA_BIN="$SCRIPT_DIR/../java_bins/bin/java"\n'
+                'elif [ -x "$SCRIPT_DIR/../../.mcasb_cache/java_bins/bin/java" ]; then\n'
+                '  JAVA_BIN="$SCRIPT_DIR/../../.mcasb_cache/java_bins/bin/java"\n'
                 "else\n"
-                '  for candidate in "$SCRIPT_DIR"/java_bins/jdk-*/bin/java "$SCRIPT_DIR"/../java_bins/jdk-*/bin/java; do\n'
+                '  for candidate in "$SCRIPT_DIR"/java_bins/jdk-*/bin/java '
+                '"$SCRIPT_DIR"/../java_bins/jdk-*/bin/java '
+                '"$SCRIPT_DIR"/../../.mcasb_cache/java_bins/jdk-*/bin/java; do\n'
                 '    if [ -x "$candidate" ]; then\n'
                 '      JAVA_BIN="$candidate"\n'
                 "      break\n"

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 LoaderType = Literal["forge", "neoforge", "fabric", "quilt", "unknown"]
 InputType = Literal["local_zip", "curseforge", "modrinth", "url"]
@@ -70,6 +70,15 @@ class WorkDirs:
     logs: Path
     java_bins: Path
     db: Path
+
+
+@dataclass(slots=True)
+class CacheDirs:
+    root: Path
+    runs: Path
+    packs: Path
+    manifests: Path
+    java_bins: Path
 
 
 @dataclass(slots=True)
@@ -227,3 +236,85 @@ class AttemptTrace:
     preflight: list[dict[str, Any]] = field(default_factory=list)
     execution: list[dict[str, Any]] = field(default_factory=list)
     rollback: list[dict[str, Any]] = field(default_factory=list)
+
+
+def pack_manifest_to_dict(manifest: PackManifest) -> dict[str, Any]:
+    return asdict(manifest)
+
+
+def pack_manifest_from_dict(payload: dict[str, Any]) -> PackManifest:
+    loader = str(payload.get("loader") or "unknown")
+    if loader not in {"forge", "neoforge", "fabric", "quilt", "unknown"}:
+        loader = "unknown"
+    start_mode = str(payload.get("start_mode") or "unknown")
+    if start_mode not in {"jar", "args_file", "script", "unknown"}:
+        start_mode = "unknown"
+
+    def _coerce_mods(values: object) -> list[ModInfo]:
+        result: list[ModInfo] = []
+        for item in values if isinstance(values, list) else []:
+            if not isinstance(item, dict):
+                continue
+            result.append(
+                ModInfo(
+                    name=str(item.get("name") or ""),
+                    project_id=str(item.get("project_id")) if item.get("project_id") is not None else None,
+                    file_id=str(item.get("file_id")) if item.get("file_id") is not None else None,
+                )
+            )
+        return result
+
+    def _coerce_evidence(values: object) -> list[DetectionEvidence]:
+        result: list[DetectionEvidence] = []
+        for item in values if isinstance(values, list) else []:
+            if not isinstance(item, dict):
+                continue
+            result.append(
+                DetectionEvidence(
+                    source_type=str(item.get("source_type") or ""),
+                    evidence_type=str(item.get("evidence_type") or ""),
+                    file=str(item.get("file") or ""),
+                    matched_text=str(item.get("matched_text") or ""),
+                    weight=float(item.get("weight") or 0.0),
+                    reason=str(item.get("reason") or ""),
+                )
+            )
+        return result
+
+    def _coerce_candidates(values: object) -> list[DetectionCandidate]:
+        result: list[DetectionCandidate] = []
+        for item in values if isinstance(values, list) else []:
+            if not isinstance(item, dict):
+                continue
+            result.append(
+                DetectionCandidate(
+                    value=str(item.get("value") or ""),
+                    confidence=float(item.get("confidence") or 0.0),
+                    evidence=_coerce_evidence(item.get("evidence")),
+                    reason=str(item.get("reason") or ""),
+                )
+            )
+        return result
+
+    return PackManifest(
+        pack_name=str(payload.get("pack_name") or ""),
+        mc_version=str(payload.get("mc_version") or "unknown"),
+        loader=cast("Literal['forge', 'neoforge', 'fabric', 'quilt', 'unknown']", loader),
+        loader_version=str(payload.get("loader_version")) if payload.get("loader_version") is not None else None,
+        mods=_coerce_mods(payload.get("mods")),
+        start_mode=cast("Literal['jar', 'args_file', 'script', 'unknown']", start_mode),
+        build=str(payload.get("build")) if payload.get("build") is not None else None,
+        loader_candidates=_coerce_candidates(payload.get("loader_candidates")),
+        mc_version_candidates=_coerce_candidates(payload.get("mc_version_candidates")),
+        loader_version_candidates=_coerce_candidates(payload.get("loader_version_candidates")),
+        build_candidates=_coerce_candidates(payload.get("build_candidates")),
+        start_mode_candidates=_coerce_candidates(payload.get("start_mode_candidates")),
+        evidence=_coerce_evidence(payload.get("evidence")),
+        confidence=float(payload.get("confidence") or 0.0),
+        warnings=(
+            [str(item) for item in payload.get("warnings", []) if str(item).strip()]
+            if isinstance(payload.get("warnings"), list)
+            else []
+        ),
+        raw=dict(payload.get("raw", {})) if isinstance(payload.get("raw"), dict) else {},
+    )

@@ -18,6 +18,13 @@ def _existing_file_path(value: str) -> str:
     return value
 
 
+def _existing_dir_path(value: str) -> str:
+    path = Path(value)
+    if not path.exists() or not path.is_dir():
+        raise argparse.ArgumentTypeError(f"目录不存在或不是目录: {value}")
+    return value
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mcasb",
@@ -31,6 +38,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", help="JSON 配置文件路径", default=None, type=_existing_file_path)
     parser.add_argument("--base-dir", help="工作目录根路径", default=".")
+    parser.add_argument("--resume", help="恢复已有工作目录路径", default=None, type=_existing_dir_path)
     parser.add_argument("--json", action="store_true", help="以 JSON 输出最终结果")
     parser.add_argument("--check-config", action="store_true", help="仅校验配置文件并输出结果，不执行构建")
     parser.add_argument("--proxy", help="临时覆盖 HTTP/HTTPS/ALL 代理地址")
@@ -63,8 +71,8 @@ def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    if not args.source and not args.check_config:
-        parser.error("缺少 source 参数；如仅校验配置，请使用 --check-config --config <path>")
+    if not args.source and not args.check_config and not args.resume:
+        parser.error("缺少 source 参数；如仅校验配置，请使用 --check-config --config <path>，或通过 --resume 恢复已有工作目录")
     if args.check_config and not args.config:
         parser.error("--check-config 需要同时提供 --config")
 
@@ -83,7 +91,7 @@ def main() -> None:
         console.print(f"配置文件: {args.config}")
         return
 
-    builder = ServerBuilder(source=args.source, config=config, base_dir=args.base_dir)
+    builder = ServerBuilder(source=args.source, config=config, base_dir=args.base_dir, resume_dir=args.resume)
     result = builder.run()
 
     if args.json:

@@ -57,6 +57,12 @@ mcasb <source> --config config.local.json
 mcasb /path/to/modpack.zip --config config.local.json --json
 ```
 
+恢复上一次失败后的工作目录继续调试：
+
+```bash
+mcasb --resume ./runs/workdir_20260628_120000 --json
+```
+
 `<source>` 可为：
 - 本地 ZIP 路径
 - CurseForge 项目 ID 或链接（如 `396246` / `396246:7760973`）
@@ -94,6 +100,8 @@ mcasb /path/to/modpack.zip --config config.local.json --base-dir ./workspace --j
   - `model`、`base_url`、`api_key`、`chat_path`
 - `download`
   - 并发、超时、重试、终端下载 UI
+- `artifacts`
+  - `package_mode`：`full` 打包完整 server/java 产物，`minimal` 仅保留诊断信息与小型启动元文件
 - 平台鉴权
   - `curseforge_api_key`、`modrinth_api_token`、`github_api_key` 等
 
@@ -116,6 +124,15 @@ flowchart TD
 ```
 
 每次运行会创建独立目录：`workdir_<timestamp>`。
+
+当前目录布局已拆成：
+
+- `./runs/workdir_<timestamp>`：单次运行工作区
+- `./.mcasb_cache/packs`：共享整合包下载缓存
+- `./.mcasb_cache/manifests`：共享 manifest 解析缓存
+- `./.mcasb_cache/java_bins`：共享 Java 安装缓存
+
+`--resume` 会复用已有 `workdir` 中的服务端目录与运行状态；若该工作区已经准备过 server 文件，则不会重复解压整合包和安装 Java/核心。
 
 ---
 
@@ -159,9 +176,10 @@ pip install -e .[dev]
 ruff check .
 mypy src
 pytest
+pytest --cov=mc_auto_server_builder --cov-report=term-missing --cov-fail-under=15
 ```
 
-覆盖率门禁已在 [`pyproject.toml`](pyproject.toml) 中配置，默认执行 `pytest` 时会输出缺失行并校验总覆盖率。
+覆盖率门禁在 [`CI`](.github/workflows/ci.yml) 中执行；本地默认 `pytest` 保持轻量，显式追加 `--cov` 参数即可得到同样的覆盖率输出。
 
 ### 测试分层与开发导航
 

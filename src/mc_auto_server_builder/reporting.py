@@ -137,6 +137,78 @@ def summarize_remote_failure_events(builder: ServerBuilder, *, detail_limit: int
     }
 
 
+def _resolve_package_mode(builder: ServerBuilder, mode: str | None = None) -> str:
+    if mode is not None and str(mode).strip():
+        candidate = str(mode).strip().lower()
+    else:
+        config = getattr(builder, "config", None)
+        artifacts = getattr(config, "artifacts", None)
+        candidate = str(getattr(artifacts, "package_mode", "full") or "full").strip().lower()
+    return candidate if candidate in {"full", "minimal"} else "full"
+
+
+def _zip_write_if_file(zf: zipfile.ZipFile, path: object, arcname: Path) -> None:
+    candidate = Path(path) if isinstance(path, (str, Path)) else None
+    if candidate is None or not candidate.exists() or not candidate.is_file():
+        return
+    zf.write(candidate, arcname)
+
+
+def _package_diagnostic_artifacts(builder: ServerBuilder, zf: zipfile.ZipFile) -> None:
+    _zip_write_if_file(zf, builder.workdirs.root / "report.txt", Path("diagnostics") / "report.txt")
+    _zip_write_if_file(zf, getattr(builder, "log_file_path", None), Path("diagnostics") / "install.log")
+    _zip_write_if_file(zf, builder.workdirs.root / "run_state.json", Path("diagnostics") / "run_state.json")
+    logs_dir = getattr(builder.workdirs, "logs", None)
+    if not isinstance(logs_dir, Path) or not logs_dir.exists():
+        return
+    for trace_path in sorted(logs_dir.glob("attempt_*.json")):
+        if trace_path.is_file():
+            zf.write(trace_path, Path("diagnostics") / "attempt_traces" / trace_path.name)
+
+
+def _package_full_server_artifacts(builder: ServerBuilder, zf: zipfile.ZipFile) -> None:
+    excluded_runtime_dirs = {
+        "crash-reports",
+        "logs",
+        "world",
+        "world_nether",
+        "world_the_end",
+    }
+    for path in builder.workdirs.server.rglob("*"):
+        if path.is_file() and not any(part in excluded_runtime_dirs for part in path.relative_to(builder.workdirs.server).parts):
+            zf.write(path, path.relative_to(builder.workdirs.server))
+    selected_java_home = builder.workdirs.java_bins / f"jdk-{int(getattr(builder, 'current_java_version', 0) or 0)}"
+    if selected_java_home.exists() and selected_java_home.is_dir():
+        for path in selected_java_home.rglob("*"):
+            if path.is_file():
+                zf.write(path, Path("java_bins") / path.relative_to(builder.workdirs.java_bins))
+        return
+    for path in builder.workdirs.java_bins.iterdir():
+        if path.is_file():
+            zf.write(path, Path("java_bins") / path.relative_to(builder.workdirs.java_bins))
+    fallback_java_root = builder.workdirs.java_bins / "bin"
+    if fallback_java_root.exists() and fallback_java_root.is_dir():
+        for path in fallback_java_root.rglob("*"):
+            if path.is_file():
+                zf.write(path, Path("java_bins") / path.relative_to(builder.workdirs.java_bins))
+
+
+def _package_minimal_server_artifacts(builder: ServerBuilder, zf: zipfile.ZipFile) -> None:
+    preserved_names = {"eula.txt", "server.properties"}
+    preserved_suffixes = {".sh", ".bat", ".cmd", ".ps1"}
+    for path in sorted(builder.workdirs.server.iterdir(), key=lambda item: item.name.lower()):
+        if not path.is_file():
+            continue
+        if path.name in preserved_names or path.suffix.lower() in preserved_suffixes:
+            zf.write(path, Path("server") / path.name)
+    if getattr(builder, "start_command_mode", "") == "argsfile":
+        start_value = str(getattr(builder, "start_command_value", "") or "").strip()
+        if start_value:
+            args_path = builder.workdirs.server / start_value
+            if args_path.exists() and args_path.is_file():
+                zf.write(args_path, Path("server") / args_path.relative_to(builder.workdirs.server))
+
+
 def build_recognition_summary(builder: ServerBuilder) -> dict[str, object]:
     manifest = getattr(builder, "manifest", None)
     if not manifest:
@@ -230,6 +302,9 @@ def build_meta_payload(builder: ServerBuilder) -> dict[str, object]:
             "stop_reason": builder.stop_reason,
             "recognition_attempts": list(builder.recognition_attempts),
         },
+        "artifacts": {
+            "package_mode": _resolve_package_mode(builder),
+        },
         "remote_failures": {
             "summary": remote_failure_summary,
             "events": _coerce_dict_list(getattr(builder, "remote_failure_events", [])),
@@ -239,22 +314,15 @@ def build_meta_payload(builder: ServerBuilder) -> dict[str, object]:
 
 
 def package_server(builder: ServerBuilder) -> str:
+    package_mode = _resolve_package_mode(builder)
     out = builder.workdirs.root / "server_pack.zip"
-    excluded_runtime_dirs = {
-        "crash-reports",
-        "logs",
-        "world",
-        "world_nether",
-        "world_the_end",
-    }
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("build_meta.json", json.dumps(builder._build_meta_payload(), ensure_ascii=False, indent=2))
-        for p in builder.workdirs.server.rglob("*"):
-            if p.is_file() and not any(part in excluded_runtime_dirs for part in p.relative_to(builder.workdirs.server).parts):
-                zf.write(p, p.relative_to(builder.workdirs.server))
-        for p in builder.workdirs.java_bins.rglob("*"):
-            if p.is_file():
-                zf.write(p, Path("java_bins") / p.relative_to(builder.workdirs.java_bins))
+        _package_diagnostic_artifacts(builder, zf)
+        if package_mode == "minimal":
+            _package_minimal_server_artifacts(builder, zf)
+        else:
+            _package_full_server_artifacts(builder, zf)
     return str(out)
 
 

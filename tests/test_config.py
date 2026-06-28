@@ -13,6 +13,7 @@ def test_load_default_config_when_path_is_none():
     assert cfg.memory.xmx == "6G"
     assert cfg.runtime.max_attempts == 20
     assert cfg.ai.enabled is False
+    assert cfg.artifacts.package_mode == "full"
     assert cfg.proxy.trust_env is True
     assert cfg.proxy.to_requests_proxies() is None
 
@@ -74,6 +75,7 @@ def test_load_config_normalizes_bool_number_and_list_fields(tmp_path):
     payload = {
         "runtime": {"keep_running": "true", "max_attempts": "3"},
         "ai": {"stream": "false", "retry_backoff_sec": "2.5", "stop": "<END>"},
+        "artifacts": {"package_mode": "MINIMAL"},
         "extra_jvm_flags": "-Dfoo=bar",
         "graalvm_external_packages": [" pkg.a ", "pkg.b"],
     }
@@ -85,6 +87,7 @@ def test_load_config_normalizes_bool_number_and_list_fields(tmp_path):
     assert cfg.runtime.max_attempts == 3
     assert cfg.ai.stream is False
     assert cfg.ai.retry_backoff_sec == 2.5
+    assert cfg.artifacts.package_mode == "minimal"
     assert cfg.extra_jvm_flags == ["-Dfoo=bar"]
     assert cfg.graalvm_external_packages == ["pkg.a", "pkg.b"]
 
@@ -110,4 +113,12 @@ def test_load_config_rejects_invalid_bool_value(tmp_path):
     config_path.write_text(json.dumps({"ai": {"enabled": "not-bool"}}), encoding="utf-8")
 
     with pytest.raises(ConfigError, match="ai.enabled"):
+        AppConfig.load(config_path)
+
+
+def test_load_config_rejects_invalid_artifact_package_mode(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"artifacts": {"package_mode": "huge"}}), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="artifacts.package_mode"):
         AppConfig.load(config_path)

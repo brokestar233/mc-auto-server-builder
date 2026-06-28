@@ -52,7 +52,7 @@ jobs:
           python -m pip install -e .[dev]
 
       - name: Run tests (pytest)
-        run: pytest
+        run: pytest --cov=mc_auto_server_builder --cov-report=term-missing --cov-fail-under=15
 
       - name: Build package
         if: matrix.python-version == '3.11'

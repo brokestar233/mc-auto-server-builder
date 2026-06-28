@@ -22,6 +22,10 @@ if TYPE_CHECKING:
     from .builder import ServerBuilder
 
 
+class UnsupportedStructuredOutputError(ExternalServiceError):
+    pass
+
+
 class BuilderAIService:
     def __init__(self, builder: ServerBuilder):
         self.builder = builder
@@ -78,6 +82,122 @@ class BuilderAIService:
             return mapped
 
         return {"type": str(action)}
+
+    def _normal_failure_schema_example(self) -> dict[str, object]:
+        return {
+            "thought_chain": ["最多 8 条简短推理"],
+            "final_output": {
+                "primary_issue": (
+                    "client_mod|memory_allocation|memory_oom|java_version_mismatch|mod_conflict|missing_dependency|config_error|pack_recognition_error|loader_misclassification|version_misclassification|start_command_misclassification|other"
+                ),
+                "confidence": 0.0,
+                "reason": "技术原因摘要",
+                "input_summary": "输入信息摘要",
+                "user_summary": "给用户看的结论",
+                "hit_deleted_mods": ["..."],
+                "dependency_chains": [["dependent", "...", "deleted_mod"]],
+                "deletion_rationale": ["..."],
+                "conflicts_or_exceptions": ["..."],
+                "evidence": ["关键证据"],
+                "suggested_manual_steps": ["人工修复步骤"],
+                "actions": [
+                    {"type": "remove_mods", "targets": ["modA.jar"], "rollback_on_failure": True},
+                    {
+                        "type": "continue_after_restore_mods",
+                        "reason": "专项删除验证确认故障形态变化，需要恢复到删除后的工作集并继续一次常规分析",
+                    },
+                    {
+                        "type": "bisect_mods",
+                        "bisect_mode": "initial",
+                        "targets": ["modA.jar", "modB.jar"],
+                        "bisect_reason": "日志无法唯一命中单个 mod，但这两个 mod 最可疑，申请系统先对最小 suspects 集合做受控二分",
+                        "max_rounds": 1,
+                    },
+                    {
+                        "type": "bisect_mods",
+                        "bisect_mode": "switch_group",
+                        "bisect_reason": "当前组已启动成功，申请系统切换验证另一组",
+                    },
+                    {
+                        "type": "bisect_mods",
+                        "bisect_mode": "continue_failed_group",
+                        "bisect_reason": "失败组仍包含多个嫌疑 mod，申请继续稳定二分",
+                    },
+                    {"type": "move_bisect_mods", "targets": ["libX.jar"], "reason": "当前测试组缺少前置依赖，申请从另一组临时迁移"},
+                    {"type": "adjust_memory", "xmx": "6G", "xms": "4G"},
+                    {"type": "change_java", "version": 21},
+                    {
+                        "type": "switch_recognition_candidate",
+                        "loader": "forge",
+                        "loader_version": "1.20.1-47.2.0",
+                        "mc_version": "1.20.1",
+                        "start_mode": "argsfile",
+                        "build": "47.2.0",
+                        "reason": "日志反证当前识别错误",
+                    },
+                    {
+                        "type": "report_manual_fix",
+                        "final_reason": "崩溃主因",
+                        "reason": "为什么无法自动修复",
+                        "manual_steps": ["步骤1"],
+                        "evidence": ["证据1"],
+                    },
+                    {"type": "stop_and_report", "final_reason": "证据不足，保守停止"},
+                ],
+            },
+        }
+
+    def _success_guard_schema_example(self) -> dict[str, object]:
+        return {
+            "thought_chain": ["最多 6 条简短推理"],
+            "final_output": {
+                "primary_issue": "client_mod|mod_conflict|missing_dependency|other",
+                "confidence": 0.0,
+                "reason": "成功态风险摘要",
+                "input_summary": "成功态输入摘要",
+                "user_summary": "给用户看的结论",
+                "evidence": ["关键证据"],
+                "suggested_manual_steps": ["人工修复步骤"],
+                "actions": [
+                    {"type": "remove_mods", "targets": ["modA.jar"], "rollback_on_failure": True},
+                    {
+                        "type": "bisect_mods",
+                        "bisect_mode": "switch_group",
+                        "bisect_reason": "当前组已启动成功，申请系统切换验证另一组",
+                    },
+                    {"type": "move_bisect_mods", "targets": ["libX.jar"], "reason": "成功组缺少前置依赖，申请迁移依赖"},
+                    {
+                        "type": "report_manual_fix",
+                        "final_reason": "成功态仍存在残余风险，需要人工确认",
+                        "manual_steps": ["步骤1"],
+                        "evidence": ["证据1"],
+                    },
+                    {"type": "stop_and_report", "final_reason": "成功态证据不足，保守停止"},
+                ],
+            },
+        }
+
+    def _remove_validation_schema_example(self) -> dict[str, object]:
+        return {
+            "thought_chain": ["最多 6 条简短推理"],
+            "final_output": {
+                "primary_issue": "mod_conflict|missing_dependency|client_mod|other",
+                "confidence": 0.0,
+                "reason": "删除验证结论",
+                "input_summary": "验证输入摘要",
+                "user_summary": "给用户看的结论",
+                "evidence": ["关键证据"],
+                "suggested_manual_steps": ["人工步骤"],
+                "actions": [
+                    {
+                        "type": "continue_after_restore_mods",
+                        "reason": "删除后故障形态变化，说明这次删除命中了问题方向；请恢复到删除后的工作集并继续一次后续动作",
+                    },
+                    {"type": "report_manual_fix", "final_reason": "需要人工处理", "manual_steps": ["步骤1"], "evidence": ["证据1"]},
+                    {"type": "stop_and_report", "final_reason": "删除验证未提供可继续的新信息"},
+                ],
+            },
+        }
 
     def _extract_json_object(self, text: str) -> dict | None:
         payload = (text or "").strip()
@@ -311,6 +431,85 @@ class BuilderAIService:
             {"role": "user", "content": prompt},
         ]
 
+    def _build_structured_output_schema(self, allowed_action_types: list[str]) -> dict[str, object]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "thought_chain": {"type": "array", "items": {"type": "string"}},
+                "final_output": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "properties": {
+                        "primary_issue": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "reason": {"type": "string"},
+                        "input_summary": {"type": "string"},
+                        "user_summary": {"type": "string"},
+                        "hit_deleted_mods": {"type": "array", "items": {"type": "string"}},
+                        "dependency_chains": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+                        "deletion_rationale": {"type": "array", "items": {"type": "string"}},
+                        "conflicts_or_exceptions": {"type": "array", "items": {"type": "string"}},
+                        "suggested_manual_steps": {"type": "array", "items": {"type": "string"}},
+                        "evidence": {"type": "array", "items": {"type": "string"}},
+                        "actions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": True,
+                                "properties": {
+                                    "type": {"type": "string", "enum": allowed_action_types},
+                                    "targets": {"type": "array", "items": {"type": "string"}},
+                                    "rollback_on_failure": {"type": "boolean"},
+                                    "xmx": {"type": "string"},
+                                    "xms": {"type": "string"},
+                                    "version": {"type": "integer"},
+                                    "reason": {"type": "string"},
+                                    "final_reason": {"type": "string"},
+                                    "manual_steps": {"type": "array", "items": {"type": "string"}},
+                                    "evidence": {"type": "array", "items": {"type": "string"}},
+                                    "bisect_mode": {"type": "string"},
+                                    "bisect_reason": {"type": "string"},
+                                    "move_candidates": {"type": "array", "items": {"type": "string"}},
+                                    "max_rounds": {"type": "integer"},
+                                    "allow_dependency_moves": {"type": "boolean"},
+                                    "loader": {"type": "string"},
+                                    "loader_version": {"type": "string"},
+                                    "mc_version": {"type": "string"},
+                                    "start_mode": {"type": "string"},
+                                    "build": {"type": "string"},
+                                },
+                                "required": ["type"],
+                            },
+                        },
+                    },
+                    "required": ["primary_issue", "confidence", "reason", "actions"],
+                },
+            },
+            "required": ["final_output"],
+        }
+
+    def _build_response_format(self, name: str, allowed_action_types: list[str]) -> dict[str, object]:
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": name,
+                "strict": False,
+                "schema": self._build_structured_output_schema(allowed_action_types),
+            },
+        }
+
+    def _build_json_repair_prompt(self, raw_text: str, schema_example: dict[str, object]) -> str:
+        return "".join(
+            [
+                "你是一个 JSON 修复器。\n",
+                "不要重新分析 Minecraft 问题，不要补充新结论，只把已有输出修复成一个严格 JSON 对象。\n",
+                "要求：1. 只能输出 JSON；2. 保留原语义；3. 若某字段缺失，可给出最保守的空值或默认值；4. 不要输出 markdown 代码块。\n",
+                f"参考结构示例: {json.dumps(schema_example, ensure_ascii=False)}\n",
+                f"待修复文本: {self._truncate_debug_text(raw_text, 12000)}",
+            ]
+        )
+
     def _build_openai_headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
         api_key = (self.builder.config.ai.api_key or "").strip()
@@ -359,7 +558,10 @@ class BuilderAIService:
         for raw_line in resp.iter_lines(decode_unicode=True):
             if not raw_line:
                 continue
-            line = raw_line.strip()
+            if isinstance(raw_line, bytes):
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+            else:
+                line = str(raw_line).strip()
             if not line.startswith("data:"):
                 continue
             data = line[5:].strip()
@@ -427,6 +629,20 @@ class BuilderAIService:
             return "(429)" in message or "AI 服务端异常(" in message
         return False
 
+    def _is_unsupported_structured_output_response(self, status_code: int, body_preview: str) -> bool:
+        if status_code != 400:
+            return False
+        lowered = (body_preview or "").lower()
+        markers = (
+            "response_format",
+            "json_schema",
+            "unsupported",
+            "unknown parameter",
+            "invalid parameter",
+            "not supported",
+        )
+        return any(marker in lowered for marker in markers)
+
     def _log_ai_retry(self, provider: str, attempt: int, max_attempts: int, retryable: bool, exc: Exception) -> None:
         self._ai_debug(
             f"{provider}.retry attempt={attempt}/{max_attempts} retryable={retryable} "
@@ -456,7 +672,7 @@ class BuilderAIService:
                         proxies=self.builder.config.proxy.to_requests_proxies(),
                         trust_env=self.builder.config.proxy.trust_env,
                     ) as session:
-                        resp = session.post(self.builder.config.ai.endpoint, json=payload, timeout=timeout_sec)
+                        resp = session.post(self.builder.config.ai.endpoint, json=cast(Any, payload), timeout=timeout_sec)
                 except requests.RequestException as exc:
                     self._raise_ai_request_error("ollama", exc)
                 if resp.status_code >= 400:
@@ -495,7 +711,7 @@ class BuilderAIService:
         assert last_error is not None
         raise last_error
 
-    def _call_openai_compatible_chat(self, prompt: str) -> str:
+    def _call_openai_compatible_chat(self, prompt: str, response_format: dict[str, object] | None = None) -> str:
         ai_cfg = self.builder.config.ai
         endpoint = self._resolve_openai_chat_endpoint()
         timeout_sec = max(5, int(ai_cfg.timeout_sec or 300))
@@ -512,6 +728,8 @@ class BuilderAIService:
         }
         if ai_cfg.stop:
             payload["stop"] = list(ai_cfg.stop)
+        if response_format:
+            payload["response_format"] = dict(response_format)
         headers = self._build_openai_headers()
         self._ai_debug(
             "openai.request "
@@ -527,11 +745,16 @@ class BuilderAIService:
                             requests.Session(),
                             proxies=self.builder.config.proxy.to_requests_proxies(),
                             trust_env=self.builder.config.proxy.trust_env,
-                        ).post(endpoint, headers=headers, json=payload, timeout=timeout_sec, stream=True)
+                        ).post(endpoint, headers=headers, json=cast(Any, payload), timeout=timeout_sec, stream=True)
                     except requests.RequestException as exc:
                         self._raise_ai_request_error("openai_compatible", exc)
                     with request_ctx as resp:
                         if resp.status_code >= 400:
+                            if response_format and self._is_unsupported_structured_output_response(resp.status_code, resp.text):
+                                message = self._map_ai_http_error(resp.status_code, body_preview=resp.text)
+                                raise UnsupportedStructuredOutputError(
+                                    f"AI 结构化输出不受支持(openai_compatible): {message}"
+                                )
                             self._raise_ai_http_error("openai_compatible", resp)
                         text = self._extract_openai_text_from_stream(resp)
                         self._ai_debug(
@@ -546,10 +769,14 @@ class BuilderAIService:
                         proxies=self.builder.config.proxy.to_requests_proxies(),
                         trust_env=self.builder.config.proxy.trust_env,
                     ) as session:
-                        resp = session.post(endpoint, headers=headers, json=payload, timeout=timeout_sec)
+                        resp = session.post(endpoint, headers=headers, json=cast(Any, payload), timeout=timeout_sec)
                 except requests.RequestException as exc:
                     self._raise_ai_request_error("openai_compatible", exc)
                 if resp.status_code >= 400:
+                    if response_format and self._is_unsupported_structured_output_response(resp.status_code, resp.text):
+                        raise UnsupportedStructuredOutputError(
+                            f"AI 结构化输出不受支持(openai_compatible): {self._map_ai_http_error(resp.status_code, body_preview=resp.text)}"
+                        )
                     self._raise_ai_http_error("openai_compatible", resp)
                 body = self._parse_json_body("openai_compatible", resp)
                 text = self._extract_openai_text_from_non_stream(body)
@@ -559,8 +786,10 @@ class BuilderAIService:
                     f"{json.dumps(self._truncate_debug_text(text, 1200), ensure_ascii=False)}"
                 )
                 return text
-            except (ExternalRequestError, ExternalResponseError, ExternalDataError) as e:
+            except (ExternalRequestError, ExternalResponseError, ExternalDataError, UnsupportedStructuredOutputError) as e:
                 last_error = e
+                if isinstance(e, UnsupportedStructuredOutputError):
+                    break
                 retryable = self._is_retryable_ai_error(e)
                 self._log_ai_retry("openai", attempt, max_retries + 1, retryable, e)
                 if (not retryable) or attempt >= max_retries + 1:
@@ -569,10 +798,10 @@ class BuilderAIService:
         assert last_error is not None
         raise last_error
 
-    def _call_ai_provider(self, prompt: str) -> str:
+    def _call_ai_provider(self, prompt: str, response_format: dict[str, object] | None = None) -> str:
         provider = (self.builder.config.ai.provider or "ollama").strip().lower()
         if provider in {"openai_compatible", "openai-compatible", "openai"}:
-            return self._call_openai_compatible_chat(prompt)
+            return self._call_openai_compatible_chat(prompt, response_format=response_format)
         return self._call_ollama_generate(prompt)
 
     def _extract_log_signal_lines(self, text: object, limit: int = 12) -> list[str]:
@@ -624,15 +853,44 @@ class BuilderAIService:
             "server_profile": {
                 "mc_version": context.get("mc_version", "unknown"),
                 "loader": context.get("loader", "unknown"),
+                "loader_version": context.get("loader_version"),
+                "build": context.get("build"),
+                "start_mode": context.get("start_mode", "unknown"),
                 "jvm_args": context.get("jvm_args", "unknown"),
                 "available_ram": context.get("available_ram", "unknown"),
-                "attempt": self.builder.attempts_used,
+                "attempt": int(getattr(self.builder, "attempts_used", 0) or 0),
             },
-            "failure_signals": {
+            "recognition_state": {
+                "recognition_summary": dict(context.get("recognition_summary", {}))
+                if isinstance(context.get("recognition_summary"), dict)
+                else {},
+            },
+            "startup_state": {
                 "conflicts_or_exceptions": self._normalize_text_list(context.get("conflicts_or_exceptions", []), limit=20),
+                "failure_signals": self._normalize_text_list(context.get("failure_signals", []), limit=20),
+                "readiness_evidence": self._normalize_text_list(context.get("readiness_evidence", []), limit=20),
                 "port_open_detected": context.get("port_open_detected", False),
                 "done_detected": context.get("done_detected", False),
                 "command_probe_detected": context.get("command_probe_detected", False),
+                "resource_summary": dict(context.get("resource_summary", {})) if isinstance(context.get("resource_summary"), dict) else {},
+                "key_exception": str(context.get("key_exception") or "unknown"),
+                "suspected_mods": self._normalize_text_list(context.get("suspected_mods", []), limit=30),
+                "oom_detected": bool(context.get("oom_detected", False)),
+                "jvm_exit_code": context.get("jvm_exit_code"),
+            },
+            "deterministic_tools": {
+                "start_command_check": dict(context.get("start_command_check", {}))
+                if isinstance(context.get("start_command_check"), dict)
+                else {},
+                "crash_report_analysis": dict(context.get("crash_report_analysis", {}))
+                if isinstance(context.get("crash_report_analysis"), dict)
+                else {},
+                "dependency_graph": dict(context.get("dependency_graph", {}))
+                if isinstance(context.get("dependency_graph"), dict)
+                else {},
+                "mod_metadata_summary": dict(context.get("mod_metadata_summary", {}))
+                if isinstance(context.get("mod_metadata_summary"), dict)
+                else {},
             },
             "mod_state": {
                 "mod_count": context.get("mod_count", 0),
@@ -673,11 +931,23 @@ class BuilderAIService:
             },
         }
 
+    def build_success_guard_context_payload(self, context: dict) -> dict[str, object]:
+        base = self.build_context_payload(context)
+        base["analysis_stage"] = "success_guard"
+        base["allowed_actions"] = [
+            {"type": "remove_mods", "when": "成功态证据已能锁定剩余客户端模组或冲突模组"},
+            {"type": "bisect_mods", "when": "成功态仍有待验证的另一组或失败组，需要继续受控二分"},
+            {"type": "move_bisect_mods", "when": "当前成功组缺少前置依赖，需要从另一组临时迁移少量依赖"},
+            {"type": "report_manual_fix", "when": "成功态仍存在风险，但自动动作不再安全"},
+            {"type": "stop_and_report", "when": "成功态证据不足，保守停止"},
+        ]
+        return base
+
     def build_remove_validation_context_payload(self, context: dict) -> dict[str, object]:
         validation_state = dict(context.get("remove_validation_state") or {})
         return {
             "validation_target": {
-                "attempt": self.builder.attempts_used,
+                "attempt": int(getattr(self.builder, "attempts_used", 0) or 0),
                 "action_index": validation_state.get("action_index"),
                 "removed_targets": self._normalize_text_list(validation_state.get("removed_targets", []), limit=20),
                 "forced_targets": self._normalize_text_list(validation_state.get("forced_targets", []), limit=20),
@@ -709,26 +979,7 @@ class BuilderAIService:
         }
 
     def build_remove_validation_prompt(self, context: dict) -> str:
-        schema = {
-            "thought_chain": ["最多 6 条简短推理"],
-            "final_output": {
-                "primary_issue": "mod_conflict|missing_dependency|client_mod|other",
-                "confidence": 0.0,
-                "reason": "删除验证结论",
-                "input_summary": "验证输入摘要",
-                "user_summary": "给用户看的结论",
-                "evidence": ["关键证据"],
-                "suggested_manual_steps": ["人工步骤"],
-                "actions": [
-                    {
-                        "type": "continue_after_restore_mods",
-                        "reason": "删除后故障形态变化，说明这次删除命中了问题方向；请恢复到删除后的工作集并继续一次后续动作",
-                    },
-                    {"type": "report_manual_fix", "final_reason": "需要人工处理", "manual_steps": ["步骤1"], "evidence": ["证据1"]},
-                    {"type": "stop_and_report", "final_reason": "删除验证未提供可继续的新信息"},
-                ],
-            },
-        }
+        schema = self._remove_validation_schema_example()
         return "".join(
             [
                 "你是 Minecraft 服务器自动修复流程中的删除验证裁决器。\n",
@@ -736,6 +987,7 @@ class BuilderAIService:
                     "你的任务不是做完整日志分析，而是只根据一次 remove_mods + rollback_on_failure 的验证结果，"
                     "判断这次删除是否命中了问题方向，以及系统是否应该在下一轮恢复到删除后的工作集后继续执行一次后续动作。\n"
                 ),
+                "优先参考 deterministic_tools 中的 crash_report_analysis 与 dependency_graph，再决定是否继续。\n",
                 "硬规则：1. 只能输出 continue_after_restore_mods、report_manual_fix、stop_and_report 三类动作。",
                 (
                     "2. 当 validation_target.removed_targets 删除后，"
@@ -754,74 +1006,42 @@ class BuilderAIService:
             ]
         )
 
-    def build_prompt(self, context: dict) -> str:
-        schema = {
-            "thought_chain": ["最多 8 条简短推理"],
-            "final_output": {
-                "primary_issue": (
-                    "client_mod|memory_allocation|memory_oom|java_version_mismatch|mod_conflict|missing_dependency|config_error|pack_recognition_error|loader_misclassification|version_misclassification|start_command_misclassification|other"
+    def build_success_guard_prompt(self, context: dict) -> str:
+        schema = self._success_guard_schema_example()
+        return "".join(
+            [
+                "你是 Minecraft 服务器自动修复流程中的成功态专项分析器。\n",
+                (
+                    "当前服务器已经出现启动成功信号，但系统仍在 success guard / bisect followup 阶段，"
+                    "需要判断是否还存在残余客户端模组或分组验证风险。\n"
                 ),
-                "confidence": 0.0,
-                "reason": "技术原因摘要",
-                "input_summary": "输入信息摘要",
-                "user_summary": "给用户看的结论",
-                "hit_deleted_mods": ["..."],
-                "dependency_chains": [["dependent", "...", "deleted_mod"]],
-                "deletion_rationale": ["..."],
-                "conflicts_or_exceptions": ["..."],
-                "evidence": ["关键证据"],
-                "suggested_manual_steps": ["人工修复步骤"],
-                "actions": [
-                    {"type": "remove_mods", "targets": ["modA.jar"], "rollback_on_failure": True},
-                    {
-                        "type": "continue_after_restore_mods",
-                        "reason": "专项删除验证确认故障形态变化，需要恢复到删除后的工作集并继续一次常规分析",
-                    },
-                    {
-                        "type": "bisect_mods",
-                        "bisect_mode": "initial",
-                        "targets": ["modA.jar", "modB.jar"],
-                        "bisect_reason": "日志无法唯一命中单个 mod，但这两个 mod 最可疑，申请系统先对最小 suspects 集合做受控二分",
-                        "max_rounds": 1,
-                    },
-                    {
-                        "type": "bisect_mods",
-                        "bisect_mode": "switch_group",
-                        "bisect_reason": "当前组已启动成功，申请系统切换验证另一组",
-                    },
-                    {
-                        "type": "bisect_mods",
-                        "bisect_mode": "continue_failed_group",
-                        "bisect_reason": "失败组仍包含多个嫌疑 mod，申请继续稳定二分",
-                    },
-                    {"type": "move_bisect_mods", "targets": ["libX.jar"], "reason": "当前测试组缺少前置依赖，申请从另一组临时迁移"},
-                    {"type": "adjust_memory", "xmx": "6G", "xms": "4G"},
-                    {"type": "change_java", "version": 21},
-                    {
-                        "type": "switch_recognition_candidate",
-                        "loader": "forge",
-                        "loader_version": "1.20.1-47.2.0",
-                        "mc_version": "1.20.1",
-                        "start_mode": "argsfile",
-                        "build": "47.2.0",
-                        "reason": "日志反证当前识别错误",
-                    },
-                    {
-                        "type": "report_manual_fix",
-                        "final_reason": "崩溃主因",
-                        "reason": "为什么无法自动修复",
-                        "manual_steps": ["步骤1"],
-                        "evidence": ["证据1"],
-                    },
-                    {"type": "stop_and_report", "final_reason": "证据不足，保守停止"},
-                ],
-            },
-        }
+                "优先参考 deterministic_tools 中的 start_command_check、dependency_graph、mod_metadata_summary。\n",
+                "硬规则：1. 只允许输出 remove_mods、bisect_mods、move_bisect_mods、report_manual_fix、stop_and_report。",
+                "2. 禁止输出 adjust_memory、change_java、switch_recognition_candidate、continue_after_restore_mods。",
+                "3. 若 bisect_state.active=true，必须优先遵循 next_allowed_requests、last_feedback、fallback_targets，不能自由重猜分组。",
+                "4. 若证据只能支持剩余风险提示，不能安全自动动作，则优先 report_manual_fix，而不是重复成功态回归。\n",
+                "动作优先级：1. 成功态若能唯一锁定残余客户端模组，优先 remove_mods。",
+                (
+                    "2. 若当前只是二分流程尚未完成，优先 bisect_mods 或 move_bisect_mods，"
+                    "保持与 pending_group、continuation_targets、tested_side 一致。"
+                ),
+                "3. 若 success_guard_history 已连续出现同类风险而证据仍不收敛，优先 report_manual_fix。",
+                "4. 只有当证据不足以支持任何安全动作时，才允许 stop_and_report。\n",
+                "输出必须是严格 JSON，不要包含 markdown 代码块，不要输出额外解释。\n",
+                f"结构化上下文: {json.dumps(context, ensure_ascii=False)[:12000]}\n",
+                f"返回 JSON Schema 示例: {json.dumps(schema, ensure_ascii=False)}",
+            ]
+        )
+
+    def build_prompt(self, context: dict) -> str:
+        schema = self._normal_failure_schema_example()
         return "".join(
             [
                 "你是一个专业的Minecraft服务器部署与优化助手。\n",
                 "任务目标：先识别主因，再选择最安全、最可执行的动作。"
                 "证据优先级：异常堆栈/错误关键字 > 已删除客户端mod依赖链 > 最近自动操作 > 其他上下文。\n",
+                "优先参考 deterministic_tools 中的 crash_report_analysis、dependency_graph、start_command_check；"
+                "这些是系统先做过的确定性检查。\n",
                 "硬规则：1. 若某个 mod 依赖任何已知且已删除的客户端 mod，则该 mod 必须判定为 remove_mods。"
                 "2. 若证据只能唯一锁定 1 个候选，则 remove_mods 只提交这 1 个最有把握的 mod。"
                 "但若证据已明确表明多个 mod 都是客户端专用 mod，允许一次提交多个 remove_mods targets；"
@@ -876,6 +1096,45 @@ class BuilderAIService:
             ]
         )
 
+    def _provider_prefers_structured_output(self) -> bool:
+        provider = (self.builder.config.ai.provider or "ollama").strip().lower()
+        return provider in {"openai_compatible", "openai-compatible", "openai"}
+
+    def _invoke_json_prompt(
+        self,
+        prompt: str,
+        *,
+        response_format_name: str,
+        schema_example: dict[str, object],
+        allowed_action_types: list[str],
+    ) -> dict[str, object]:
+        response_format = (
+            self._build_response_format(response_format_name, allowed_action_types)
+            if self._provider_prefers_structured_output()
+            else None
+        )
+        structured_output_unsupported = False
+        try:
+            text = self._call_ai_provider(prompt, response_format=response_format)
+        except UnsupportedStructuredOutputError:
+            structured_output_unsupported = True
+            self._ai_debug(f"response.structured.unsupported name={response_format_name}")
+            text = self._call_ai_provider(prompt)
+
+        parsed = self._extract_json_object(str(text))
+        if isinstance(parsed, dict):
+            return parsed
+
+        self._ai_debug(f"response.parse failed reason=no_json_object name={response_format_name} -> repair_prompt")
+        repair_prompt = self._build_json_repair_prompt(str(text), schema_example)
+        repair_response_format = None if structured_output_unsupported else response_format
+        repaired_text = self._call_ai_provider(repair_prompt, response_format=repair_response_format)
+        repaired = self._extract_json_object(str(repaired_text))
+        if not isinstance(repaired, dict):
+            self._ai_debug(f"response.parse failed reason=repair_failed name={response_format_name}")
+            raise ValueError("ai_response_invalid_json")
+        return repaired
+
     def analyze(self, context: dict) -> dict:
         if not self.builder.config.ai.enabled:
             result = AIResult(
@@ -913,17 +1172,22 @@ class BuilderAIService:
             f"prompt_preview={json.dumps(self._truncate_debug_text(prompt, 800), ensure_ascii=False)}"
         )
         try:
-            text = self._call_ai_provider(prompt)
-            self._ai_debug(f"response.raw len={len(str(text))}")
-            parsed = self._extract_json_object(str(text))
-            if not isinstance(parsed, dict):
-                self._ai_debug("response.parse failed reason=no_json_object attempt=1 -> retry_once")
-                retry_text = self._call_ai_provider(prompt)
-                self._ai_debug(f"response.raw.retry len={len(str(retry_text))}")
-                parsed = self._extract_json_object(str(retry_text))
-                if not isinstance(parsed, dict):
-                    self._ai_debug("response.parse failed reason=no_json_object attempt=2")
-                    raise ValueError("ai_response_invalid_json")
+            parsed = self._invoke_json_prompt(
+                prompt,
+                response_format_name="mcasb_normal_failure",
+                schema_example=self._normal_failure_schema_example(),
+                allowed_action_types=[
+                    "remove_mods",
+                    "continue_after_restore_mods",
+                    "adjust_memory",
+                    "change_java",
+                    "stop_and_report",
+                    "report_manual_fix",
+                    "bisect_mods",
+                    "move_bisect_mods",
+                    "switch_recognition_candidate",
+                ],
+            )
             self._ai_debug(f"response.parse success parsed={json.dumps(parsed, ensure_ascii=False)[:2000]}")
             self.builder.last_ai_payload = parsed
             result = self._normalize_ai_result(parsed)
@@ -980,6 +1244,61 @@ class BuilderAIService:
             "actions": [self._serialize_ai_action(a) for a in result.actions],
         }
 
+    def analyze_success_guard(self, context: dict) -> dict:
+        if not self.builder.config.ai.enabled:
+            return self.analyze(context)
+
+        normalized_context = self.build_success_guard_context_payload(context)
+        prompt = self.build_success_guard_prompt(normalized_context)
+        try:
+            parsed = self._invoke_json_prompt(
+                prompt,
+                response_format_name="mcasb_success_guard",
+                schema_example=self._success_guard_schema_example(),
+                allowed_action_types=[
+                    "remove_mods",
+                    "bisect_mods",
+                    "move_bisect_mods",
+                    "report_manual_fix",
+                    "stop_and_report",
+                ],
+            )
+            self._ai_debug(f"success_guard.parse success parsed={json.dumps(parsed, ensure_ascii=False)[:2000]}")
+            self.builder.last_ai_payload = parsed
+            result = self._normalize_ai_result(parsed)
+        except ExternalServiceError as e:
+            err = f"AI 成功态分析失败: {type(e).__name__}:{e}"
+            self.builder.operations.append(f"analyze_success_guard_failed:{type(e).__name__}")
+            self.builder._log("install.ai", err, level="WARN")
+            result = self._safe_ai_result(reason=err, confidence=0.05)
+        except Exception as e:
+            err = f"AI 成功态分析失败: {type(e).__name__}:{e}"
+            self.builder.operations.append(f"analyze_success_guard_failed:{type(e).__name__}")
+            self.builder._log("install.ai", err, level="WARN")
+            result = self._safe_ai_result(reason=err, confidence=0.05)
+
+        self.builder.last_ai_result = result
+        self.builder.last_ai_manual_report = {
+            "user_summary": result.user_summary,
+            "suggested_manual_steps": list(result.suggested_manual_steps),
+            "evidence": list(result.evidence),
+        }
+        return {
+            "primary_issue": result.primary_issue,
+            "confidence": result.confidence,
+            "reason": result.reason,
+            "thought_chain": list(result.thought_chain),
+            "input_summary": result.input_summary,
+            "hit_deleted_mods": list(result.hit_deleted_mods),
+            "dependency_chains": [list(x) for x in result.dependency_chains],
+            "deletion_rationale": list(result.deletion_rationale),
+            "conflicts_or_exceptions": list(result.conflicts_or_exceptions),
+            "user_summary": result.user_summary,
+            "suggested_manual_steps": list(result.suggested_manual_steps),
+            "evidence": list(result.evidence),
+            "actions": [self._serialize_ai_action(a) for a in result.actions],
+        }
+
     def analyze_remove_validation(self, context: dict) -> dict:
         if not self.builder.config.ai.enabled:
             result = AIResult(
@@ -1007,13 +1326,16 @@ class BuilderAIService:
         normalized_context = self.build_remove_validation_context_payload(context)
         prompt = self.build_remove_validation_prompt(normalized_context)
         try:
-            text = self._call_ai_provider(prompt)
-            parsed = self._extract_json_object(str(text))
-            if not isinstance(parsed, dict):
-                retry_text = self._call_ai_provider(prompt)
-                parsed = self._extract_json_object(str(retry_text))
-                if not isinstance(parsed, dict):
-                    raise ValueError("ai_remove_validation_invalid_json")
+            parsed = self._invoke_json_prompt(
+                prompt,
+                response_format_name="mcasb_remove_validation",
+                schema_example=self._remove_validation_schema_example(),
+                allowed_action_types=[
+                    "continue_after_restore_mods",
+                    "report_manual_fix",
+                    "stop_and_report",
+                ],
+            )
             result = self._normalize_ai_result(parsed)
         except ExternalServiceError as e:
             result = self._safe_ai_result(reason=f"AI 删除验证分析失败: {type(e).__name__}:{e}", confidence=0.05)

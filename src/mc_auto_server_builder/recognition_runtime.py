@@ -204,10 +204,13 @@ def build_ai_context(builder: ServerBuilder, start_res: dict[str, object], log_i
     recognition_summary = builder._build_recognition_summary() if manifest else {}
     rollback_state = dict(getattr(builder, "last_rollback_remove_mods", {}) or {})
     remove_validation_state = dict(getattr(builder, "remove_validation_state", {}) or {})
+    deterministic_diagnostics = builder._build_deterministic_diagnostics(log_info)
     current_crash_reports = _string_list(start_res.get("crash_reports_snapshot") or [])
     last_crash_reports = _string_list(rollback_state.get("crash_reports_after_validation") or [])
     crash_report_delta = sorted(set(current_crash_reports).symmetric_difference(set(last_crash_reports)))
     crash_reports_changed = bool(rollback_state.get("triggered")) and bool(crash_report_delta)
+    raw_resource_summary = start_res.get("resource_summary", {})
+    resource_summary = dict(raw_resource_summary) if isinstance(raw_resource_summary, dict) else {}
     if rollback_state:
         rollback_state["crash_reports_changed_since_last_context"] = crash_reports_changed
         builder.last_rollback_remove_mods = rollback_state
@@ -252,5 +255,9 @@ def build_ai_context(builder: ServerBuilder, start_res: dict[str, object], log_i
         "port_open_detected": bool(start_res.get("port_open_detected", False)),
         "stdout_tail": str(start_res.get("stdout_tail") or ""),
         "stderr_tail": str(start_res.get("stderr_tail") or ""),
+        "failure_signals": _string_list(start_res.get("failure_signals") or []),
+        "readiness_evidence": _string_list(start_res.get("readiness_evidence") or []),
+        "resource_summary": resource_summary,
+        **deterministic_diagnostics,
         **log_info,
     }
