@@ -37,6 +37,10 @@ class UnsupportedStructuredOutputError(ExternalServiceError):
     pass
 
 
+class UnsupportedToolCallError(ExternalServiceError):
+    pass
+
+
 class BuilderAIService:
     def __init__(self, builder: ServerBuilder):
         self.builder = builder
@@ -335,8 +339,30 @@ class BuilderAIService:
             {"role": "user", "content": prompt},
         ]
 
+    def _build_openai_tool_messages(self, prompt: str) -> list[dict[str, str]]:
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "你是一个专业的Minecraft服务器部署与优化助手。"
+                    "必须通过提供的函数工具一次性提交最终结构化结论，不要直接输出 JSON 文本，不要输出 markdown。"
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+
     def _build_structured_output_schema(self, allowed_action_types: list[str]) -> dict[str, object]:
         return build_structured_output_schema(self, allowed_action_types)
+
+    def _build_openai_tool(self, name: str, allowed_action_types: list[str]) -> dict[str, object]:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "提交最终的结构化分析结论与下一步动作。必须且只能调用一次。",
+                "parameters": self._build_structured_output_schema(allowed_action_types),
+            },
+        }
 
     def _build_response_format(self, name: str, allowed_action_types: list[str]) -> dict[str, object]:
         return build_response_format(self, name, allowed_action_types)
@@ -362,13 +388,16 @@ class BuilderAIService:
             return endpoint
         raise ValueError("openai_compatible 缺少可用 endpoint/base_url")
 
-    def _extract_openai_text_from_non_stream(self, body: dict) -> str:
+    def _extract_openai_message_from_non_stream(self, body: dict) -> dict[str, object]:
         choices = body.get("choices") or []
         if not isinstance(choices, list) or not choices:
-            return ""
+            return {}
         first = choices[0] if isinstance(choices[0], dict) else {}
         message_obj = first.get("message")
-        message = message_obj if isinstance(message_obj, dict) else {}
+        return message_obj if isinstance(message_obj, dict) else {}
+
+    def _extract_openai_text_from_non_stream(self, body: dict) -> str:
+        message = self._extract_openai_message_from_non_stream(body)
         content = message.get("content")
         if isinstance(content, str):
             return content
@@ -384,8 +413,69 @@ class BuilderAIService:
                 if isinstance(text_val, str):
                     parts.append(text_val)
             return "".join(parts)
+        choices = body.get("choices") or []
+        if not isinstance(choices, list) or not choices:
+            return ""
+        first = choices[0] if isinstance(choices[0], dict) else {}
         text = first.get("text")
         return text if isinstance(text, str) else ""
+
+    def _parse_openai_function_arguments(self, value: object, *, provider: str, function_name: str) -> dict[str, object] | None:
+        if isinstance(value, dict):
+            return {str(k): v for k, v in value.items()}
+        if not isinstance(value, str):
+            return None
+        arguments_text = value.strip()
+        if not arguments_text:
+            return None
+        try:
+            parsed = json.loads(arguments_text)
+        except json.JSONDecodeError as exc:
+            raise ExternalDataError(
+                f"AI 响应解析失败({provider}): invalid_tool_arguments tool={function_name}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ExternalDataError(
+                f"AI 响应解析失败({provider}): tool_arguments_not_dict tool={function_name}"
+            )
+        return parsed
+
+    def _extract_openai_tool_payload(
+        self,
+        provider: str,
+        body: dict,
+        *,
+        expected_tool_name: str | None = None,
+    ) -> dict[str, object] | None:
+        message = self._extract_openai_message_from_non_stream(body)
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function_obj = tool_call.get("function")
+                function = function_obj if isinstance(function_obj, dict) else {}
+                function_name = str(function.get("name") or "").strip()
+                if expected_tool_name and function_name != expected_tool_name:
+                    continue
+                parsed = self._parse_openai_function_arguments(
+                    function.get("arguments"),
+                    provider=provider,
+                    function_name=function_name or expected_tool_name or "unknown",
+                )
+                if isinstance(parsed, dict):
+                    return parsed
+        function_call = message.get("function_call")
+        if isinstance(function_call, dict):
+            function_name = str(function_call.get("name") or "").strip()
+            if expected_tool_name and function_name and function_name != expected_tool_name:
+                return None
+            return self._parse_openai_function_arguments(
+                function_call.get("arguments"),
+                provider=provider,
+                function_name=function_name or expected_tool_name or "unknown",
+            )
+        return None
 
     def _extract_openai_text_from_stream(self, resp: requests.Response) -> str:
         chunks: list[str] = []
@@ -477,6 +567,21 @@ class BuilderAIService:
         )
         return any(marker in lowered for marker in markers)
 
+    def _is_unsupported_tool_call_response(self, status_code: int, body_preview: str) -> bool:
+        if status_code != 400:
+            return False
+        lowered = (body_preview or "").lower()
+        parameter_markers = ("tools", "tool_choice", "tool_calls", "function_call", "functions")
+        reason_markers = (
+            "unsupported",
+            "unknown parameter",
+            "invalid parameter",
+            "unknown field",
+            "not supported",
+            "extra inputs are not permitted",
+        )
+        return any(marker in lowered for marker in parameter_markers) and any(marker in lowered for marker in reason_markers)
+
     def _log_ai_retry(self, provider: str, attempt: int, max_attempts: int, retryable: bool, exc: Exception) -> None:
         self._ai_debug(
             f"{provider}.retry attempt={attempt}/{max_attempts} retryable={retryable} "
@@ -539,6 +644,89 @@ class BuilderAIService:
                 last_error = e
                 retryable = self._is_retryable_ai_error(e)
                 self._log_ai_retry("ollama", attempt, max_retries + 1, retryable, e)
+                if (not retryable) or attempt >= max_retries + 1:
+                    break
+                time.sleep(backoff * attempt)
+        assert last_error is not None
+        raise last_error
+
+    def _call_openai_compatible_tool(
+        self,
+        prompt: str,
+        *,
+        tool_name: str,
+        allowed_action_types: list[str],
+    ) -> dict[str, object]:
+        ai_cfg = self.builder.config.ai
+        endpoint = self._resolve_openai_chat_endpoint()
+        timeout_sec = max(5, int(ai_cfg.timeout_sec or 300))
+        max_retries = max(0, int(ai_cfg.max_retries or 0))
+        backoff = max(0.1, float(ai_cfg.retry_backoff_sec or 1.0))
+        payload: dict[str, object] = {
+            "model": ai_cfg.model,
+            "messages": self._build_openai_tool_messages(prompt),
+            "temperature": float(ai_cfg.temperature),
+            "top_p": float(ai_cfg.top_p),
+            "max_tokens": int(ai_cfg.max_tokens),
+            "stream": False,
+            "tools": [self._build_openai_tool(tool_name, allowed_action_types)],
+            "tool_choice": {"type": "function", "function": {"name": tool_name}},
+        }
+        if ai_cfg.stop:
+            payload["stop"] = list(ai_cfg.stop)
+        headers = self._build_openai_headers()
+        self._ai_debug(
+            "openai.request.tool "
+            f"endpoint={endpoint}, model={ai_cfg.model}, payload="
+            f"{json.dumps({k: v for k, v in payload.items() if k != 'messages'}, ensure_ascii=False)}"
+        )
+        last_error: Exception | None = None
+        for attempt in range(1, max_retries + 2):
+            try:
+                try:
+                    with configure_requests_session(
+                        requests.Session(),
+                        proxies=self.builder.config.proxy.to_requests_proxies(),
+                        trust_env=self.builder.config.proxy.trust_env,
+                    ) as session:
+                        resp = session.post(endpoint, headers=headers, json=cast(Any, payload), timeout=timeout_sec)
+                except requests.RequestException as exc:
+                    self._raise_ai_request_error("openai_compatible", exc)
+                if resp.status_code >= 400:
+                    if self._is_unsupported_tool_call_response(resp.status_code, resp.text):
+                        raise UnsupportedToolCallError(
+                            "AI 原生 tool call 不受支持(openai_compatible): "
+                            f"{self._map_ai_http_error(resp.status_code, body_preview=resp.text)}"
+                        )
+                    self._raise_ai_http_error("openai_compatible", resp)
+                body = self._parse_json_body("openai_compatible", resp)
+                parsed = self._extract_openai_tool_payload(
+                    "openai_compatible",
+                    body,
+                    expected_tool_name=tool_name,
+                )
+                if isinstance(parsed, dict):
+                    self._ai_debug(
+                        "openai.response.tool "
+                        f"status={resp.status_code}, tool={tool_name}, parsed_preview="
+                        f"{json.dumps(self._truncate_debug_text(json.dumps(parsed, ensure_ascii=False), 1200), ensure_ascii=False)}"
+                    )
+                    return parsed
+                text = self._extract_openai_text_from_non_stream(body)
+                parsed_from_content = self._extract_json_object(text)
+                if isinstance(parsed_from_content, dict):
+                    self._ai_debug(
+                        "openai.response.tool_fallback "
+                        f"status={resp.status_code}, source=message_content_json, tool={tool_name}"
+                    )
+                    return parsed_from_content
+                raise ExternalDataError("AI 响应解析失败(openai_compatible): missing_tool_call")
+            except (ExternalRequestError, ExternalResponseError, ExternalDataError, UnsupportedToolCallError) as e:
+                last_error = e
+                if isinstance(e, UnsupportedToolCallError):
+                    break
+                retryable = self._is_retryable_ai_error(e)
+                self._log_ai_retry("openai.tool", attempt, max_retries + 1, retryable, e)
                 if (not retryable) or attempt >= max_retries + 1:
                     break
                 time.sleep(backoff * attempt)
@@ -821,6 +1009,10 @@ class BuilderAIService:
     def build_prompt(self, context: dict) -> str:
         return build_prompt(self, context)
 
+    def _provider_prefers_tool_calls(self) -> bool:
+        provider = (self.builder.config.ai.provider or "ollama").strip().lower()
+        return provider in {"openai_compatible", "openai-compatible", "openai"}
+
     def _provider_prefers_structured_output(self) -> bool:
         provider = (self.builder.config.ai.provider or "ollama").strip().lower()
         return provider in {"openai_compatible", "openai-compatible", "openai"}
@@ -833,6 +1025,21 @@ class BuilderAIService:
         schema_example: dict[str, object],
         allowed_action_types: list[str],
     ) -> dict[str, object]:
+        if self._provider_prefers_tool_calls():
+            try:
+                return self._call_openai_compatible_tool(
+                    prompt,
+                    tool_name=response_format_name,
+                    allowed_action_types=allowed_action_types,
+                )
+            except UnsupportedToolCallError:
+                self._ai_debug(f"response.tool.unsupported name={response_format_name}")
+            except ExternalDataError as exc:
+                self._ai_debug(
+                    "response.tool.invalid "
+                    f"name={response_format_name} err={type(exc).__name__}:{self._truncate_debug_text(exc, 400)}"
+                )
+
         response_format = (
             self._build_response_format(response_format_name, allowed_action_types)
             if self._provider_prefers_structured_output()

@@ -19,7 +19,7 @@ from mc_auto_server_builder.action_preflight import (
     assess_non_mutating_action,
     assess_remove_mods,
 )
-from mc_auto_server_builder.ai import BuilderAIService
+from mc_auto_server_builder.ai import BuilderAIService, UnsupportedToolCallError
 from mc_auto_server_builder.bisect_runtime import (
     build_bisect_feedback_payload,
     build_bisect_round_record,
@@ -480,14 +480,111 @@ def test_call_openai_compatible_chat_includes_json_schema_response_format():
     assert captured["json"]["response_format"]["json_schema"]["name"] == "mcasb_test"
 
 
+def test_call_openai_compatible_tool_includes_tools_payload():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.config = SimpleNamespace(
+        ai=SimpleNamespace(
+            provider="openai_compatible",
+            base_url="https://api.example.com",
+            chat_path="/v1/chat/completions",
+            endpoint="",
+            model="gpt-test",
+            timeout_sec=5,
+            max_retries=0,
+            retry_backoff_sec=0.0,
+            enabled=True,
+            debug=False,
+            stream=False,
+            temperature=0.2,
+            top_p=0.9,
+            max_tokens=256,
+            stop=[],
+            api_key="",
+        ),
+        proxy=SimpleNamespace(to_requests_proxies=lambda: None, trust_env=True),
+    )
+    builder._log = lambda *_args, **_kwargs: None
+    service = BuilderAIService(builder)
+    captured: dict[str, object] = {}
+
+    class Resp:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "mcasb_test",
+                                        "arguments": json.dumps(
+                                            {
+                                                "final_output": {
+                                                    "primary_issue": "other",
+                                                    "confidence": 0.1,
+                                                    "reason": "ok",
+                                                    "actions": [],
+                                                }
+                                            },
+                                            ensure_ascii=False,
+                                        ),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    class FakeSession:
+        def __init__(self):
+            self.proxies = {}
+            self.trust_env = True
+
+        def post(self, *_args, **kwargs):
+            captured.update(kwargs)
+            return Resp()
+
+        def close(self):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    import mc_auto_server_builder.ai as ai_module
+
+    original_session = ai_module.requests.Session
+    try:
+        ai_module.requests.Session = FakeSession
+        parsed = service._call_openai_compatible_tool(
+            "hello",
+            tool_name="mcasb_test",
+            allowed_action_types=["stop_and_report"],
+        )
+    finally:
+        ai_module.requests.Session = original_session
+
+    assert parsed["final_output"]["reason"] == "ok"
+    assert captured["json"]["tools"][0]["function"]["name"] == "mcasb_test"
+    assert captured["json"]["tool_choice"]["function"]["name"] == "mcasb_test"
+
+
 def test_analyze_uses_repair_prompt_after_invalid_json_response():
     builder = ServerBuilder.__new__(ServerBuilder)
     builder.config = SimpleNamespace(
         ai=SimpleNamespace(
             enabled=True,
             debug=False,
-            provider="openai_compatible",
-            endpoint="https://api.example.com/v1/chat/completions",
+            provider="ollama",
+            endpoint="http://127.0.0.1:11434/api/generate",
             model="gpt-test",
             timeout_sec=5,
             max_retries=0,
@@ -535,6 +632,65 @@ def test_analyze_uses_repair_prompt_after_invalid_json_response():
     assert result["actions"][0]["type"] == "stop_and_report"
     assert len(calls) == 2
     assert "JSON 修复器" in calls[1][0]
+
+
+def test_invoke_json_prompt_falls_back_when_tool_calls_unsupported():
+    builder = ServerBuilder.__new__(ServerBuilder)
+    builder.config = SimpleNamespace(
+        ai=SimpleNamespace(
+            enabled=True,
+            debug=False,
+            provider="openai_compatible",
+            endpoint="https://api.example.com/v1/chat/completions",
+            model="gpt-test",
+            timeout_sec=5,
+            max_retries=0,
+            retry_backoff_sec=0.0,
+            stream=False,
+            temperature=0.2,
+            top_p=0.9,
+            max_tokens=256,
+            stop=[],
+            api_key="",
+            base_url="",
+            chat_path="/v1/chat/completions",
+        ),
+        proxy=SimpleNamespace(to_requests_proxies=lambda: None, trust_env=True),
+    )
+    builder._log = lambda *_args, **_kwargs: None
+    service = BuilderAIService(builder)
+
+    service._call_openai_compatible_tool = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        UnsupportedToolCallError("unsupported")
+    )
+    calls: list[tuple[str, dict[str, object] | None]] = []
+
+    def fake_call_ai_provider(prompt: str, response_format: dict[str, object] | None = None) -> str:
+        calls.append((prompt, response_format))
+        return json.dumps(
+            {
+                "final_output": {
+                    "primary_issue": "other",
+                    "confidence": 0.2,
+                    "reason": "fallback",
+                    "actions": [{"type": "stop_and_report", "final_reason": "fallback"}],
+                }
+            },
+            ensure_ascii=False,
+        )
+
+    service._call_ai_provider = fake_call_ai_provider  # type: ignore[method-assign]
+
+    parsed = service._invoke_json_prompt(
+        "hello",
+        response_format_name="mcasb_test",
+        schema_example=service._normal_failure_schema_example(),
+        allowed_action_types=["stop_and_report"],
+    )
+
+    assert parsed["final_output"]["reason"] == "fallback"
+    assert calls[0][1] is not None
+    assert calls[0][1]["type"] == "json_schema"
 
 
 def test_configure_requests_session_applies_proxy_settings():
